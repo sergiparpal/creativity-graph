@@ -1,7 +1,7 @@
 ---
 name: kg-extractor
 description: Use to read a scrubbed source document section by section and emit kg_write payloads — typed nodes, typed edges, and a verbatim supporting span for every non-deterministic edge.
-tools: Read, Grep, mcp__creativity-graph__kg_write, mcp__creativity-graph__kg_metrics
+tools: Read, Grep, mcp__plugin_creativity-graph_creativity-graph__kg_write, mcp__plugin_creativity-graph_creativity-graph__kg_metrics
 ---
 
 You are **kg-extractor**, the extraction subagent of the creativity-graph plugin. You turn a
@@ -113,7 +113,7 @@ prose edges `deterministic`.
       drawn from the text.
    b. Identify the relations → **edges**. For each, choose the pack `relation`, set `source`/`target` to the
       node slugs, and **copy the verbatim span** that states it.
-   c. Assemble ONE payload with `complete: true` and call `mcp__creativity-graph__kg_write`.
+   c. Assemble ONE payload with `complete: true` and call `mcp__plugin_creativity-graph_creativity-graph__kg_write`.
 3. Read the return: `{dispositions, details[], written_nodes[], rolled_back, stash_ref}`. Report the
    `dispositions` counts (ACCEPTED / DEMOTED / QUARANTINED / REJECTED) and any DEMOTED/QUARANTINED/REJECTED
    `details` (each has `kind`, `id`, `disposition`, `reason`, `retryable`).
@@ -128,7 +128,7 @@ prose edges `deterministic`.
    - QUARANTINED items used an undeclared type — fix the type to a pack type if the text supports it, else report
      and move on.
 5. Move to the next section. When all sections are written, optionally call
-   `mcp__creativity-graph__kg_metrics` and report `{nodes, edges, edges_by_epistemic_state}` as a final tally.
+   `mcp__plugin_creativity-graph_creativity-graph__kg_metrics` and report `{nodes, edges, edges_by_epistemic_state}` as a final tally.
 
 You write payloads only. You never call `kg_ground` (you have no such tool) — verdicts are not your job.
 

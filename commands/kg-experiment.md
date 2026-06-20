@@ -1,7 +1,7 @@
 ---
 description: Stage 8 — blind ideation experiment (control|graph|rag); score with the harness and append the verdict to PROGRESS.md
 argument-hint: "[prompts_path]"
-allowed-tools: Task, Bash, mcp__creativity-graph__kg_context
+allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_context
 ---
 
 # /kg-experiment — does the graph actually help ideation? (§Stage 8, §4)
@@ -45,7 +45,7 @@ PYTHONPATH="$SCRIPTS" "$PY" -m kg_engine.harness ideation 2>&1 | head -1   # smo
 
 Confirm the graph is queryable before spending tokens generating ideas:
 
-- Call **`mcp__creativity-graph__kg_context`** with `budget=2000` and no `query`. If it returns an empty
+- Call **`mcp__plugin_creativity-graph_creativity-graph__kg_context`** with `budget=2000` and no `query`. If it returns an empty
   `items[]`, there is no grounded graph to test — tell the user to run `/kg-build` then `/kg-ground` first,
   and stop. Note the `falsification_counters.failed_or_rejected_edges`; a graph with **zero** recorded
   failures (§1.7) is suspect and the `graph` arm will look artificially clean — surface that caveat in the
@@ -92,7 +92,7 @@ generation; this command never sees which arm is which until the JSON comes back
 
 1. For **each** of the N prompts, build three context blocks:
    - **control** → no context.
-   - **graph** → the result of `mcp__creativity-graph__kg_context(query=<prompt>, budget=2000)`, rendered as
+   - **graph** → the result of `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=<prompt>, budget=2000)`, rendered as
      opaque text. Carry through the pack's `advisory` (e.g. `signal:"structural-bridge"`) and the
      `falsification_counters` so the generator can *avoid* re-proposing failed edges (§1.7) — but it MUST NOT
      fabricate verdicts or spans; this arm only *reads* the graph.

@@ -64,7 +64,7 @@ collapse the three into one "quality" number.
 | `/kg-eval` | `kg-evaluator` | `f4_probe.py`, `kg_engine.harness`, `kg_metrics` |
 | `/kg-experiment` | (orchestration) | `kg_engine.harness ideation` |
 
-The MCP server is named `creativity-graph`; tools are namespaced `mcp__creativity-graph__<tool>`
+The MCP server is named `creativity-graph`; tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`
 (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`, `query_graph`,
 `get_node`, `get_neighbors`, `shortest_path`, `kg_context` — ELEVEN tools). These are the ONLY
 graph tools — `kg-build`, `kg-query`, etc. are slash commands, not tools.
@@ -89,7 +89,7 @@ graph tools — `kg-build`, `kg-query`, etc. are slash commands, not tools.
    pruned, surfaced in `kg_context.falsification_counters.failed_or_rejected_edges`. The
    adversarial grounder *creates* this signal via `attacked_by` edges plus
    `kg_ground(verdict="failed")`. A graph that forgets its mistakes drifts into nonsense.
-5. **egress scrub (§1.9).** `mcp__creativity-graph__kg_scrub(text)` redacts secrets (always) plus
+5. **egress scrub (§1.9).** `mcp__plugin_creativity-graph_creativity-graph__kg_scrub(text)` redacts secrets (always) plus
    PII (per `sensitivity`) with CONSISTENT placeholders (`⟦SECRET:1⟧` etc.) *before* text is handed
    to a subagent; `kg_write` then RESTORES placeholder spans to the ORIGINAL text so the canon
    stores the restored original span. On the no-PII demo source it is a no-op (0 redactions).

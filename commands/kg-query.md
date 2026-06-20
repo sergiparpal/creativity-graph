@@ -1,7 +1,7 @@
 ---
 description: Answer a question against the knowledge graph with provenance and falsification counters attached.
 argument-hint: <question>
-allowed-tools: mcp__creativity-graph__kg_context, mcp__creativity-graph__query_graph, mcp__creativity-graph__get_node, mcp__creativity-graph__get_neighbors, mcp__creativity-graph__shortest_path
+allowed-tools: mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__get_node, mcp__plugin_creativity-graph_creativity-graph__get_neighbors, mcp__plugin_creativity-graph_creativity-graph__shortest_path
 ---
 
 You are answering a question **against the grounded knowledge graph**, not against your own prior
@@ -22,7 +22,7 @@ Question: **$ARGUMENTS**
 ## Procedure
 
 ### 1. Get grounded, token-budgeted context
-Call `mcp__creativity-graph__kg_context(query=$ARGUMENTS)`. This is the primary source. It returns:
+Call `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=$ARGUMENTS)`. This is the primary source. It returns:
 - `items[]` — edges ordered **grounded → span-present → inferred**, each carrying
   `{id, source, target, relation, provenance, authored_by, epistemic_state, span, confidence, confidence_score}`.
 - `approx_tokens`, `budget` — the fill is capped (default budget 2000); note if you were truncated.
@@ -34,14 +34,14 @@ structural lookups below before concluding "not in the graph."
 
 ### 2. Structural lookups (only when the question is structural)
 Use these to follow specific relationships rather than to re-rank context:
-- `mcp__creativity-graph__query_graph(node_type=…, relation=…, epistemic_state=…, limit=…)` — e.g.
+- `mcp__plugin_creativity-graph_creativity-graph__query_graph(node_type=…, relation=…, epistemic_state=…, limit=…)` — e.g.
   `query_graph(epistemic_state="grounded")` for the trustworthy subgraph, or
   `query_graph(relation="attacked_by")` to enumerate adversarial edges. Node types are
   `compression | primitive | claim | metric | operation | failure`; relations are
   `grounds | attacked_by | reconciles_with | bridges | collapses_into | confounded_by | approximates | defends_against | projects | survives`.
-- `mcp__creativity-graph__get_node(node_id)` — one node plus its incident edges (use slug IDs, e.g. `compression`).
-- `mcp__creativity-graph__get_neighbors(node_id, relation=…)` — incident edges, optionally one relation.
-- `mcp__creativity-graph__shortest_path(source, target)` — `{path: [node_ids] | null}` over the derived graph.
+- `mcp__plugin_creativity-graph_creativity-graph__get_node(node_id)` — one node plus its incident edges (use slug IDs, e.g. `compression`).
+- `mcp__plugin_creativity-graph_creativity-graph__get_neighbors(node_id, relation=…)` — incident edges, optionally one relation.
+- `mcp__plugin_creativity-graph_creativity-graph__shortest_path(source, target)` — `{path: [node_ids] | null}` over the derived graph.
   A path is a *structural* connection only; it is **not** evidence the chain of claims is grounded.
 
 ### 3. Answer with provenance attached

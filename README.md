@@ -125,7 +125,7 @@ machine.
 Confirm the server sees your config:
 
 ```
-mcp__creativity-graph__kg_ping()
+mcp__plugin_creativity-graph_creativity-graph__kg_ping()
 → {name, version, metrics_mode, sensitivity, pack_loaded}
 ```
 
@@ -209,7 +209,7 @@ measurement rather than a slogan.
 
 ## The MCP tool surface
 
-Server name `creativity-graph` ⇒ tools are namespaced `mcp__creativity-graph__<tool>`. These
+Server name `creativity-graph` ⇒ tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`. These
 **eleven** tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
 `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`) are the **only** graph
 tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash commands).

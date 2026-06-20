@@ -1,7 +1,7 @@
 ---
 description: Measure extractor precision (Stage 4) and grounding reliability (Stage 7); record the numbers in PROGRESS.md.
 argument-hint: "[graph.json] (default: ${KG_DATA:-${CLAUDE_PROJECT_DIR:-.}/.kg-data}/derived/graph.json)"
-allowed-tools: Task, Bash, mcp__creativity-graph__query_graph
+allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__query_graph
 ---
 
 # /kg-eval — extraction & grounding measurement
@@ -201,7 +201,7 @@ place — gate ON") means the specificity-weighted bridge metric separates real 
 high-traffic nodes beyond the churn band and may be promoted out of advisory; otherwise degree stays the
 honest MVP advisory and specificity-weighted betweenness remains GATED (§1.6).
 
-> Cross-check (optional): `mcp__creativity-graph__query_graph(node_type="compression")` shows the live
+> Cross-check (optional): `mcp__plugin_creativity-graph_creativity-graph__query_graph(node_type="compression")` shows the live
 > compression nodes; the specificity leaders should be these, not vague terms like `idea`/`system`.
 
 Stage 7 does not gate either — log α and the gate verdict and proceed (§4).

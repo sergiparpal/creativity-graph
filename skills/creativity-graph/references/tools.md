@@ -9,8 +9,10 @@ field is missing, grep the engine source, don't guess.
 
 ## 1 · MCP tool surface
 
-Server name is `creativity-graph`, so every tool is namespaced `mcp__creativity-graph__<tool>`. These eleven
-are the **only** graph tools. There is no `kg_build` / `kg_query` / `kg_project` MCP tool — those are slash
+A plugin-bundled MCP server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>` — here both the
+plugin and the server are named `creativity-graph`, so every tool is `mcp__plugin_creativity-graph_creativity-graph__<tool>`
+(use this exact form in agent `tools:` / command `allowed-tools:` grants). These eleven are the **only**
+graph tools. There is no `kg_build` / `kg_query` / `kg_project` MCP tool — those are slash
 commands (`/kg-build`, …) that *orchestrate* these tools.
 
 Mutation tools (`kg_write`, `kg_ground`, `kg_rename`) write the **canon** (human-editable Markdown, the single
@@ -19,7 +21,7 @@ the **derived** layer; they call `_ensure_projected()` first, which reprojects o
 missing or stale (`built_from_commit != HEAD`). The derived layer contains nothing the canon does not (§1.2)
 and never prunes failure memory (§1.7).
 
-### 1.1 `mcp__creativity-graph__kg_ping()`
+### 1.1 `mcp__plugin_creativity-graph_creativity-graph__kg_ping()`
 
 Health check / config probe. No args.
 
@@ -32,7 +34,7 @@ Health check / config probe. No args.
 is `structure_only` by default (centrality stays advisory; the specificity-weighted bridge metric is gated,
 §1.4/§1.6).
 
-### 1.2 `mcp__creativity-graph__kg_scrub(text=None)`
+### 1.2 `mcp__plugin_creativity-graph_creativity-graph__kg_scrub(text=None)`
 
 The §1.9 **egress scrub**. Redacts **secrets (always)** + **PII (per `sensitivity`)** with **CONSISTENT
 placeholders** (`⟦SECRET:1⟧`, `⟦EMAIL:1⟧`, …) before any text is handed to a subagent for semantic work.
@@ -54,7 +56,7 @@ local canon.
 For the no-PII demo source (`examples/source.md`), `kg_scrub` is a **no-op**: `redactions: 0`,
 `categories: []`, and `scrubbed` equals the source verbatim.
 
-### 1.3 `mcp__creativity-graph__kg_write(payload: dict)`
+### 1.3 `mcp__plugin_creativity-graph_creativity-graph__kg_write(payload: dict)`
 
 The boundary (§1.5). Validates an extraction payload, writes ACCEPTED/DEMOTED nodes & edges to the canon,
 quarantines or rejects the rest. `payload` is the write contract (see `references/payload.md` / the shared
@@ -88,7 +90,7 @@ REJECTED as `truncated-payload`.
 A write may never set a verdict or `authored_by=human`: such payloads are **DEMOTED** (verdict reset to
 `unverified` → `forged-verdict-stripped`; human → `agent` → `human-claim-stripped`), never accepted as-is.
 
-### 1.4 `mcp__creativity-graph__kg_ground(target_id, verdict, by="agent", kind="edge", note="")`
+### 1.4 `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, by="agent", kind="edge", note="")`
 
 **The ONLY path that may set a verdict** (§1.4/§1.8). Stamps the epistemic_state and appends a `ground.audit`
 record so the reconciler treats the transition as legitimate.
@@ -114,7 +116,7 @@ For an edge, also sets `verdict_by` and `verdict_at`. Note: the return `key` for
 > `kg_ground(target_id=<edge>, verdict="failed")`. Failed/rejected edges are NEGATIVE INFORMATION — never
 > pruned, surfaced by `kg_context.falsification_counters`.
 
-### 1.5 `mcp__creativity-graph__kg_rename(old_id, new_id)`
+### 1.5 `mcp__plugin_creativity-graph_creativity-graph__kg_rename(old_id, new_id)`
 
 Renames a node and rewrites every edge endpoint (`source`/`target`) referencing it, preserving the
 single-canonical-edge rule. Both ids are slugged.
@@ -127,7 +129,7 @@ single-canonical-edge rule. Both ids are slugged.
 Failure: `{"ok": false, "error": "node not found"}` or `"target id exists"`. `ok` is `false` if the write had
 to stash.
 
-### 1.6 `mcp__creativity-graph__kg_metrics()`
+### 1.6 `mcp__plugin_creativity-graph_creativity-graph__kg_metrics()`
 
 Cheap summary counts straight off the canon (no projection). No args.
 
@@ -138,7 +140,7 @@ Cheap summary counts straight off the canon (no projection). No args.
 `edges_by_epistemic_state` keys are whatever `EpistemicState` values are present
 (`unverified|grounded|rejected|failed|obsolete`).
 
-### 1.7 `mcp__creativity-graph__query_graph(node_type=None, relation=None, epistemic_state=None, limit=50)`
+### 1.7 `mcp__plugin_creativity-graph_creativity-graph__query_graph(node_type=None, relation=None, epistemic_state=None, limit=50)`
 
 Filtered read of the derived index. Nodes filtered by `node_type` and/or `epistemic_state`, **ordered by
 precomputed `degree` DESC** (the honest MVP advisory, §1.6), capped at `limit`. Edges filtered by `relation`,
@@ -167,7 +169,7 @@ Node rows carry precomputed rank columns: `degree`, `community` (Leiden membersh
 (`compression|primitive|claim|metric|operation|failure`); `relation` filters the declared edge types
 (`grounds|attacked_by|reconciles_with|bridges|collapses_into|confounded_by|approximates|defends_against|projects|survives`).
 
-### 1.8 `mcp__creativity-graph__get_node(node_id)`
+### 1.8 `mcp__plugin_creativity-graph_creativity-graph__get_node(node_id)`
 
 One node row + its incident edges (both `source=` and `target=` matches).
 
@@ -187,12 +189,12 @@ One node row + its incident edges (both `source=` and `target=` matches).
 
 Returns `{"error": "not found"}` when the id is unknown.
 
-### 1.9 `mcp__creativity-graph__get_neighbors(node_id, relation=None)`
+### 1.9 `mcp__plugin_creativity-graph_creativity-graph__get_neighbors(node_id, relation=None)`
 
 A **list** (not a dict) of edge dicts incident to `node_id` (as `source` OR `target`), optionally filtered by
 `relation`. Each element has the same shape as an edge row above. Empty list if the node has no incident edges.
 
-### 1.10 `mcp__creativity-graph__shortest_path(source, target)`
+### 1.10 `mcp__plugin_creativity-graph_creativity-graph__shortest_path(source, target)`
 
 BFS over the derived edge list, treated as **undirected** (no centrality is computed).
 
@@ -202,7 +204,7 @@ BFS over the derived edge list, treated as **undirected** (no centrality is comp
 
 `{"path": ["x"]}` when `source == target`; `{"path": null}` when no path exists.
 
-### 1.11 `mcp__creativity-graph__kg_context(query=None, budget=2000)`
+### 1.11 `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=None, budget=2000)`
 
 The **grounding-aware, provenance-carrying, token-budgeted** context tool — the one to call before reasoning
 over the graph. Reads precomputed ranks **O(1)**; it **NEVER computes centrality in-request** (centrality is

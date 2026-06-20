@@ -4,11 +4,11 @@ The precise specification the extractor and grounders bind to. This mirrors the 
 (`scripts/kg_engine/boundary.py`, `model.py`) and `ARCHITECTURE.md`. When the prose here and the engine
 ever disagree, the engine wins — grep `scripts/kg_engine/` rather than guessing.
 
-`mcp__creativity-graph__kg_write(payload)` is the ONLY path from language into the canon. It writes nothing
+`mcp__plugin_creativity-graph_creativity-graph__kg_write(payload)` is the ONLY path from language into the canon. It writes nothing
 until `validate_payload` (§1.8) classifies every node and edge into a **disposition**. This file is the spec
 for that payload and that classification.
 
-Before extraction, the §1.9 **egress scrub** `mcp__creativity-graph__kg_scrub(text=None) ->
+Before extraction, the §1.9 **egress scrub** `mcp__plugin_creativity-graph_creativity-graph__kg_scrub(text=None) ->
 {scrubbed, redactions, sensitivity, categories}` redacts secrets (always) + PII (per `sensitivity`) with
 **consistent** placeholders (`⟦SECRET:1⟧` etc.) so relational structure survives, then hands the scrubbed
 text to the subagent. `kg_write` **restores** the placeholder spans to the ORIGINAL text before writing, so
@@ -142,7 +142,7 @@ A `kg_write` payload may **not** assert `grounded`/`rejected`/`failed` (in `epis
 `authored_by=human`. The boundary does not error — it **silently demotes** (DEMOTED, §3), so a forged
 verdict is wasted, not honored.
 
-Verdicts come **only** from `mcp__creativity-graph__kg_ground(target_id, verdict, by, kind, note)` with
+Verdicts come **only** from `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, by, kind, note)` with
 `verdict ∈ {grounded, rejected, failed, obsolete}`, which stamps `verdict_by`/`verdict_at` and appends an
 audit record. The reconciler re-quarantines any verdict that appears in canon without a matching audit
 record. **Extractors emit `unverified` only.**

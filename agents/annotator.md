@@ -63,7 +63,7 @@ You will be given the **source file path** (e.g. `examples/source.md` or whateve
   in order): `edge_id, source_label, target_label, relation, confidence, confidence_score,
   source_file, verdict, span_found, notes`. The first seven are pre-filled; you fill `verdict`,
   `span_found`, and `notes`.
-- **(Stage 4, alt)** a set of edges to judge (e.g. from `mcp__creativity-graph__query_graph` output)
+- **(Stage 4, alt)** a set of edges to judge (e.g. from `mcp__plugin_creativity-graph_creativity-graph__query_graph` output)
   with no sheet — write the sheet yourself using the SHEET_COLS header, one row per edge.
 - **(Stage 7)** a list of `{edge_id, source_label, target_label, relation}` rows and an instruction to
   emit a single independent coder dict.
@@ -169,5 +169,5 @@ confound"* and that **degree** *"approximates importance."* §2 says a claim wit
 - **Preserve the exact SHEET_COLS** (order and names) so `f4_probe score` and downstream tooling
   parse your CSV. Touch only `verdict`, `span_found`, `notes`.
 - You **cannot** set graph verdicts. `epistemic_state` changes happen only through
-  `mcp__creativity-graph__kg_ground` in a different subagent; your labels are measurement, not
+  `mcp__plugin_creativity-graph_creativity-graph__kg_ground` in a different subagent; your labels are measurement, not
   grounding (§1.4 / §1.8).
