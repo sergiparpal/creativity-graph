@@ -34,6 +34,7 @@ class KGEngine:
         self.reconciler = Reconciler(self.canon)
         self.projector = Projector(self.canon, self.data_dir / "derived", metrics_mode=metrics_mode)
         self.scrubber = Scrubber(sensitivity)
+        self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
         self.sensitivity = sensitivity
         self.metrics_mode = metrics_mode
         self.source_path = Path(source_path) if source_path else None
@@ -56,10 +57,25 @@ class KGEngine:
                 "metrics_mode": self.metrics_mode, "sensitivity": self.sensitivity,
                 "pack_loaded": self.pack is not None}
 
+    def kg_scrub(self, text: str | None = None) -> dict:
+        """Egress scrub (§1.9): redact secrets (always) + PII (per sensitivity) with CONSISTENT
+        placeholders before any text is handed to a subagent for semantic work. Accumulates the local
+        placeholder->original mapping so kg_write can restore spans to the original for the canon (the
+        scrub protects the egress, not the local canon). Pass `text` to scrub a snippet, or omit to scrub
+        the configured source. Returns the scrubbed text the subagent should see."""
+        src = text if text is not None else self.source_text()
+        scrubbed, mapping = self.scrubber.scrub(src)
+        self._scrub_map.update(mapping)
+        return {"scrubbed": scrubbed, "redactions": len(mapping),
+                "sensitivity": self.sensitivity, "categories": sorted({k.split(":")[0].strip("⟦") for k in mapping})}
+
     def kg_write(self, payload: dict, *, message: str = "kg_write") -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted items."""
+        # if egress scrubbing happened this session, restore placeholder spans to the original before
+        # span verification, and store the original in the canon (§1.9).
+        restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
         results = validate_payload(payload, pack=self.pack, source_text=self.source_text(),
-                                   existing=self.canon.all_edges())
+                                   existing=self.canon.all_edges(), restore=restore)
         nodes = merge_results_into_nodes(results)
         info = self.canon.write_nodes(list(nodes.values()), message=message) if nodes else None
         summary: dict = {d.value: 0 for d in Disposition}
@@ -201,6 +217,12 @@ def _register(mcp, engine: KGEngine) -> None:
     def kg_ping() -> dict:
         """Health check: returns the engine version and configuration."""
         return engine.kg_ping()
+
+    @mcp.tool()
+    def kg_scrub(text: str = None) -> dict:
+        """Egress PII/secret scrub (§1.9): redact a snippet (or the source) with consistent placeholders
+        before handing text to a subagent; the canon later restores spans to the original."""
+        return engine.kg_scrub(text)
 
     @mcp.tool()
     def kg_write(payload: dict) -> dict:

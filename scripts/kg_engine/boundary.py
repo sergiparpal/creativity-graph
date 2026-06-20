@@ -189,6 +189,10 @@ def _validate_edge(ein, edge_types, source_text, restore, seen) -> ValidationRes
         check_span = restore(edge.span) if restore else edge.span
         if not span_verifies(check_span, source_text):
             return _ok("edge", edge, Disposition.REJECTED, "span-not-in-source", False, ident)
+        # restore protects the egress, not the local canon (§1.9): the canon stores the ORIGINAL
+        # (unscrubbed) span, recovered from the placeholder form the subagent emitted.
+        if restore and check_span != edge.span:
+            edge.span = check_span
         # a verifying span justifies span-present provenance; if the agent under-claimed (inferred),
         # leave it; if it claimed span-present we keep it. hypothesized stays hypothesized.
     else:
