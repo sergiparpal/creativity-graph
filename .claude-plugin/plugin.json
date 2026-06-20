@@ -1,5 +1,6 @@
 {
   "name": "creativity-graph",
+  "version": "0.1.0",
   "description": "Turn a non-self-grounding conceptual document into a rigorously-grounded, queryable knowledge graph: a human-editable canon with three-axis provenance, a span-present write boundary, a grounding loop with memory of failures, and a regenerable NetworkX/SQLite derived layer.",
   "author": {
     "name": "Sergi Parpal",
@@ -15,22 +16,20 @@
       "default": "conceptual theory"
     },
     "source_path": {
-      "type": "string",
+      "type": "file",
       "title": "Source document path",
-      "description": "Absolute path to the source document the graph is built and grounded against."
+      "description": "Path to the source document the graph is built and grounded against."
     },
     "sensitivity": {
       "type": "string",
       "title": "Egress sensitivity",
-      "description": "Egress scrubbing aggressiveness: low = secrets only; medium = + structured PII; high = + person/address heuristics.",
-      "options": ["low", "medium", "high"],
+      "description": "Egress scrubbing aggressiveness — one of low | medium | high (low = secrets only; medium = + structured PII; high = + person/address heuristics). Validated by the engine; unknown values fall back to medium.",
       "default": "medium"
     },
     "metrics_mode": {
       "type": "string",
       "title": "Metrics mode",
-      "description": "structure_only uses graph structure as signal; with_embeddings adds a gated sqlite-vss candidate generator.",
-      "options": ["structure_only", "with_embeddings"],
+      "description": "One of structure_only | with_embeddings (structure_only uses graph structure as signal; with_embeddings adds a gated sqlite-vss candidate generator). Validated by the engine; unknown values fall back to structure_only.",
       "default": "structure_only"
     }
   }
