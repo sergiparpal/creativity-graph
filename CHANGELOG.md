@@ -1,9 +1,9 @@
 # Changelog
 
 All notable changes to the **creativity-graph** Claude Code plugin are recorded here.
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project will
-follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once a `version` is set in
-`.claude-plugin/plugin.json` (omitted during dev so each commit is its own version — Stage 0/§5).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html); `version` is set to `0.1.0` in
+`.claude-plugin/plugin.json` and the matching `marketplace.json` entry.
 
 The plugin turns a non-self-grounding conceptual document into a grounded, queryable knowledge
 graph: a human-editable Markdown **canon** (the single source of truth, §1.2), a span-present
@@ -14,9 +14,11 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
-The initial end-to-end build, staged per the implementation plan (§5). Engine: 49 tests green.
-Components: 4 agents, 4 commands, 1 skill, the `SessionStart`/`PreToolUse` hooks, and the
-`creativity-graph` MCP server. Each stage advanced on its own automated exit test (§4).
+The initial end-to-end build, staged per the implementation plan (§5). Engine: **53 tests green**.
+Components: **5 agents, 5 commands**, 1 skill (+3 on-demand references), the `SessionStart`/`PreToolUse`
+hooks, and the `creativity-graph` MCP server. Each stage advanced on its own automated exit test (§4).
+The plugin was then **installed locally and the full workflow run end-to-end** (see *Packaging hardening
++ live validation* below).
 
 ### Stage 0 — Scaffold + environment bootstrap
 
@@ -168,14 +170,57 @@ Components: 4 agents, 4 commands, 1 skill, the `SessionStart`/`PreToolUse` hooks
   `test_projector.py`, `test_pack.py`, `test_harness.py`).
 - **Component layer wired here** — the markdown that connects the session to the engine:
   - **Agents:** `extractor.md` (`kg-extractor`), `grounder.md` (`kg-grounder`),
-    `annotator.md` (`kg-annotator`), `adversarial-grounder.md` (`kg-adversarial-grounder`).
-  - **Commands:** `/kg-build`, `/kg-ground`, `/kg-query`, `/kg-experiment` — orchestrate the agents
-    via the `Task` tool and the MCP tools.
+    `annotator.md` (`kg-annotator`), `adversarial-grounder.md` (`kg-adversarial-grounder`),
+    `evaluator.md` (`kg-evaluator`).
+  - **Commands:** `/kg-build`, `/kg-ground`, `/kg-query`, `/kg-eval`, `/kg-experiment` — orchestrate the
+    agents via the `Task` tool and the MCP tools.
   - **Skill:** `skills/creativity-graph/SKILL.md` (the build → ground → query operating guide) with
-    on-demand `references/` (`contract.md`, `pack-schema.md`).
+    on-demand `references/` (`contract.md`, `pack-schema.md`, `tools.md`).
   - **Hooks:** `hooks/hooks.json` wiring `SessionStart` (`bootstrap.sh`) and `PreToolUse`
     (`precontext.py`).
 - **Exit test:** `pytest tests/` fully green and `claude plugin validate ./creativity-graph --strict`
   passes; a clean install lists every component (skills, agents, hooks, MCP server).
+
+### Packaging hardening + live validation (v0.1.0)
+
+After `claude plugin validate --strict` passed, the plugin was installed locally — user scope, via a
+single-plugin `marketplace.json` — and the full workflow run end-to-end **through the installed plugin**
+on a fresh vault: `/creativity-graph:kg-build` → `/kg-ground` → `/kg-query`. (Plugin commands are
+namespaced `/creativity-graph:<command>`.) Running it for real surfaced four packaging/quality bugs that
+static review could not — each fixed and re-verified:
+
+- **MCP tool namespace.** A plugin-bundled server's tools are namespaced
+  `mcp__plugin_<plugin>_<server>__<tool>` (here `mcp__plugin_creativity-graph_creativity-graph__kg_write`),
+  **not** `mcp__creativity-graph__kg_write`. Every agent `tools:` / command `allowed-tools:` grant (and
+  doc reference) used the short form, so the `kg-extractor` subagent received no graph tools. Swept all
+  references to the correct prefix.
+- **userConfig → server environment.** `${CLAUDE_PLUGIN_OPTION_*}` does **not** expand inside `.mcp.json`
+  (only `${user_config.KEY}`, `${CLAUDE_PLUGIN_ROOT|DATA}`, `${CLAUDE_PROJECT_DIR}` do), and two
+  self-referential `CLAUDE_PLUGIN_OPTION_*` mappings were *clobbering* the values Claude Code auto-injects
+  — so the server saw no source and rejected every span. `KG_SOURCE_PATH` now uses
+  `${user_config.source_path}`; sensitivity/metrics_mode come from the auto-injected `CLAUDE_PLUGIN_OPTION_*`.
+- **Cold-start spawn race.** Pointing `.mcp.json` `command` straight at
+  `${CLAUDE_PLUGIN_DATA}/.venv/bin/python` let a first-session spawn fail before the `SessionStart` hook
+  finished building the venv; Claude Code cached that as "needs-auth" and dropped every `kg_*` tool for the
+  session. The server now launches via **`scripts/launch_server.sh`** (bash always exists → the MCP spawn
+  always succeeds; the wrapper self-heals the venv before `exec`'ing the server).
+- **`kg_context` query matching.** A natural-language `/kg-query` matched the *whole* question string as one
+  `LIKE` substring and returned zero items (the command fell back to structural lookups). `kg_context` now
+  **tokenizes the query and OR-matches each term** (≥3 chars, deduped) across source/target/relation/span;
+  single-term and empty queries are unchanged; a no-match query still returns nothing.
+- **Manifest.** `userConfig` does not support `enum`/`options` (rejected by `--strict`) — dropped them; set
+  `version 0.1.0`; `source_path` is a `file`-typed option. Added `.claude-plugin/marketplace.json`.
+
+**Live results (demo corpus, fresh vault):**
+
+- `/kg-build` — 31 ACCEPTED / 0 DEMOTED / 0 QUARANTINED / 0 REJECTED; **18 nodes, 12 edges**, every edge
+  `span-present` with a verifying verbatim span; egress `kg_scrub` ran (0 redactions, PII-free demo).
+- `/kg-ground` — queue drained `unverified 12 → 0`: **11 grounded, 1 rejected** (the generality confound —
+  a generic definitional gloss correctly refused, §1.6), **2 failed** (adversarial counter-edges that did
+  not hold). `falsification_counters.failed_or_rejected_edges = 3`, never pruned; verdicts survive a full
+  reprojection (reconciler re-attach).
+- `/kg-query` — answered with `[provenance/epistemic_state]` on every edge and the falsification counters
+  attached; **refused to present the rejected `bridges` claim as fact**, and labelled the structural-bridge
+  advisory as a heuristic.
 
 [Unreleased]: https://github.com/sergiparpal/creativity-graph/commits/main

@@ -17,7 +17,7 @@ under `/tmp/kg-demo/` by driving the real engine (boundary → canon → project
 | 6 — Grounding loop + adversarial grounder + memory of failures | `pytest tests/test_grounding.py -q` + live demo | PASS — **12/12 edges grounded** via `kg_ground`; verdicts **survive a full reproject** (12 reattached, 0 orphaned); 0 failed/rejected on this curated corpus; the `failed`-state survival + falsification-counter path is pinned by `test_grounding.py` |
 | 7 — Annotation agreement + specificity harness | `python -m kg_engine.harness agreement && … specificity` | LOGGED — **Krippendorff α = 0.000** on the 12-edge sample (raw agreement 11/12; α is degenerate under extreme label prevalence — the α-paradox — so the grounding signal **stays advisory**); **specificity gate OFF** (generality_confound_detected=false, rank_churn 0.0 → specificity-weighting does not clearly separate on this small graph; degree remains the honest advisory) |
 | 8 — Ideation comparison | `python -m kg_engine.harness ideation` | LOGGED — see table below; verdict: *graph condition did not clearly beat control* on the harness's diversity/novelty test, **but** the graph arm cut the unsupported-claim rate ~4× (0.083 vs 0.333) and raised utility (0.367 vs 0.167). The novelty metric (1 − source-overlap) rewards untethered text, so control "wins" novelty by inventing; the graph arm trades raw novelty for grounding. Logged; execution proceeds (§4). |
-| 9 — Hardening + packaging | `pytest tests/ -q`; `claude plugin validate --strict` | PASS (core) — full suite **green (52 tests)**; **`claude plugin validate --strict` ✔ passes**; version `0.1.0` set; component layer (5 agents, 5 commands, skill + 3 references) authored, adversarially verified against the engine source, and cross-checked (every example span verifies; every edge-id canonical; every `subagent_type` resolves). Deferred to a future release: headless `--backend` CI path, edges-per-KB injection rate-limit, marketplace publish/`tag`. |
+| 9 — Hardening + packaging | `pytest tests/ -q`; `claude plugin validate --strict` | PASS — full suite **green (53 tests)**; **`claude plugin validate --strict` ✔ passes**; version `0.1.0`; component layer (5 agents, 5 commands, skill + 3 references) authored, adversarially verified against the engine source, and cross-checked (every example span verifies; every edge-id canonical; every `subagent_type` resolves). **Installed locally and the full `/kg-build` → `/kg-ground` → `/kg-query` workflow run end-to-end through the installed plugin** (see *Live validation* below). Deferred to a future release: headless `--backend` CI path, edges-per-KB injection rate-limit, public marketplace publish/`tag`. |
 
 ## Stage 8 ideation table (real harness output, demo corpus)
 
@@ -38,4 +38,28 @@ test (§1.1) — measured, labelled, not shipped as a guarantee.
 - annotation Krippendorff α: **0.000** (degenerate under 11/12 prevalence; signal stays advisory)
 - specificity-metric verdict: **gate OFF** (degree is the honest advisory; specificity-weighted betweenness stays gated)
 - ideation comparison: table above — graph arm most grounded/useful, not most "novel" by the diversity metric
-- test suite: **52 passing** (`pytest tests/ -q`)
+- test suite: **53 passing** (`pytest tests/ -q`)
+
+## Live validation (installed plugin, fresh vault)
+
+The plugin was installed locally (user scope, via a single-plugin `marketplace.json`) and the full
+workflow run end-to-end **through the installed plugin** — `/creativity-graph:kg-build` → `/kg-ground` →
+`/kg-query` on a fresh vault (`/tmp/kg-vault`). Driving it for real surfaced and fixed four packaging/quality
+bugs static review could not (committed):
+
+1. **MCP tool namespace** — plugin tools are `mcp__plugin_<plugin>_<server>__<tool>`, not `mcp__<server>__`;
+   the corrected grants let the `kg-extractor` subagent reach the boundary.
+2. **userConfig env wiring** — `${CLAUDE_PLUGIN_OPTION_*}` doesn't expand in `.mcp.json` and was clobbering
+   the auto-injected values; `KG_SOURCE_PATH` now uses `${user_config.source_path}` so the server reads the source.
+3. **Cold-start spawn race** — the server now launches via `scripts/launch_server.sh` (bash always exists →
+   spawn never fails → no spurious "needs-auth" caching; the wrapper self-heals the venv).
+4. **`kg_context` query matching** — tokenize + OR-match terms so a natural-language `/kg-query` hits
+   (was a 0-item whole-string `LIKE` miss).
+
+Live run results:
+
+- **`/kg-build`** — 31 ACCEPTED / 0 rejected; 18 nodes, 12 span-present edges; egress `kg_scrub` ran (0 redactions).
+- **`/kg-ground`** — `unverified 12 → 0`: **11 grounded, 1 rejected** (generality confound caught), **2 failed**
+  (adversarial counter-edges). `falsification_counters = 3`, never pruned; verdicts survive reprojection.
+- **`/kg-query`** — answered with provenance + falsification counters on every edge; refused to present the
+  rejected `bridges` claim as fact; labelled the structural-bridge advisory as a heuristic.
