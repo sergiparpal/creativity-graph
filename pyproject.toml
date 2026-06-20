@@ -1,0 +1,37 @@
+[project]
+name = "kg-engine"
+version = "0.1.0"
+description = "Deterministic graph engine for the creativity-graph Claude Code plugin"
+requires-python = ">=3.10"
+# Core, always-installed dependencies. Each is verified to install from wheels with no
+# system build toolchain. The heavy/finicky optional layers live under [project.optional-dependencies]
+# so a plain `uv sync` (the SessionStart bootstrap) never hard-fails on a user machine.
+dependencies = [
+    "mcp>=1.2",            # FastMCP server + tool surface (the graph engine interface)
+    "pydantic>=2",         # the boundary contract (P_write validation)
+    "networkx>=3",         # node-link graph.json interchange
+    "pyyaml>=6",           # pack.yaml / glossary loader
+    "python-igraph>=0.11", # graph backend for Leiden
+    "leidenalg>=0.10",     # Leiden community detection
+    "GitPython>=3.1",      # canon atomicity, audit, union-merge
+]
+
+[project.optional-dependencies]
+# Gated embedding layer (metrics_mode == with_embeddings). sqlite-vss ships as a loadable
+# extension; absence degrades gracefully to structure-only signal.
+embeddings = ["sqlite-vss>=0.1"]
+# Deterministic extraction of structured (code/SQL) inputs. Optional for pure-prose corpora.
+treesitter = ["tree_sitter>=0.21", "tree-sitter-languages>=1.10"]
+# Test + dev tooling.
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripts/kg_engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

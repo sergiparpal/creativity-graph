@@ -1,0 +1,151 @@
+"""Stage 3 exit test: boundary invariants + scrubber leakage.
+
+Fabricated edges, undeclared types, and span-less edges are rejected/demoted; truncated JSON is
+rejected with no partial write; a seeded secret never appears in any text leaving the scrubber.
+"""
+from __future__ import annotations
+
+import pytest
+
+from kg_engine.boundary import WritePayload, merge_results_into_nodes, validate_payload
+from kg_engine.model import Disposition
+from kg_engine.scrub import Scrubber
+
+SRC = ("A compression grounds the claims beneath it. Betweenness is confounded by the generality "
+       "confound. Heat flows from hot to cold.")
+
+
+def _by_target(results):
+    return {r.item.target: r for r in results if r.kind == "edge"}
+
+
+def test_span_present_edge_accepted(pack):
+    res = validate_payload(
+        {"edges": [{"source": "compression", "target": "claim", "relation": "grounds",
+                    "span": "A compression grounds the claims beneath it", "authored_by": "agent"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["claim"]
+    assert e.disposition == Disposition.ACCEPTED, e
+
+
+def test_fabricated_span_rejected(pack):
+    res = validate_payload(
+        {"edges": [{"source": "a", "target": "b", "relation": "grounds",
+                    "span": "unicorns cause gravity", "authored_by": "agent"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["b"]
+    assert e.disposition == Disposition.REJECTED and e.reason == "span-not-in-source"
+    assert e.retryable is False  # semantic outcome
+
+
+def test_spanless_edge_rejected(pack):
+    res = validate_payload(
+        {"edges": [{"source": "a", "target": "b", "relation": "grounds", "authored_by": "agent"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["b"]
+    assert e.disposition == Disposition.REJECTED and e.reason == "no-supporting-span"
+
+
+def test_undeclared_edge_type_quarantined(pack):
+    res = validate_payload(
+        {"edges": [{"source": "a", "target": "b", "relation": "smells_like",
+                    "span": "Heat flows from hot to cold", "authored_by": "agent"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["b"]
+    assert e.disposition == Disposition.QUARANTINED and "undeclared-edge-type" in e.reason
+
+
+def test_undeclared_node_type_quarantined(pack):
+    res = validate_payload(
+        {"nodes": [{"label": "Weird", "node_type": "banana"}]}, pack=pack, source_text=SRC)
+    n = next(r for r in res if r.kind == "node")
+    assert n.disposition == Disposition.QUARANTINED and "undeclared-node-type" in n.reason
+
+
+def test_forged_verdict_stripped(pack):
+    res = validate_payload(
+        {"edges": [{"source": "a", "target": "b", "relation": "grounds",
+                    "span": "Heat flows from hot to cold", "authored_by": "human",
+                    "epistemic_state": "grounded"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["b"]
+    assert e.disposition == Disposition.DEMOTED
+    assert "forged-verdict-stripped" in e.reason and "human-claim-stripped" in e.reason
+    assert e.item.epistemic_state.value == "unverified"
+    assert e.item.authored_by.value == "agent"
+
+
+def test_deterministic_edge_needs_no_span(pack):
+    res = validate_payload(
+        {"edges": [{"source": "a", "target": "b", "relation": "grounds", "authored_by": "deterministic"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["b"]
+    assert e.disposition == Disposition.ACCEPTED
+    assert e.item.provenance.value == "span-present"
+
+
+def test_truncated_payload_rejected_no_partial_write(pack):
+    # `complete: false` marks a streamed/truncated payload -> reject whole, no partial write
+    res = validate_payload(
+        {"complete": False,
+         "edges": [{"source": "a", "target": "b", "relation": "grounds",
+                    "span": "A compression grounds the claims beneath it", "authored_by": "agent"}]},
+        pack=pack, source_text=SRC)
+    assert len(res) == 1 and res[0].disposition == Disposition.REJECTED
+    assert res[0].reason == "truncated-payload" and res[0].retryable is True
+    assert not merge_results_into_nodes(res)  # nothing written
+
+
+def test_schema_invalid_rejected():
+    res = validate_payload({"edges": [{"source": "a"}]}, source_text=SRC)  # missing required fields
+    assert res[0].disposition == Disposition.REJECTED and "schema-invalid" in res[0].reason
+
+
+def test_dedup_single_canonical_edge(pack):
+    payload = {"edges": [
+        {"source": "a", "target": "b", "relation": "grounds",
+         "span": "Heat flows from hot to cold", "authored_by": "agent"},
+        {"source": "a", "target": "b", "relation": "grounds",
+         "span": "Heat flows from hot to cold", "authored_by": "agent"},
+    ]}
+    res = validate_payload(payload, pack=pack, source_text=SRC)
+    edges = [r for r in res if r.kind == "edge"]
+    assert any("deduped" in r.reason for r in edges)
+    nodes = merge_results_into_nodes(res)
+    assert sum(len(n.edges) for n in nodes.values()) == 1  # one canonical edge
+
+
+# ---- scrubber leakage (egress, §1.9) -------------------------------------
+
+def test_secret_never_leaves_scrubber():
+    secret = "sk-abcd1234efgh5678ijkl9012"
+    aws = "AKIAIOSFODNN7EXAMPLE"
+    text = f"the api_key={secret} and aws key {aws} relate to entropy"
+    for sens in ("low", "medium", "high"):
+        scrubbed, mapping = Scrubber(sens).scrub(text)
+        assert Scrubber.leaks(scrubbed, [secret, aws]) == [], (sens, scrubbed)
+        # consistent placeholders preserve structure and restore exactly
+        assert Scrubber.restore(scrubbed, mapping) == text
+
+
+def test_pii_scrubbed_per_sensitivity():
+    text = "Contact jane.doe@example.com about Alan Turing's proof."
+    low, _ = Scrubber("low").scrub(text)
+    assert "jane.doe@example.com" in low  # low = secrets only, email survives
+    med, mp = Scrubber("medium").scrub(text)
+    assert "jane.doe@example.com" not in med and Scrubber.restore(med, mp) == text
+    high, hp = Scrubber("high").scrub(text)
+    assert "Alan Turing" not in high  # person heuristic active at high
+
+
+def test_consistent_placeholders_preserve_relation():
+    text = "Alice Smith argues with Bob Jones; Alice Smith later agrees."
+    scrubbed, mapping = Scrubber("high").scrub(text)
+    # the same entity gets the same placeholder both times (relational structure survives)
+    assert scrubbed.count("⟦PERSON:1⟧") == 2
+    assert Scrubber.restore(scrubbed, mapping) == text
+
+
+def test_write_payload_pydantic_roundtrip():
+    wp = WritePayload.model_validate({"nodes": [], "edges": []})
+    assert wp.complete is True

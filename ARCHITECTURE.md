@@ -1,0 +1,117 @@
+# Architecture & shared contract — `kg_engine`
+
+The single source of truth for the data model, the boundary semantics, and every module's public API.
+Tests and implementations both bind to this. Derived from the IMPLEMENTATION-PLAN (§1 design foundations).
+
+## Canon note format
+
+One Markdown file per **node**, named `<node_id>.md`, living under the canon vault
+(`${KG_PROJECT_DIR}/canon/`). YAML frontmatter + free body. Directed **edges** live in the source node's
+`edges:` block.
+
+```markdown
+---
+id: thermo-arrow
+label: "Thermodynamic arrow of time"
+node_type: compression          # from the pack; unknown types -> 'undeclared-type'
+file_type: prose                # prose | code | sql | ...   (for projector/probe)
+provenance: span-present        # span-present | inferred | hypothesized
+authored_by: agent              # deterministic | agent | human
+epistemic_state: unverified     # unverified | grounded | rejected | failed | obsolete
+created_at: "2026-06-20T..."
+updated_at: "2026-06-20T..."
+edges:
+  - id: e_thermo-arrow__grounds__entropy
+    target: entropy
+    relation: grounds
+    provenance: span-present
+    authored_by: agent
+    epistemic_state: unverified
+    span: "the arrow of time is grounded in the increase of entropy"
+    source_file: "source.md"
+    confidence: INFERRED        # EXTRACTED | INFERRED | AMBIGUOUS  (graphify tier, used by f4_probe)
+    confidence_score: 0.62      # float | null
+    verdict_by: null            # human | agent | null  (only set via kg_ground)
+    verdict_at: null
+    notes: ""
+---
+Body prose (the node's definition). May restate cited spans.
+```
+
+## The three axes (§1.3) — orthogonal, never collapsed to one scalar
+
+- `provenance`: `span-present` | `inferred` | `hypothesized`
+- `authored_by`: `deterministic` | `agent` | `human`
+- `epistemic_state`: `unverified` | `grounded` | `rejected` | `failed` | `obsolete`
+
+## Edge identity & single-canonical-edge rule (deterministic tier, §1.4)
+
+Identity = `(source_id, relation, target_id)`. The boundary deduplicates: a second accepted edge with the
+same identity updates the existing one, never creates a duplicate. `edge.id` is derived deterministically:
+`e_{source}__{relation}__{target}` (slugged).
+
+## Boundary dispositions (§1.8) — `validate()` returns one per item
+
+- `ACCEPTED`  — valid; span verifies; type declared. Written to canon, `epistemic_state=unverified`.
+- `DEMOTED`   — written, but a claimed axis is downgraded. Cases: claimed `provenance=span-present` but the
+  span verifies only loosely → demote to `inferred`; claimed `authored_by=human` → demote to `agent`
+  (never forge a human verdict); payload set `epistemic_state` to a verdict → reset to `unverified`.
+- `QUARANTINED` — structurally valid but untrusted; not merged into trusted canon. Cases: undeclared
+  node/edge type (routed to the `undeclared-type` bucket, never silently accepted); reconciler-detected
+  out-of-band epistemic_state transition (forged verdict re-quarantined).
+- `REJECTED`  — hard fail, not written. Cases: no supporting span (`no-supporting-span`); span not found in
+  source (`span-not-in-source`, fabrication); truncated/partial payload; schema-invalid.
+
+`retryable=false` for **semantic** rejections (no-span, span-not-in-source, vague); `retryable=true` for
+**transport** failures (truncation, schema). Reason string always set.
+
+## span-present enforcement (§1.5, the anti-nonsense invariant)
+
+- `authored_by=deterministic` edges are span-present by construction (parser-exact); span auto-trusted.
+- Every non-deterministic (agent) edge MUST carry a non-empty `span`. Missing → `REJECTED/no-supporting-span`.
+- The span must verify against the **original** source text (whitespace-normalized, case-insensitive
+  substring). Restore scrubber placeholders before verifying. Not found → `REJECTED/span-not-in-source`.
+
+## Never-forge-a-verdict (§1.4, §1.8)
+
+A write payload may not assert a verdict. `epistemic_state ∈ {grounded,rejected,failed}` in a write →
+demoted to `unverified`. `authored_by=human` in a write → demoted to `agent`. Verdicts are applied ONLY
+through `kg_ground`, which stamps `verdict_by`, `verdict_at`, and appends an audit record. The reconciler
+re-quarantines any out-of-band epistemic_state transition that lacks a matching audit record.
+
+## Memory of failures (§1.7)
+
+`epistemic_state ∈ {rejected,failed}` edges are negative information: never pruned by the projector,
+surfaced in `kg_context` as falsification counters.
+
+## Derived layer (§1.2) — "contains nothing the canon does not"
+
+`projector.py`: canon → NetworkX node-link `graph.json` + SQLite index. Leiden communities (igraph +
+leidenalg, with a label-propagation fallback if unavailable). Precomputed ranks: local **degree** (cheap
+advisory) and a labelled **structural-bridge** signal (node whose neighbors span ≥2 Leiden communities,
+§1.4/§1.6). Incremental reproject from `git diff built_from_commit..HEAD`; mismatch → SQLite marked stale.
+Embeddings (`sqlite-vss`) only when `metrics_mode=with_embeddings`, as candidate generators.
+
+## Module public API (imports: `from kg_engine import ...`)
+
+- `model`: enums `Provenance, AuthoredBy, EpistemicState, Disposition, Confidence`; dataclasses `Node`,
+  `Edge`; `edge_id(src,rel,tgt)`; `normalize_text(s)`; `span_verifies(span, source_text) -> bool`;
+  frontmatter (de)serialization `node_to_frontmatter`/`node_from_markdown`.
+- `boundary`: pydantic `EdgeIn, NodeIn, WritePayload`; `Disposition` result `ValidationResult(disposition,
+  item, reason, retryable)`; `validate_payload(payload, *, pack, source_text, existing) -> list[result]`.
+- `canon`: `Canon(vault_dir)` with `read_node`, `write_nodes(nodes, *, message)` (atomic + git rollback),
+  `all_nodes`, `all_edges`; `LeaseLock(path, ttl)` with `acquire/heartbeat/release/is_stale`.
+- `reconciler`: `Reconciler(canon, state_path)` with `scan(full_sweep=False) -> ReconcileReport`;
+  `reattach_after_reproject(derived) -> OrphanReport`.
+- `scrub`: `Scrubber(sensitivity)` with `scrub(text) -> (scrubbed, mapping)`; `restore(text, mapping)`.
+- `pack`: pydantic `PackContract`; `load_pack(path) -> PackContract`; `coverage(pack, source_text) -> float`.
+- `projector`: `Projector(canon, derived_dir)` with `project(incremental=True) -> ProjectReport`;
+  `kg_context(query=None, budget=2000) -> dict`.
+- `harness`: `agreement(label_sets) -> alpha`; `specificity(graph, corpus) -> verdict`;
+  `ideation(outputs_by_condition) -> table`.
+- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration (`kg_ping`, `query_graph`,
+  `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_write`, `kg_ground`, `kg_rename`,
+  `kg_metrics`).
+
+All filesystem state goes under `${KG_DATA}` (derived, caches, locks may live with canon under
+`${KG_PROJECT_DIR}`); `${CLAUDE_PLUGIN_ROOT}` is read-only bundled code.

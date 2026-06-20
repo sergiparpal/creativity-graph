@@ -1,0 +1,55 @@
+# Conceptual-theory domain pack (Stage 2), authored from examples/source.md.
+# Node/edge types absent from these lists are routed to the `undeclared-type` bucket by the boundary.
+domain: "conceptual theory"
+version: "0.1.0"
+
+# §1.4: compressions/primitives vs claims vs operations.
+node_types:
+  - compression      # an idea standing in for many observations (predicts to earn its keep)
+  - primitive        # an irreducible defined term
+  - claim            # an assertion relating nodes
+  - metric           # a measurement (degree, betweenness, specificity)
+  - operation        # a process the theory performs (grounding, projection, reconciliation)
+  - failure          # a recorded falsified claim (negative information)
+
+# Relation types the theory actually uses (drawn from the source prose).
+edge_types:
+  - grounds          # X provides verifiable support for Y
+  - attacked_by      # X is challenged by a stronger/more specific Y
+  - reconciles_with  # X resolves an intuition that Y captured imperfectly
+  - bridges          # X joins two otherwise separate communities
+  - collapses_into   # X reduces to / is subsumed by Y
+  - confounded_by    # X's apparent value is inflated by Y
+  - approximates     # X is an honest cheap proxy for Y
+  - defends_against  # X guards the graph against Y
+  - projects         # X is the regenerable projection of Y
+  - survives         # X persists across an operation Y
+
+glossary:
+  compression: "A single idea that stands in for many observations; earns its keep only when it predicts."
+  generality confound: "Failure mode where a vague idea accumulates spurious connections and looks central."
+  span-present: "A claim that cites a verbatim textual span a reader can check."
+  inferred: "A claim asserted without a verifiable span."
+  bridge: "A node that joins two otherwise separate communities of ideas."
+  betweenness: "How often a node lies on shortest paths; the natural but confounded bridge metric."
+  specificity-weighted betweenness: "Betweenness weighted by term rarity; the gated bridge metric."
+  degree: "Count of a node's connections; the honest advisory for importance."
+  failed: "A claim that has been actively falsified; recorded as negative information, never pruned."
+  negative information: "The record of what was refuted, which defends against re-proposal."
+  canon: "The human-editable source of truth carrying the grounding state."
+  derived: "The regenerable, disposable projection of the canon."
+
+# Per-term specificity seeds (IDF-like; higher = rarer/more specific). The harness recomputes IDF over
+# the corpus; these are starting hints so vague terms are not mistaken for bridges (§1.6).
+specificity_seeds:
+  idea: 0.4
+  system: 0.4
+  thing: 0.2
+  claim: 0.8
+  betweenness: 2.4
+  specificity: 2.2
+  compression: 2.0
+  generality: 1.6
+  confound: 2.1
+  reconciler: 2.3
+  falsification: 2.3

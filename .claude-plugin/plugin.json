@@ -1,0 +1,37 @@
+{
+  "name": "creativity-graph",
+  "description": "Turn a non-self-grounding conceptual document into a rigorously-grounded, queryable knowledge graph: a human-editable canon with three-axis provenance, a span-present write boundary, a grounding loop with memory of failures, and a regenerable NetworkX/SQLite derived layer.",
+  "author": {
+    "name": "Sergi Parpal",
+    "email": "sergiparpal@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["knowledge-graph", "grounding", "provenance", "networkx", "mcp"],
+  "userConfig": {
+    "domain": {
+      "type": "string",
+      "title": "Conceptual domain",
+      "description": "The conceptual domain of the source (shapes the domain pack vocabulary).",
+      "default": "conceptual theory"
+    },
+    "source_path": {
+      "type": "string",
+      "title": "Source document path",
+      "description": "Absolute path to the source document the graph is built and grounded against."
+    },
+    "sensitivity": {
+      "type": "string",
+      "title": "Egress sensitivity",
+      "description": "Egress scrubbing aggressiveness: low = secrets only; medium = + structured PII; high = + person/address heuristics.",
+      "options": ["low", "medium", "high"],
+      "default": "medium"
+    },
+    "metrics_mode": {
+      "type": "string",
+      "title": "Metrics mode",
+      "description": "structure_only uses graph structure as signal; with_embeddings adds a gated sqlite-vss candidate generator.",
+      "options": ["structure_only", "with_embeddings"],
+      "default": "structure_only"
+    }
+  }
+}
