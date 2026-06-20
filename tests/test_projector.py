@@ -103,6 +103,33 @@ def test_kg_context_priority_and_failure_counter(canon: Canon):
     assert ctx["items"][0]["epistemic_state"] == "grounded"  # grounded filled first
 
 
+def test_kg_context_query_is_termwise_not_whole_string(canon: Canon):
+    # a multi-word / natural-language query must match edges containing ANY of its terms; a single
+    # LIKE on the whole question string would only match a verbatim substring and always miss.
+    nodes = [
+        Node(id="betweenness", label="Betweenness", edges=[
+            Edge(source="betweenness", target="generality-confound", relation="confounded_by",
+                 span="it is confounded_by the generality confound", epistemic_state=EpistemicState.GROUNDED),
+        ]),
+        Node(id="degree", label="Degree", edges=[
+            Edge(source="degree", target="importance", relation="approximates",
+                 span="degree approximates importance", epistemic_state=EpistemicState.GROUNDED),
+        ]),
+        Node(id="generality-confound"), Node(id="importance"),
+    ]
+    canon.write_nodes(nodes, message="seed")
+    proj = Projector(canon)
+    proj.project()
+    # full-sentence question (would be a 0-item miss under the old whole-string LIKE)
+    q = "Is betweenness confounded by the generality confound and does degree approximate importance?"
+    items = proj.kg_context(query=q)["items"]
+    rels = {(i["source"], i["relation"]) for i in items}
+    assert ("betweenness", "confounded_by") in rels
+    assert ("degree", "approximates") in rels
+    # a term that matches nothing yields no items (no accidental match-all)
+    assert proj.kg_context(query="zzznomatch")["items"] == []
+
+
 def test_get_neighbors_and_shortest_path(canon: Canon):
     _seed(canon)
     proj = Projector(canon)

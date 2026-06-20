@@ -383,9 +383,22 @@ class Projector:
                   "confidence,confidence_score FROM edges")
             ea: list = []
             if query:
-                eq += " WHERE (source LIKE ? OR target LIKE ? OR relation LIKE ? OR span LIKE ?)"
-                like = f"%{query}%"
-                ea = [like, like, like, like]
+                # term-wise OR match: a natural-language question matches edges that contain ANY of its
+                # terms in any field. A single LIKE on the whole string would only match a verbatim
+                # substring of the question, so multi-word queries always missed.
+                import re as _re
+                seen: set = set()
+                terms = [t for t in _re.findall(r"[A-Za-z0-9_-]{3,}", query.lower())
+                         if not (t in seen or seen.add(t))]
+                if terms:
+                    clauses = []
+                    for t in terms:
+                        clauses.append("(source LIKE ? OR target LIKE ? OR relation LIKE ? OR span LIKE ?)")
+                        ea += [f"%{t}%"] * 4
+                    eq += " WHERE (" + " OR ".join(clauses) + ")"
+                else:
+                    eq += " WHERE (source LIKE ? OR target LIKE ? OR relation LIKE ? OR span LIKE ?)"
+                    ea = [f"%{query}%"] * 4
             eq += f" ORDER BY {order}"
             items, used = [], 0
             for r in con.execute(eq, ea):
