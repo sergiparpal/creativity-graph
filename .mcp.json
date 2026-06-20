@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "creativity-graph": {
-      "command": "${CLAUDE_PLUGIN_DATA}/.venv/bin/python",
-      "args": ["-m", "kg_engine.server"],
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch_server.sh"],
       "env": {
         "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}/scripts",
         "KG_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}",
