@@ -1,0 +1,181 @@
+# Changelog
+
+All notable changes to the **creativity-graph** Claude Code plugin are recorded here.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project will
+follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once a `version` is set in
+`.claude-plugin/plugin.json` (omitted during dev so each commit is its own version — Stage 0/§5).
+
+The plugin turns a non-self-grounding conceptual document into a grounded, queryable knowledge
+graph: a human-editable Markdown **canon** (the single source of truth, §1.2), a span-present
+write **boundary**, a **grounding loop** with memory of failures, and a regenerable
+NetworkX/SQLite **derived** layer. The deterministic Python engine (`scripts/kg_engine`) does the
+hard guarantees; the Claude Code session and its subagents do the language work and hand structured
+JSON back across the MCP boundary.
+
+## [Unreleased]
+
+The initial end-to-end build, staged per the implementation plan (§5). Engine: 49 tests green.
+Components: 4 agents, 4 commands, 1 skill, the `SessionStart`/`PreToolUse` hooks, and the
+`creativity-graph` MCP server. Each stage advanced on its own automated exit test (§4).
+
+### Stage 0 — Scaffold + environment bootstrap
+
+- Added the plugin manifest `.claude-plugin/plugin.json` with the `userConfig` enable-time prompts:
+  `domain` (default "conceptual theory"), `source_path`, `sensitivity` (`low|medium|high`, default
+  `medium`), `metrics_mode` (`structure_only|with_embeddings`, default `structure_only`).
+- Added `.mcp.json` registering one server `creativity-graph`, launched with `uv run` against the
+  persistent data dir, exporting `KG_PROJECT_DIR=${CLAUDE_PROJECT_DIR}` and `KG_DATA=${CLAUDE_PLUGIN_DATA}`.
+- Added `pyproject.toml` (uv-managed engine deps) and the `SessionStart` bootstrap
+  (`hooks/bootstrap.sh`): diff the bundled `pyproject.toml` against the copy in `${CLAUDE_PLUGIN_DATA}`
+  and run `uv sync` only on difference, so the venv installs once and re-syncs only on dependency changes.
+- Stubbed `scripts/kg_engine/server.py` exposing `mcp__creativity-graph__kg_ping` →
+  `{name, version, metrics_mode, sensitivity, pack_loaded}`.
+- **Exit test:** `claude plugin validate ./creativity-graph --strict` passes; the plugin loads and
+  `kg_ping` returns the version.
+
+### Stage 1 — Canon + transactional writes + lease lock + reconciler
+
+- `scripts/kg_engine/model.py`: the three orthogonal axes (`Provenance`, `AuthoredBy`,
+  `EpistemicState`, §1.3) plus `Disposition`, `Confidence`; `Node`/`Edge` dataclasses; deterministic
+  `edge_id(src, rel, tgt)` = `e_{source}__{relation}__{target}` (slugged); `normalize_text`,
+  `span_verifies`, and Markdown frontmatter (de)serialization.
+- `scripts/kg_engine/canon.py`: one Markdown note per node with three-axis frontmatter and an `edges:`
+  block. Single-file writes are temp-file + atomic `os.rename`; multi-file mutations use
+  git-as-rollback (`git stash push -u` before `git reset --hard HEAD`, preserving parallel human
+  edits and surfacing the stash). Reclaimable `LeaseLock` (`acquire`/`heartbeat`/`release`/`is_stale`).
+- `scripts/kg_engine/reconciler.py`: `mtime`/`size` pre-filter backed by a periodic full re-hash
+  sweep (the sweep defeats mtime spoofing, §1.8); re-validates out-of-band changes through the
+  boundary; `reattach_after_reproject` re-attaches grounding verdicts to surviving edges and surfaces
+  orphaned verdicts. **An out-of-band `epistemic_state` transition (a forged verdict) is re-quarantined.**
+- **Exit test:** `pytest tests/test_chaos.py` — crash-mid-write recovers via git, a stale lock is
+  always reclaimed, an out-of-band verdict edit is re-quarantined on reconcile.
+
+### Stage 2 — Domain pack + glossary
+
+- Authored `pack/pack.yaml` from `examples/source.md`: node types
+  `compression, primitive, claim, metric, operation, failure`; edge types
+  `grounds, attacked_by, reconciles_with, bridges, collapses_into, confounded_by, approximates,
+  defends_against, projects, survives`; a glossary of defined terms; and per-term `specificity_seeds`
+  (IDF-like hints so vague terms are not mistaken for bridges, §1.6).
+- Added `pack/glossary.md`.
+- `scripts/kg_engine/pack.py`: `PackContract` (Pydantic), `load_pack`, and `coverage(pack, source_text)`.
+  Types outside the pack route to the `undeclared-type` bucket — never silently accepted.
+- **Exit test:** `python -m kg_engine.pack validate pack/pack.yaml [source.md]` passes `PackContract`
+  and reports glossary coverage of the source's defined terms.
+
+### Stage 3 — Staged extractor + boundary + PII scrubber
+
+- `scripts/kg_engine/scrub.py`: `Scrubber(sensitivity)` redacts secrets/keys (always) and PII (per
+  `sensitivity`) using consistent placeholders that preserve relational structure
+  (`⟦PERSON:1⟧ attacked_by ⟦PERSON:2⟧`); the mapping stays local and `restore` rebuilds the original
+  for span verification (§1.9). The scrub protects egress, not the local canon.
+- The egress scrub is now wired into the live path: a new `mcp__creativity-graph__kg_scrub` tool runs
+  the §1.9 egress redaction with consistent placeholders (`⟦SECRET:1⟧` etc.) before text reaches a
+  subagent, and `kg_write` restores placeholder spans to the original for the canon (the boundary
+  stores the restored original span). The MCP tool surface is now **eleven** tools.
+- `scripts/kg_engine/boundary.py`: strict Pydantic `WritePayload`/`NodeIn`/`EdgeIn` (extra fields
+  forbidden) and `validate_payload(...) -> [ValidationResult]`. Enforces span-present (§1.5: every
+  non-deterministic edge cites a verbatim span that verifies against the source), tags the three axes,
+  and returns dispositions `ACCEPTED | DEMOTED | QUARANTINED | REJECTED` with `reason` and
+  `retryable` (`false` for semantic rejections, `true` for transport failures). A truncated payload
+  (`complete` not `true`) is rejected with no partial write; a forged verdict or `authored_by=human`
+  is **demoted** to `unverified`/`agent`, never forged (§1.4/§1.8).
+- `agents/extractor.md` (subagent `kg-extractor`): reads the scrubbed source section by section and
+  emits the contract JSON — nodes, pack-typed edges, and a verbatim supporting span per edge — to
+  `mcp__creativity-graph__kg_write`.
+- **Exit test:** `pytest tests/test_invariants.py` — fabricated/undeclared/span-less edges are
+  rejected or demoted; truncated JSON is rejected; a seeded secret never leaves the scrubber.
+
+### Stage 4 — Extraction evaluation (`f4_probe`)
+
+- Added `scripts/f4_probe.py` (verbatim from Appendix A; standard library only): `summary` to
+  inspect, `sheet --n --out` to emit the labeling CSV, `score` to compute **precision** (exit gate
+  ≥ 0.70), the astrology rate (fabricated+vague), the span-support rate, precision per relation, and
+  a confidence-calibration check.
+- `agents/annotator.md` (subagent `kg-annotator`): labels a sample of extracted edges
+  `correct | fabricated | vague | wrong_type` and records `span_found` (`y|n`), judged strictly
+  against the source — producing the gold CSV `f4_probe score` consumes.
+- **Exit test:** `python scripts/f4_probe.py score labels.csv` prints precision; on a miss the pack
+  and extractor prompt auto-iterate (≤ 3) and the best result is recorded — the plan never halts on a
+  metric (§4).
+
+### Stage 5 — Projector + derived layer + query surface
+
+- `scripts/kg_engine/projector.py`: `Projector(canon, derived_dir).project(incremental=True)`
+  renders the canon to `${CLAUDE_PLUGIN_DATA}/derived/graph.json` (NetworkX node-link interchange) +
+  `index.sqlite`. Runs Leiden communities (`leidenalg`, label-propagation fallback); precomputes,
+  off the hot path, indexed local **degree** (the cheap advisory) and a labelled **structural-bridge**
+  signal (nodes joining ≥2 communities, §1.4/§1.6). Reprojection is incremental from the git diff
+  `built_from_commit..HEAD`; a mismatch marks SQLite stale. **The derived layer contains nothing the
+  canon does not (§1.2).**
+- `scripts/kg_engine/server.py`: the read/query surface — `query_graph`, `get_node`, `get_neighbors`,
+  `shortest_path`, and `kg_context(query, budget=2000)`, which reads precomputed ranks O(1) (never
+  computing centrality in-request), carries provenance + epistemic tier, is hard-capped to a token
+  budget (filled grounded → span-present → inferred), and surfaces
+  `falsification_counters.failed_or_rejected_edges` plus a labelled `structural-bridge` advisory.
+- `hooks/precontext.py`: a `PreToolUse` hook biasing the session toward the graph (query-first).
+- Commands `commands/kg-build.md` (`/kg-build`) and `commands/kg-query.md` (`/kg-query`) orchestrate
+  extract → write → project and answer questions with provenance + falsification counters attached.
+- **Exit test:** `pytest tests/test_projector.py` — `graph.json` round-trips through NetworkX, a
+  one-edge incremental reproject touches only that edge, `kg_context` returns within budget,
+  `get_neighbors`/`shortest_path` are correct on a fixture graph.
+
+### Stage 6 — Grounding loop + adversarial grounder + memory of failures
+
+- `mcp__creativity-graph__kg_ground(target_id, verdict, by, kind, note)` — the **only** way to set a
+  verdict (`grounded | rejected | failed | obsolete`), stamping `verdict_by`/`verdict_at` and an audit
+  record; verdicts survive reprojection via the reconciler (§1.8).
+- `agents/grounder.md` (subagent `kg-grounder`): walks the `unverified` edge queue, re-verifies each
+  span, checks the relation is specific (rejects edges "true" only because generic/unfalsifiable, the
+  generality confound, §1.6), and applies verdicts through `kg_ground`.
+- `agents/adversarial-grounder.md` (subagent `kg-adversarial-grounder`): for each hub candidate,
+  generates the strongest counter-edges and falsifying questions as typed `attacked_by` edges and
+  `kg_ground(verdict="failed")`, bounded by a per-run cap.
+- Memory of failures (§1.7): `rejected`/`failed` edges are non-regenerable negative information —
+  never pruned by the projector, surfaced in `kg_context` as falsification counters.
+- Command `commands/kg-ground.md` (`/kg-ground`) drives the grounding + adversarial passes.
+- **Exit test:** `pytest tests/test_grounding.py` — the grounder drains a fixture queue, a verdict
+  survives a full reproject, the adversarial grounder emits counter-edges for a seeded hub, and a
+  `failed` edge survives a pruning pass and appears as a counter in `kg_context`.
+
+### Stage 7 — Annotation agreement + specificity harness
+
+- `scripts/kg_engine/harness.py` `agreement(...)`: Krippendorff's α across **independent**
+  annotator label sets over the same edge sample (CLI consumes a JSON list of coder dicts with labels
+  `correct|fabricated|vague|wrong_type`). α ≥ 0.67 ⇒ the grounding signal is treated as reliable.
+- `harness.py` `specificity(...)`: compares specificity-weighted betweenness against raw degree and
+  raw betweenness and emits the bridge-metric gate verdict (JSON). The real bridge metric stays
+  **gated** until the harness validates it; degree + the labelled structural-bridge signal remain the
+  honest advisory (§1.6).
+- **Exit test:** `python -m kg_engine.harness agreement && python -m kg_engine.harness specificity`
+  print α and the metric verdict; the outcome is logged and execution proceeds (§4).
+
+### Stage 8 — Ideation comparison
+
+- `harness.py` `ideation(...)`: scores three conditions — **control** (no graph), **graph**
+  (`kg_context` + the structural-bridge advisory), **RAG** (flat retrieval over the same source) — on
+  a fixed prompt set, with labels withheld then revealed, scoring diversity/novelty/apparent utility
+  and flagging unsupported claims (CLI consumes `{"outputs": {"control":[…], "graph":[…], "rag":[…]},
+  "source": "<text>"}`).
+- Command `commands/kg-experiment.md` (`/kg-experiment`) runs and reports the comparison.
+- **Exit test:** `python -m kg_engine.harness ideation` prints the per-condition table plus a verdict;
+  the result is logged and execution proceeds (§4).
+
+### Stage 9 — Hardening + packaging + component layer
+
+- Full suite green (`pytest tests/`): crash recovery, stale-lock, OOB-verdict, ID fuzzing, truncated
+  payload, scrub leakage (`tests/test_chaos.py`, `test_invariants.py`, `test_grounding.py`,
+  `test_projector.py`, `test_pack.py`, `test_harness.py`).
+- **Component layer wired here** — the markdown that connects the session to the engine:
+  - **Agents:** `extractor.md` (`kg-extractor`), `grounder.md` (`kg-grounder`),
+    `annotator.md` (`kg-annotator`), `adversarial-grounder.md` (`kg-adversarial-grounder`).
+  - **Commands:** `/kg-build`, `/kg-ground`, `/kg-query`, `/kg-experiment` — orchestrate the agents
+    via the `Task` tool and the MCP tools.
+  - **Skill:** `skills/creativity-graph/SKILL.md` (the build → ground → query operating guide) with
+    on-demand `references/` (`contract.md`, `pack-schema.md`).
+  - **Hooks:** `hooks/hooks.json` wiring `SessionStart` (`bootstrap.sh`) and `PreToolUse`
+    (`precontext.py`).
+- **Exit test:** `pytest tests/` fully green and `claude plugin validate ./creativity-graph --strict`
+  passes; a clean install lists every component (skills, agents, hooks, MCP server).
+
+[Unreleased]: https://github.com/sergiparpal/creativity-graph/commits/main
