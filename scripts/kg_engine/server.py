@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 from . import __version__
-from .boundary import merge_results_into_nodes, validate_payload
+from .boundary import DEFAULT_MAX_EDGES_PER_KB, merge_results_into_nodes, validate_payload
 from .canon import Canon
 from .model import Disposition, EpistemicState, Node, slug, utcnow
 from .pack import load_pack
@@ -26,7 +26,8 @@ class KGEngine:
     """Stateful facade over canon + boundary + projector + reconciler + scrubber."""
 
     def __init__(self, project_dir, data_dir=None, *, source_path=None, pack_path=None,
-                 sensitivity="medium", metrics_mode="structure_only"):
+                 sensitivity="medium", metrics_mode="structure_only",
+                 max_edges_per_kb=DEFAULT_MAX_EDGES_PER_KB):
         self.project_dir = Path(project_dir)
         self.data_dir = Path(data_dir) if data_dir else (self.project_dir / ".kg-data")
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -37,6 +38,7 @@ class KGEngine:
         self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
         self.sensitivity = sensitivity
         self.metrics_mode = metrics_mode
+        self.max_edges_per_kb = max_edges_per_kb
         self.source_path = Path(source_path) if source_path else None
         self.pack = None
         if pack_path and Path(pack_path).exists():
@@ -75,7 +77,8 @@ class KGEngine:
         # span verification, and store the original in the canon (§1.9).
         restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
         results = validate_payload(payload, pack=self.pack, source_text=self.source_text(),
-                                   existing=self.canon.all_edges(), restore=restore)
+                                   existing=self.canon.all_edges(), restore=restore,
+                                   max_edges_per_kb=self.max_edges_per_kb)
         nodes = merge_results_into_nodes(results)
         info = self.canon.write_nodes(list(nodes.values()), message=message) if nodes else None
         summary: dict = {d.value: 0 for d in Disposition}
@@ -199,17 +202,25 @@ class KGEngine:
 # --------------------------------------------------------------------------- MCP wiring
 
 
-def build_engine_from_env() -> KGEngine:
-    project = os.environ.get("KG_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    data = os.environ.get("KG_DATA")
+def build_engine_from_env(*, project=None, data=None, source=None, pack=None) -> KGEngine:
+    """Construct a KGEngine from environment config, with optional explicit overrides (CLI flags win
+    over env). All resolution — project dir, source, pack auto-discovery, and the flood rate limit —
+    lives here so every caller (MCP server, headless backend) gets identical behavior."""
+    project = project or os.environ.get("KG_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    data = data or os.environ.get("KG_DATA")
     opt = lambda k, d=None: os.environ.get(f"CLAUDE_PLUGIN_OPTION_{k}", d)  # noqa: E731
-    src = opt("SOURCE_PATH") or os.environ.get("KG_SOURCE_PATH")
-    pack_path = os.environ.get("KG_PACK_PATH")
+    src = source or opt("SOURCE_PATH") or os.environ.get("KG_SOURCE_PATH")
+    pack_path = pack or os.environ.get("KG_PACK_PATH")
     if not pack_path:
         guess = Path(project) / "pack" / "pack.yaml"
         pack_path = str(guess) if guess.exists() else None
+    try:
+        rate = float(os.environ["KG_MAX_EDGES_PER_KB"])
+    except (KeyError, ValueError):
+        rate = DEFAULT_MAX_EDGES_PER_KB
     return KGEngine(project, data, source_path=src, pack_path=pack_path,
-                    sensitivity=opt("SENSITIVITY", "medium"), metrics_mode=opt("METRICS_MODE", "structure_only"))
+                    sensitivity=opt("SENSITIVITY", "medium"), metrics_mode=opt("METRICS_MODE", "structure_only"),
+                    max_edges_per_kb=rate)
 
 
 def _register(mcp, engine: KGEngine) -> None:

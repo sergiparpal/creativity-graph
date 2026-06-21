@@ -156,7 +156,19 @@ class Canon:
 
     # ---- paths
     def node_path(self, node_id: str) -> Path:
-        return self.notes_dir / f"{slug(node_id)}.md"
+        """Resolve a node id to its canon file, confined to the vault (§Stage 9 hardened resolver).
+
+        `slug()` already strips path separators, dots, and control bytes, so traversal is structurally
+        impossible; this is the explicit belt-and-suspenders vault-prefix check (logical chroot): a
+        null byte is rejected outright and the resolved path must stay under the canon dir.
+        """
+        if "\x00" in str(node_id):
+            raise ValueError("null byte in node id")
+        notes_dir = self.notes_dir.resolve()
+        p = (notes_dir / f"{slug(node_id)}.md").resolve()
+        if p != notes_dir and notes_dir not in p.parents:
+            raise ValueError(f"path escapes canon vault: {node_id!r}")
+        return p
 
     def exists(self, node_id: str) -> bool:
         return self.node_path(node_id).exists()

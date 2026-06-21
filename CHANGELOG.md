@@ -14,7 +14,7 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
-The initial end-to-end build, staged per the implementation plan (§5). Engine: **53 tests green**.
+The initial end-to-end build, staged per the implementation plan (§5). Engine: **67 tests green**.
 Components: **5 agents, 5 commands**, 1 skill (+3 on-demand references), the `SessionStart`/`PreToolUse`
 hooks, and the `creativity-graph` MCP server. Each stage advanced on its own automated exit test (§4).
 The plugin was then **installed locally and the full workflow run end-to-end** (see *Packaging hardening
@@ -222,5 +222,38 @@ static review could not — each fixed and re-verified:
 - `/kg-query` — answered with `[provenance/epistemic_state]` on every edge and the falsification counters
   attached; **refused to present the rejected `bridges` claim as fact**, and labelled the structural-bridge
   advisory as a heuristic.
+
+### Stage 9 deferred items (now implemented)
+
+The items Stage 9 had parked for a future release, plus the explicit path-resolver hardening from the
+Stage 9 task list — implemented, then hardened against a 6-dimension adversarial review. Engine tests:
+**53 → 67** (+14).
+
+- **Headless `--backend` extraction path** (`scripts/kg_engine/backend.py`, §2.2). The non-interactive
+  counterpart to "the LLM is the session": API-key-driven extraction for CI. It mirrors
+  `agents/extractor.md` — split the source into `##` sections, `kg_scrub` each (egress, §1.9), call the
+  Claude API (`claude-opus-4-8` default; adaptive thinking; `output_config.format` json_schema keyed to
+  the pack vocabulary; no removed sampling params) for nodes/edges/spans, stamp the deterministic axes,
+  and write through the **same `kg_write` boundary** the in-session flow uses. The API call is isolated
+  and the client injectable, so `tests/test_backend.py` exercises the full pipeline (split → extract →
+  stamp → boundary → canon → project) with a fake client and no network, and asserts the request is
+  Opus-4.x-compliant. Ships as the optional `backend` extra (`anthropic>=0.40`); `python -m
+  kg_engine.backend extract`.
+- **Edges-per-KB injection rate-limit** (`scripts/kg_engine/boundary.py`). `validate_payload` caps
+  **net-new** writable edges at `max(64, kb·20)` across the canon; overflow is REJECTED
+  `rate-limited-flood` (`retryable=false`). Deduped edges (re-sent or already canonical) grow the canon
+  by zero and so cost no budget — idempotent `/kg-build` re-runs never trip the limiter (a
+  double-counting bug the adversarial review caught; now regression-tested). Tunable via
+  `KG_MAX_EDGES_PER_KB` (threaded through `KGEngine`); pass `max_edges_per_kb=None` to disable. The
+  2.7 KB demo (~6.5 edges/KB) is far below the bar, so normal builds are unaffected.
+- **Hardened canon path resolver / logical chroot** (`scripts/kg_engine/canon.py`). `Canon.node_path`
+  now rejects null bytes and verifies the resolved path stays under the canon dir — the explicit
+  vault-prefix check on top of the structural `slug()` guarantee.
+- **CI** (`.github/workflows/ci.yml` + `scripts/validate_plugin.py`). On push/PR: full `pytest`, `pack
+  validate`, the Stage 7/8 harness commands, and a deterministic manifest/component check (the hard
+  gate — parses every manifest, checks each component exists, and that the plugin/marketplace versions
+  agree). A best-effort job runs the real `claude plugin validate --strict` when the CLI is installable.
+- **`RELEASE.md`** documents the one remaining outward-facing step left deliberately manual: public
+  marketplace publish + `claude plugin tag`.
 
 [Unreleased]: https://github.com/sergiparpal/creativity-graph/commits/main

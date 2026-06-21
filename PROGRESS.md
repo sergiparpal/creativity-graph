@@ -17,7 +17,7 @@ under `/tmp/kg-demo/` by driving the real engine (boundary → canon → project
 | 6 — Grounding loop + adversarial grounder + memory of failures | `pytest tests/test_grounding.py -q` + live demo | PASS — **12/12 edges grounded** via `kg_ground`; verdicts **survive a full reproject** (12 reattached, 0 orphaned); 0 failed/rejected on this curated corpus; the `failed`-state survival + falsification-counter path is pinned by `test_grounding.py` |
 | 7 — Annotation agreement + specificity harness | `python -m kg_engine.harness agreement && … specificity` | LOGGED — **Krippendorff α = 0.000** on the 12-edge sample (raw agreement 11/12; α is degenerate under extreme label prevalence — the α-paradox — so the grounding signal **stays advisory**); **specificity gate OFF** (generality_confound_detected=false, rank_churn 0.0 → specificity-weighting does not clearly separate on this small graph; degree remains the honest advisory) |
 | 8 — Ideation comparison | `python -m kg_engine.harness ideation` | LOGGED — see table below; verdict: *graph condition did not clearly beat control* on the harness's diversity/novelty test, **but** the graph arm cut the unsupported-claim rate ~4× (0.083 vs 0.333) and raised utility (0.367 vs 0.167). The novelty metric (1 − source-overlap) rewards untethered text, so control "wins" novelty by inventing; the graph arm trades raw novelty for grounding. Logged; execution proceeds (§4). |
-| 9 — Hardening + packaging | `pytest tests/ -q`; `claude plugin validate --strict` | PASS — full suite **green (53 tests)**; **`claude plugin validate --strict` ✔ passes**; version `0.1.0`; component layer (5 agents, 5 commands, skill + 3 references) authored, adversarially verified against the engine source, and cross-checked (every example span verifies; every edge-id canonical; every `subagent_type` resolves). **Installed locally and the full `/kg-build` → `/kg-ground` → `/kg-query` workflow run end-to-end through the installed plugin** (see *Live validation* below). Deferred to a future release: headless `--backend` CI path, edges-per-KB injection rate-limit, public marketplace publish/`tag`. |
+| 9 — Hardening + packaging | `pytest tests/ -q`; `claude plugin validate --strict` | PASS — full suite **green (67 tests)**; **`claude plugin validate --strict` ✔ passes**; version `0.1.0`; component layer (5 agents, 5 commands, skill + 3 references) authored, adversarially verified against the engine source, and cross-checked (every example span verifies; every edge-id canonical; every `subagent_type` resolves). **Installed locally and the full `/kg-build` → `/kg-ground` → `/kg-query` workflow run end-to-end through the installed plugin** (see *Live validation* below). Previously-deferred items now landed (see *Stage 9 deferred items* below): headless `--backend` extraction path (`kg_engine.backend`, §2.2), edges-per-KB injection rate-limit, hardened canon path resolver (logical chroot), and CI (`.github/workflows/ci.yml` + `scripts/validate_plugin.py`). Still deliberately manual: public marketplace publish/`claude plugin tag` (an outward-facing human action — see `RELEASE.md`). |
 
 ## Stage 8 ideation table (real harness output, demo corpus)
 
@@ -38,7 +38,7 @@ test (§1.1) — measured, labelled, not shipped as a guarantee.
 - annotation Krippendorff α: **0.000** (degenerate under 11/12 prevalence; signal stays advisory)
 - specificity-metric verdict: **gate OFF** (degree is the honest advisory; specificity-weighted betweenness stays gated)
 - ideation comparison: table above — graph arm most grounded/useful, not most "novel" by the diversity metric
-- test suite: **53 passing** (`pytest tests/ -q`)
+- test suite: **67 passing** (`pytest tests/ -q`)
 
 ## Live validation (installed plugin, fresh vault)
 
@@ -63,3 +63,31 @@ Live run results:
   (adversarial counter-edges). `falsification_counters = 3`, never pruned; verdicts survive reprojection.
 - **`/kg-query`** — answered with provenance + falsification counters on every edge; refused to present the
   rejected `bridges` claim as fact; labelled the structural-bridge advisory as a heuristic.
+
+## Stage 9 deferred items (now landed)
+
+The three items previously parked plus the explicit path-resolver hardening from the Stage 9 task list,
+implemented, then hardened against a 6-dimension adversarial review (+14 tests, 53 → 67):
+
+1. **Headless `--backend` extraction path** (`scripts/kg_engine/backend.py`, §2.2). API-key-driven
+   extraction for CI / unattended runs, mirroring `agents/extractor.md`: split the source into `##`
+   sections, `kg_scrub` each (egress, §1.9), call Claude (`claude-opus-4-8`, adaptive thinking,
+   `output_config.format` keyed to the pack vocabulary — no removed sampling params) to get
+   nodes+edges+spans, stamp the deterministic axes, and write through the **same `kg_write` boundary**.
+   The API call is isolated and the client injectable, so the full pipeline is unit-tested with a fake
+   client and no network (`tests/test_backend.py`). Ships as the optional `backend` extra (`anthropic`).
+2. **Edges-per-KB injection rate-limit** (`boundary.py`). Net-new writable edges are capped at
+   `max(64, kb·20)` across the canon; the overflow is REJECTED `rate-limited-flood` (`retryable=false`).
+   Deduped edges (re-sent / already canonical) cost no budget, so idempotent `/kg-build` re-runs never
+   trip it (a bug the adversarial review caught and is now regression-tested). Tunable via
+   `KG_MAX_EDGES_PER_KB`; the 2.7 KB demo (~6.5 edges/KB) is far under the bar. `tests/test_hardening.py`.
+3. **Hardened canon path resolver / logical chroot** (`canon.py`). `node_path` now rejects null bytes
+   and asserts the resolved path stays under the canon dir (explicit vault-prefix check on top of the
+   `slug()` guarantee). Covered by `tests/test_hardening.py`.
+4. **CI** (`.github/workflows/ci.yml`). On every push/PR: `pytest tests/`, `pack validate`, the Stage
+   7/8 harness commands, and a deterministic manifest/component check (`scripts/validate_plugin.py`,
+   the hard gate). A best-effort job runs the real `claude plugin validate --strict` when the CLI is
+   installable.
+
+Still deliberately **not** automated: public marketplace publish + `claude plugin tag` — an
+outward-facing, hard-to-reverse human action documented in `RELEASE.md`.

@@ -28,6 +28,12 @@ from .model import (
     span_verifies,
 )
 
+# Anti-injection-flooding rate limit (§Stage 9): a hostile or oversized source must not be able to
+# stuff the canon with unbounded edges. The budget scales with source size but has a floor so normal
+# small corpora are never affected; writable edges past the budget are REJECTED `rate-limited-flood`.
+DEFAULT_MAX_EDGES_PER_KB = 20.0
+MIN_EDGE_BUDGET = 64
+
 
 # --------------------------------------------------------------------------- pydantic contract
 
@@ -99,6 +105,7 @@ def validate_payload(
     source_text: str = "",
     existing: Iterable[Edge] | None = None,
     restore=None,
+    max_edges_per_kb: float | None = DEFAULT_MAX_EDGES_PER_KB,
 ) -> list[ValidationResult]:
     """Validate a raw payload dict/obj. Returns one ValidationResult per item.
 
@@ -106,6 +113,8 @@ def validate_payload(
     `source_text` is the ORIGINAL (unscrubbed) source used for span verification.
     `restore` optionally maps a scrubbed span back to original text before verifying.
     `existing` is the current set of canonical edges (for dedup / single-canonical-edge).
+    `max_edges_per_kb` caps writable edges at `max(MIN_EDGE_BUDGET, kb*rate)` across the canon
+    (existing + this payload), defeating injection flooding (§Stage 9); pass None to disable.
     """
     # 1. schema / truncation -------------------------------------------------
     try:
@@ -142,8 +151,24 @@ def validate_payload(
 
     # 3. edges ---------------------------------------------------------------
     seen = {e.identity for e in (existing or [])}
+    existing_count = len(seen)
+    budget = None
+    if max_edges_per_kb is not None:
+        budget = max(MIN_EDGE_BUDGET, int(len(source_text) / 1024.0 * max_edges_per_kb))
+    written = 0
     for ein in wp.edges:
-        results.append(_validate_edge(ein, edge_types, source_text, restore, seen))
+        r = _validate_edge(ein, edge_types, source_text, restore, seen)
+        # rate limit: once the canon-wide writable-edge budget is exhausted, reject the overflow as a
+        # flood rather than letting it grow the graph unbounded (§Stage 9). Only NET-NEW edges are
+        # charged: a deduped edge (already in the canon or repeated in this payload) grows the canon by
+        # zero, so it must neither consume budget nor be flooded — otherwise an idempotent re-build that
+        # re-emits existing edges would spuriously trip the limiter.
+        if budget is not None and r.written and "deduped" not in r.reason:
+            if existing_count + written >= budget:
+                r = _ok("edge", r.item, Disposition.REJECTED, "rate-limited-flood", False, r.identity)
+            else:
+                written += 1
+        results.append(r)
 
     return results
 
