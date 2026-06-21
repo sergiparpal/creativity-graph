@@ -256,4 +256,19 @@ Stage 9 task list — implemented, then hardened against a 6-dimension adversari
 - The one remaining outward-facing step is left deliberately manual (see `CLAUDE.md`): public
   marketplace publish + `claude plugin tag`.
 
+### Documentation
+
+Streamlined the prose docs to `README` + `ARCHITECTURE` + `PROGRESS` + `CHANGELOG` + a new `CLAUDE.md`;
+the full `.md` set was then audited and verified free of dangling links.
+
+- **Removed `IMPLEMENTATION-PLAN-creativity-graph-claude-code.md`** — the pre-build design doc,
+  superseded by the shipped engine, `ARCHITECTURE.md`, and this changelog; no code, CI, or manifest
+  referenced it. The stale prose pointers to it in `ARCHITECTURE`/`PROGRESS`/`CHANGELOG` were scrubbed.
+- **Removed `RELEASE.md`**, folding the maintainer release checklist (pre-flight validation,
+  dual-manifest version bump, optional headless rebuild, manual publish/tag) into the new **`CLAUDE.md`**;
+  the publish-step mentions in `PROGRESS`/`CHANGELOG` now point there.
+- **Fixed** a dangling reference in `skills/creativity-graph/references/tools.md`: the write-contract
+  pointer now targets the existing `references/contract.md` (it previously named a sibling reference
+  file that did not exist).
+
 [Unreleased]: https://github.com/sergiparpal/creativity-graph/commits/main
