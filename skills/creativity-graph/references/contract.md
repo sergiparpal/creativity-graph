@@ -99,10 +99,13 @@ Valid; span verifies (§5); type declared (§3.5). Written to canon with `episte
 `reason=""`.
 
 ### DEMOTED
-Written, but one axis was downgraded. Reasons (joined by `;` when both fire):
-- `forged-verdict-stripped` — payload set `epistemic_state` to a verdict (`grounded`/`rejected`/`failed`);
-  reset to `unverified` (§4).
+Written, but one axis was downgraded. Reasons (joined by `;` when several fire):
+- `forged-verdict-stripped` — payload set `epistemic_state` to any non-`unverified` state (a verdict
+  `grounded`/`rejected`/`failed`, **or** `obsolete`); reset to `unverified` (§4).
 - `human-claim-stripped` — payload set `authored_by=human`; reset to `agent` (§4).
+- `deterministic-claim-stripped` — payload set `authored_by=deterministic`; reset to `agent`. Only the
+  in-process parser is deterministic; a write can't self-declare it to skip the span-present check (§5),
+  so the edge then needs a verifying span like any agent edge.
 
 (`ARCHITECTURE.md` also lists a span-present→inferred provenance demotion at the boundary; the agent
 extractor should not rely on it — claim only what the span supports.)
@@ -123,13 +126,15 @@ edited straight into canon, bypassing `kg_ground`).
 | `span-not-in-source`  | false     | `span` does not verify against the source — **fabrication** (§5) |
 | `truncated-payload`   | true      | `complete` was false (§1.3) — transport failure, whole payload dropped |
 | `schema-invalid: N errors` | true | Pydantic rejected the shape (extra/missing/mistyped field) |
+| `rate-limited-flood`  | false     | net-new writable **edges or nodes** past the per-payload budget `max(64, kb·20)` — anti-injection cap (§Stage 9) |
 
 `retryable=false` ⇒ **semantic** failure: do not resend the same item; fix the span or drop the edge.
 `retryable=true` ⇒ **transport** failure: re-emit the corrected/whole payload.
 
 ### 3.5 Composite reasons & `deduped`
-Reasons stack with `;`. Order seen in `_validate_edge`: verdict/human demotions first, then span checks
-(which can short-circuit to REJECTED), then undeclared-type, then dedup. A `deduped` marker is appended
+Reasons stack with `;`. Order seen in `_validate_edge`: verdict/authorship demotions first (verdict reset,
+`human`/`deterministic` → `agent`), then span checks (which can short-circuit to REJECTED), then
+undeclared-type, then dedup. A `deduped` marker is appended
 **only** when the edge is otherwise ACCEPTED or DEMOTED and its identity (§6) already exists — the
 single-canonical-edge rule (§1.4) updates the existing edge rather than creating a duplicate. A QUARANTINED
 or REJECTED edge is never tagged `deduped`.

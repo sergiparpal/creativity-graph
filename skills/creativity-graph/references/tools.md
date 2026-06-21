@@ -87,18 +87,18 @@ REJECTED as `truncated-payload`.
 - `written_nodes[]` — node ids actually committed (includes boundary-auto-created placeholder source nodes).
 - `rolled_back` / `stash_ref` — set when the canon write stashed instead of committing.
 
-A write may never set a verdict or `authored_by=human`: such payloads are **DEMOTED** (verdict reset to
-`unverified` → `forged-verdict-stripped`; human → `agent` → `human-claim-stripped`), never accepted as-is.
+A write may never set a non-`unverified` state or claim parser/human authorship: such payloads are
+**DEMOTED** — any verdict or `obsolete` is reset to `unverified` (`forged-verdict-stripped`); `human` →
+`agent` (`human-claim-stripped`); `deterministic` → `agent` (`deterministic-claim-stripped`, so an
+extractor can't dodge span-present by self-declaring parser authorship). None are accepted as-is.
 
-### 1.4 `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, by="agent", kind="edge", note="")`
+### 1.4 `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind="edge", note="")`
 
 **The ONLY path that may set a verdict** (§1.4/§1.8). Stamps the epistemic_state and appends a `ground.audit`
 record so the reconciler treats the transition as legitimate.
 
 - `target_id: str` — an edge id (default `kind="edge"`) or node id (`kind="node"`).
 - `verdict: str` — one of `VALID_VERDICTS = {grounded, rejected, failed, obsolete}` (lower-cased internally).
-- `by: str = "agent"` — recorded as `verdict_by` on the edge (use a person's name for a human verdict — that
-  is the only legitimate route to a human-authored state).
 - `kind: str = "edge"` — `edge` or `node`.
 - `note: str = ""` — appended to the edge's `notes` (e.g. the rejection reason `vague` for a generality-confound
   edge that is "true" only because it is generic/unfalsifiable, §1.6).
@@ -109,8 +109,9 @@ record so the reconciler treats the transition as legitimate.
 ```
 
 On failure: `{"ok": false, "error": "invalid verdict 'maybe'"}` / `"node not found"` / `"edge not found"`.
-For an edge, also sets `verdict_by` and `verdict_at`. Note: the return `key` for a node verdict is
-`node:<id>`; for an edge it is the edge id.
+For an edge, also sets `verdict_by` (always `agent` via this tool — a human verdict cannot be forged
+through the tool surface) and `verdict_at`. Note: the return `key` for a node verdict is `node:<id>`;
+for an edge it is the edge id.
 
 > Adversarial grounding (§1.7): the adversarial grounder adds `attacked_by` edges then calls
 > `kg_ground(target_id=<edge>, verdict="failed")`. Failed/rejected edges are NEGATIVE INFORMATION — never

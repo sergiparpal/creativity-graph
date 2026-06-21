@@ -79,17 +79,20 @@ textual anchor?", "who made it?", and "has it survived checking?" are read separ
 ### The write boundary and its invariants (`boundary.py`)
 The canon is written **only** through `kg_write`, which validates each item into one of four
 dispositions — `ACCEPTED` / `DEMOTED` / `QUARANTINED` / `REJECTED` — enforcing:
-- **span-present (§1.5):** every non-deterministic edge must carry a `span` that is a normalized
-  verbatim substring of the source. No span → `REJECTED:no-supporting-span`; span not found →
-  `REJECTED:span-not-in-source` (fabrication). Paraphrasing is fabrication.
-- **never-forge-a-verdict (§1.4/§1.8):** extractors emit `unverified` only. A payload claiming a
-  verdict (or `authored_by=human`) is silently **DEMOTED**, not honored. Verdicts flow **only**
-  through `kg_ground`; out-of-band edits to `epistemic_state` are re-quarantined by the reconciler.
+- **span-present (§1.5):** every agent edge must carry a `span` that is a normalized verbatim substring
+  of the source. No span → `REJECTED:no-supporting-span`; span not found → `REJECTED:span-not-in-source`
+  (fabrication). Paraphrasing is fabrication. A write claiming `authored_by=deterministic` to skip this
+  check is **DEMOTED** to `agent` (only the in-process parser is deterministic), so it then needs a span.
+- **never-forge-a-verdict (§1.4/§1.8):** extractors emit `unverified` only. A payload setting any
+  non-`unverified` `epistemic_state` (a verdict *or* `obsolete`) or claiming `authored_by=human`/
+  `deterministic` is silently **DEMOTED**, not honored. Verdicts flow **only** through `kg_ground`
+  (which attributes them to the agent — a human verdict can't be forged via the tool); out-of-band
+  edits to `epistemic_state` are re-quarantined by the reconciler.
 - **deterministic edge identity:** `edge_id = e_{slug(source)}__{slug(relation)}__{slug(target)}`.
   Re-emitting the same edge updates rather than duplicates (idempotent builds).
 - **pack vocabulary:** types outside `pack/pack.yaml` (`node_types`/`edge_types`) are `QUARANTINED`,
   never merged into trusted canon.
-- **rate limit:** net-new writable edges are capped (`max(64, kb·20)`); deduped edges cost zero, so
+- **rate limit:** net-new writable edges (and nodes) are capped (`max(64, kb·20)`); deduped edges cost zero, so
   idempotent re-runs never trip it.
 
 `canon.py` makes writes crash-safe (atomic temp+replace for single files; git-stash-as-rollback for

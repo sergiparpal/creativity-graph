@@ -85,7 +85,7 @@ Never construct an id by hand and hope. **Read the `id` field off the edge dict*
       counterexample. If `kg_context.advisory` flagged a node as a `structural-bridge`, weight its edges here.
    d. **Otherwise GROUND it.** The span is present, asserts the relation, and the relation is specific and
       defeasible → `grounded`, note quoting the deciding clause.
-4. **Stamp the verdict** with `kg_ground(target_id=<edge.id>, verdict=..., by="agent", kind="edge", note=...)`.
+4. **Stamp the verdict** with `kg_ground(target_id=<edge.id>, verdict=..., kind="edge", note=...)`.
    Confirm `ok:true` and `from == "unverified"`. If `from` was already a verdict, skip — someone else ruled.
 5. **Report.** Summarize: N grounded, M rejected (broken out by reason: vague / no-support / wrong-relation),
    K skipped, and how many remain `unverified`. Re-run to drain the rest.
@@ -131,7 +131,7 @@ I `Read` `examples/source.md`, then rule each:
   claim is specific and falsifiable (a specific claim can fail to defeat). → GROUND.
   ```
   kg_ground(target_id="e_generality-confound__attacked-by__specificity", verdict="grounded",
-            by="agent", kind="edge",
+            kind="edge",
             note="§1: 'a more specific claim, when it holds, defeats a vaguer one' — specific, defeasible support")
   ```
 
@@ -140,7 +140,7 @@ I `Read` `examples/source.md`, then rule each:
   verifiable span is the check"* is present, asserts `span-present grounds claim`, and it is
   defeasible (a missing/false span breaks it, §1.5). → GROUND.
   ```
-  kg_ground(target_id="e_span-present__grounds__claim", verdict="grounded", by="agent", kind="edge",
+  kg_ground(target_id="e_span-present__grounds__claim", verdict="grounded", kind="edge",
             note="§2: 'Span-present provenance grounds a claim ... because the verifiable span is the check'")
   ```
 
@@ -148,7 +148,7 @@ I `Read` `examples/source.md`, then rule each:
   `idea` and `system` are low-specificity terms (seeds 0.4/0.4); this is a generic hub edge that would inflate
   betweenness for empty reasons — the generality confound exactly (§1.6). Fails check (b) and (c). → REJECT.
   ```
-  kg_ground(target_id="e_idea__bridges__system", verdict="rejected", by="agent", kind="edge",
+  kg_ground(target_id="e_idea__bridges__system", verdict="rejected", kind="edge",
             note="vague: span defines 'compression', asserts no 'bridges' between generic terms idea/system")
   ```
 

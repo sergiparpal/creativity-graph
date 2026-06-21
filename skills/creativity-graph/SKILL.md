@@ -15,7 +15,7 @@ A conceptual document does not verify itself the way code verifies against a par
 (`examples/source.md` §intro). A naive extractor turns such prose into convincing nonsense.
 This plugin extracts a graph, then forces every non-trivial edge to earn its place against the
 *original text* and against adversarial attack. A deterministic Python engine (`scripts/kg_engine`,
-49 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
+79 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
 hand structured JSON back across the MCP boundary. Your job is to orchestrate, not to forge.
 
 ## The model: canon vs derived (§1.2)
@@ -76,10 +76,11 @@ graph tools — `kg-build`, `kg-query`, etc. are slash commands, not tools.
    span not in source → `REJECTED/span-not-in-source` (fabrication). **Copy spans exactly from the
    source; never paraphrase.** From `source.md`: an edge `generality → attacked_by → specificity`
    needs `span: "a more specific claim, when it holds, defeats a vaguer one"`.
-2. **never-forge-a-verdict (§1.4/§1.8).** A `kg_write` payload may NOT assert
-   `grounded/rejected/failed`, nor `authored_by=human`. Such payloads are `DEMOTED` to
-   `unverified`/`agent`. Verdicts come ONLY through `kg_ground`. The reconciler re-quarantines any
-   out-of-band verdict edit.
+2. **never-forge-a-verdict (§1.4/§1.8).** A `kg_write` payload may NOT assert a non-`unverified`
+   `epistemic_state` (`grounded/rejected/failed` *or* `obsolete`), nor claim `authored_by=human` or
+   `deterministic` (the latter would otherwise skip span-present — only the in-process parser is
+   deterministic). Such payloads are `DEMOTED` to `unverified`/`agent`. Verdicts come ONLY through
+   `kg_ground`. The reconciler re-quarantines any out-of-band verdict edit.
 3. **generality confound → degree, not betweenness (§1.6).** A vague node accumulates spurious
    edges and spuriously high betweenness because it touches everything loosely. Plain **degree** is
    the honest MVP advisory (`approximates` importance); **specificity-weighted betweenness** is a
