@@ -5,5 +5,7 @@ __pycache__/
 .pytest_cache/
 .kg-session-lock
 .kg-reconcile-state.json
+.kg-data/
+.tmp-*
 *.Zone.Identifier
 /derived/

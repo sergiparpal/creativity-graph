@@ -7,6 +7,7 @@ so the flow never stalls (§2.4, §4).
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -100,6 +101,9 @@ class KGEngine:
         verdict = verdict.lower()
         if verdict not in VALID_VERDICTS:
             return {"ok": False, "error": f"invalid verdict {verdict!r}"}
+        # `by` is provenance, not a free-text field: clamp to the known actors so a stray value can't
+        # masquerade as a verdict author (the MCP tool surface already pins this to "agent").
+        by = by if by in ("agent", "human", "deterministic") else "agent"
         state = EpistemicState(verdict)
         if kind == "node":
             if not self.canon.exists(target_id):
@@ -108,7 +112,6 @@ class KGEngine:
             frm = node.epistemic_state.value
             node.epistemic_state = state
             key = f"node:{node.id}"
-            self.canon.write_one(node)
         else:
             node = self._owner_of_edge(target_id)
             if node is None:
@@ -121,8 +124,11 @@ class KGEngine:
             if note:
                 edge.notes = (edge.notes + " | " if edge.notes else "") + note
             key = edge.id
-            self.canon.write_one(node)
+        # Append the audit record BEFORE persisting the verdict: a crash between the two would then
+        # leave an audit record with no state change (harmless, unconsumed) rather than a verdict in
+        # the canon with no audit record (which the reconciler would re-quarantine as a forgery).
         self._audit(key, frm, verdict, by)
+        self.canon.write_one(node)
         return {"ok": True, "key": key, "from": frm, "to": verdict, "by": by}
 
     def _owner_of_edge(self, edge_id: str) -> Node | None:
@@ -136,9 +142,12 @@ class KGEngine:
         path = self.canon.root / GROUND_AUDIT
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
+            f.flush()
+            os.fsync(f.fileno())  # the audit log is tamper-evidence; make each record durable
 
     def kg_rename(self, old_id: str, new_id: str, *, message: str = "kg_rename") -> dict:
         """Rename a node and rewrite every edge endpoint referencing it (single-canonical-edge safe)."""
+        from .model import edge_id
         old, new = slug(old_id), slug(new_id)
         if not self.canon.exists(old):
             return {"ok": False, "error": "node not found"}
@@ -149,26 +158,36 @@ class KGEngine:
         for e in node.edges:
             if e.source == old:
                 e.source = new
+            e.id = edge_id(e.source, e.relation, e.target)  # keep edge id consistent with endpoints
         touched = [node]
         for other in self.canon.all_nodes():
             if other.id == old:
                 continue
             changed = False
             for e in other.edges:
+                ec = False
                 if e.target == old:
-                    e.target = new; changed = True
+                    e.target = new; ec = True
                 if e.source == old:
-                    e.source = new; changed = True
+                    e.source = new; ec = True
+                if ec:
+                    e.id = edge_id(e.source, e.relation, e.target)
+                    changed = True
             if changed:
                 touched.append(other)
-        # write new + others, remove the old file
-        info = self.canon.write_nodes(touched, message=message, commit=False)
+        # Write the corrected nodes VERBATIM (merge=False): merging would re-introduce each note's
+        # pre-rename edges (different identity -> not deduped) and leave dangling old-endpoint edges.
+        info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
+        if info.stashed:
+            # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
+            return {"ok": False, "error": "rename rolled back", "stash_ref": info.stash_ref,
+                    "old": old, "new": new}
         self.canon.node_path(old).unlink(missing_ok=True)
         from .canon import _git, _git_ok
         if _git_ok(self.canon.root):
             _git(self.canon.root, "add", "-A", check=False)
             _git(self.canon.root, "commit", "-m", message, "--allow-empty", check=False)
-        return {"ok": not info.stashed, "old": old, "new": new, "touched": [n.id for n in touched]}
+        return {"ok": True, "old": old, "new": new, "touched": [n.id for n in touched]}
 
     def kg_metrics(self) -> dict:
         nodes = self.canon.all_nodes()
@@ -208,14 +227,22 @@ def build_engine_from_env(*, project=None, data=None, source=None, pack=None) ->
     lives here so every caller (MCP server, headless backend) gets identical behavior."""
     project = project or os.environ.get("KG_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     data = data or os.environ.get("KG_DATA")
-    opt = lambda k, d=None: os.environ.get(f"CLAUDE_PLUGIN_OPTION_{k}", d)  # noqa: E731
-    src = source or opt("SOURCE_PATH") or os.environ.get("KG_SOURCE_PATH")
+    # treat an empty env value the same as unset, so a blank `${user_config.*}` substitution falls back
+    # to the documented default instead of an empty string the engine then misreports.
+    opt = lambda k, d=None: (os.environ.get(f"CLAUDE_PLUGIN_OPTION_{k}") or "").strip() or d  # noqa: E731
+    src = source or opt("SOURCE_PATH") or (os.environ.get("KG_SOURCE_PATH") or "").strip() or None
+    if not src:
+        # documented default: build/ground against the bundled example when nothing is configured
+        guess = Path(project) / "examples" / "source.md"
+        src = str(guess) if guess.exists() else None
     pack_path = pack or os.environ.get("KG_PACK_PATH")
     if not pack_path:
         guess = Path(project) / "pack" / "pack.yaml"
         pack_path = str(guess) if guess.exists() else None
     try:
         rate = float(os.environ["KG_MAX_EDGES_PER_KB"])
+        if not math.isfinite(rate) or rate < 0:  # 'nan'/'inf'/negative would crash or disable the limiter
+            rate = DEFAULT_MAX_EDGES_PER_KB
     except (KeyError, ValueError):
         rate = DEFAULT_MAX_EDGES_PER_KB
     return KGEngine(project, data, source_path=src, pack_path=pack_path,
@@ -241,9 +268,11 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_write(payload)
 
     @mcp.tool()
-    def kg_ground(target_id: str, verdict: str, by: str = "agent", kind: str = "edge", note: str = "") -> dict:
-        """Apply a grounding verdict (grounded|rejected|failed|obsolete) to an edge or node."""
-        return engine.kg_ground(target_id, verdict, by=by, kind=kind, note=note)
+    def kg_ground(target_id: str, verdict: str, kind: str = "edge", note: str = "") -> dict:
+        """Apply a grounding verdict (grounded|rejected|failed|obsolete) to an edge or node. Verdicts
+        applied via this tool are always attributed to the agent — a human verdict cannot be forged
+        through the tool surface (§1.4)."""
+        return engine.kg_ground(target_id, verdict, by="agent", kind=kind, note=note)
 
     @mcp.tool()
     def kg_rename(old_id: str, new_id: str) -> dict:

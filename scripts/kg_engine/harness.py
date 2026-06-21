@@ -108,10 +108,16 @@ def specificity(graph_data: dict, corpus: list[str]) -> dict:
     btw_leader_spec = sum(spec[n] for n in top_btw) / max(len(top_btw), 1)
     confound = btw_leader_spec < mean_spec  # leaders are vaguer than average -> confound present
     churn = len(set(top_btw) ^ set(top_w)) / (2 * max(len(top_btw), 1))  # rank movement
-    gate_on = bool(confound and churn > 0.2)
+    # if every node has the same specificity (no IDF spread — e.g. a tiny corpus where the default
+    # dominates), the weighting can't separate anything and the gate must stay closed regardless of
+    # incidental churn. Surface the spread so a degenerate run is legible, not silently "gate ON".
+    spread = (max(spec.values()) - min(spec.values())) if spec else 0.0
+    has_spread = spread > 1e-9
+    gate_on = bool(confound and churn > 0.2 and has_spread)
     return {
         "n": G.number_of_nodes(),
         "mean_specificity": round(mean_spec, 3),
+        "specificity_spread": round(spread, 3),
         "betweenness_leader_specificity": round(btw_leader_spec, 3),
         "top_raw_betweenness": top_btw,
         "top_specificity_weighted": top_w,
@@ -119,7 +125,9 @@ def specificity(graph_data: dict, corpus: list[str]) -> dict:
         "generality_confound_detected": confound,
         "gate_on": gate_on,
         "verdict": ("specificity-weighting earns its place — gate ON" if gate_on
-                    else "specificity-weighting does not clearly separate — stays advisory"),
+                    else ("specificity is uniform (corpus too small / no IDF spread) — stays advisory"
+                          if not has_spread
+                          else "specificity-weighting does not clearly separate — stays advisory")),
     }
 
 
@@ -146,7 +154,9 @@ def _score_condition(outputs: list[str], source_text: str) -> dict:
     for o in outputs:
         ong = _ngrams(o)
         overlap = len(ong & src_ng) / max(len(ong), 1)
-        novelties.append(1.0 - overlap)
+        # an empty/too-short output has no n-grams; score it 0 novelty rather than a free 1.0, so a
+        # condition can't game the experiment by emitting blank or one-word "ideas".
+        novelties.append(1.0 - overlap if ong else 0.0)
         util.append(min(1.0, len(re.findall(r"\bbecause\b|\bif\b|\btherefore\b|\bbridge|\bconnect", o.lower())) / 5))
         sents = [s for s in _SENT.split(o) if len(s.split()) >= 4]
         if sents:
@@ -171,8 +181,11 @@ def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
     g, c = table.get("graph"), table.get("control")
     verdict = "insufficient data"
     if g and c and g["n"] and c["n"]:
-        better = (g["diversity"] >= c["diversity"] and g["novelty"] >= c["novelty"]
-                  and g["unsupported_rate"] <= c["unsupported_rate"] + 0.05)
+        no_regression = (g["diversity"] >= c["diversity"] and g["novelty"] >= c["novelty"]
+                         and g["unsupported_rate"] <= c["unsupported_rate"] + 0.05)
+        # require a STRICT improvement on at least one axis: an exact tie is not a graph win
+        strict_gain = (g["diversity"] > c["diversity"] or g["novelty"] > c["novelty"])
+        better = no_regression and strict_gain
         verdict = ("graph condition produced more diverse/novel ideas without more unsupported claims"
                    if better else "graph condition did NOT clearly beat control")
     return {"table": table, "verdict": verdict}
@@ -222,7 +235,10 @@ def _main(argv: list[str]) -> int:
         path = argv[1] if len(argv) > 1 else None
         if path and Path(path).exists():
             blob = json.loads(Path(path).read_text())
-            obc, src = blob.get("outputs", blob), blob.get("source", "")
+            src = blob.get("source", "")
+            # when outputs aren't nested under "outputs", treat the rest of the blob as conditions but
+            # never let the top-level "source" string leak in as a fake (char-iterated) condition.
+            obc = blob.get("outputs", {k: v for k, v in blob.items() if k != "source"})
         else:
             obc = {"control": ["A is connected to B."], "graph": ["A bridges B and C because entropy grounds time."],
                    "rag": ["A relates to B somehow."]}

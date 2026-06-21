@@ -23,6 +23,7 @@ span_found (y/n): is there an actual textual span in the source supporting it (t
 
 import csv
 import json
+import math
 import random
 import sys
 from collections import Counter, defaultdict
@@ -35,10 +36,31 @@ SHEET_COLS = [
 ]
 GOOD = {"correct"}
 ASTROLOGY = {"fabricated", "vague"}
+VALID_VERDICTS = GOOD | ASTROLOGY | {"wrong_type"}
+TRUE_VALUES = {"y", "yes", "true", "1"}  # accepted spellings for span_found
+
+
+def _flag_str(args, name, default):
+    if name not in args:
+        return default
+    i = args.index(name)
+    if i + 1 >= len(args):
+        sys.exit(f"{name} requires a value")
+    return args[i + 1]
+
+
+def _flag_int(args, name, default):
+    raw = _flag_str(args, name, None)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        sys.exit(f"{name} must be an integer, got {raw!r}")
 
 
 def load(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:  # utf-8-sig tolerates a BOM-prefixed export
         data = json.load(f)
     nodes = data.get("nodes", [])
     edges = data.get("links", data.get("edges", []))
@@ -109,16 +131,21 @@ def sheet(path, n, out, include_extracted):
 
 
 def score(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         rows = [r for r in csv.DictReader(f) if r.get("verdict", "").strip()]
     if not rows:
         sys.exit("no labeled rows (fill the `verdict` column first)")
 
     n = len(rows)
     verdicts = Counter(r["verdict"].strip().lower() for r in rows)
+    unknown = {v: c for v, c in verdicts.items() if v not in VALID_VERDICTS}
+    if unknown:
+        print(f"WARNING: {sum(unknown.values())} row(s) carry an unrecognized verdict "
+              f"{dict(unknown)} (expected {sorted(VALID_VERDICTS)}) — these are excluded from `correct` "
+              f"but still count toward the denominator, deflating precision. Fix them.", file=sys.stderr)
     correct = sum(verdicts[v] for v in GOOD)
     astro = sum(verdicts[v] for v in ASTROLOGY)
-    span_y = sum(1 for r in rows if r.get("span_found", "").strip().lower() == "y")
+    span_y = sum(1 for r in rows if r.get("span_found", "").strip().lower() in TRUE_VALUES)
 
     print(f"labeled edges: {n}\n")
     print(f"PRECISION (correct / labeled):        {correct/n:.2f}   <- exit gate is >= 0.70")
@@ -146,6 +173,8 @@ def score(path):
             cs = float(r.get("confidence_score", ""))
         except (ValueError, TypeError):
             continue
+        if not math.isfinite(cs):  # 'NaN'/'inf' parse to a float but would poison the calibration mean
+            continue
         (cs_correct if r["verdict"].strip().lower() in GOOD else cs_wrong).append(cs)
     if cs_correct and cs_wrong:
         mc, mw = sum(cs_correct)/len(cs_correct), sum(cs_wrong)/len(cs_wrong)
@@ -164,16 +193,18 @@ def main():
         sys.exit(__doc__)
     cmd, path = sys.argv[1], sys.argv[2]
     args = sys.argv[3:]
-    if cmd == "summary":
-        summary(path)
-    elif cmd == "sheet":
-        n = int(args[args.index("--n") + 1]) if "--n" in args else 80
-        out = args[args.index("--out") + 1] if "--out" in args else "labels.csv"
-        sheet(path, n, out, "--include-extracted" in args)
-    elif cmd == "score":
-        score(path)
-    else:
-        sys.exit(__doc__)
+    try:
+        if cmd == "summary":
+            summary(path)
+        elif cmd == "sheet":
+            sheet(path, _flag_int(args, "--n", 80), _flag_str(args, "--out", "labels.csv"),
+                  "--include-extracted" in args)
+        elif cmd == "score":
+            score(path)
+        else:
+            sys.exit(__doc__)
+    except FileNotFoundError as e:
+        sys.exit(f"file not found: {e.filename}")
 
 
 if __name__ == "__main__":

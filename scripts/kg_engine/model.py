@@ -6,6 +6,7 @@ See ARCHITECTURE.md for the full contract.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -69,11 +70,16 @@ _WS = re.compile(r"\s+")
 def normalize_text(s: str) -> str:
     """Whitespace-collapsed, case-folded form used for span verification.
 
-    Curly quotes/dashes are folded to ASCII so a paraphrase-free span still matches a source that
-    differs only by typographic normalization.
+    Applies Unicode NFC normalization (so a verbatim span in NFC matches a source stored as NFD, e.g.
+    macOS/HFS+ paths and copy-paste), strips zero-width / format controls (BOM, ZWSP, word joiner),
+    and folds curly quotes/dashes to ASCII so a paraphrase-free span still matches a source that
+    differs only by typographic or composition-form normalization.
     """
     if s is None:
         return ""
+    s = unicodedata.normalize("NFC", s)
+    # drop zero-width / format controls (Cf) that are invisible but break a substring match
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
     s = (
         s.replace("‘", "'").replace("’", "'")
         .replace("“", '"').replace("”", '"')
@@ -125,8 +131,11 @@ class Edge:
         self.authored_by = AuthoredBy(self.authored_by)
         self.epistemic_state = EpistemicState(self.epistemic_state)
         self.confidence = Confidence(self.confidence)
-        if not self.id:
-            self.id = edge_id(self.source, self.relation, self.target)
+        # endpoints/relation may arrive as non-str from YAML; the id is a deterministic function of
+        # them (single-canonical-edge rule). Always recompute so a stored/forged id can never diverge
+        # from (source, relation, target).
+        self.source, self.relation, self.target = str(self.source), str(self.relation), str(self.target)
+        self.id = edge_id(self.source, self.relation, self.target)
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -166,13 +175,14 @@ class Node:
         self.provenance = Provenance(self.provenance)
         self.authored_by = AuthoredBy(self.authored_by)
         self.epistemic_state = EpistemicState(self.epistemic_state)
-        if not self.label:
-            self.label = self.id
+        # YAML may coerce id/label/timestamps to non-str (numbers, booleans, datetime). Coerce to str
+        # so frontmatter() stays JSON-serializable (the projector hashes json.dumps(frontmatter)) and a
+        # falsy-but-present label (0 / false) is not mistaken for "missing" and overwritten by the id.
+        self.id = str(self.id)
+        self.label = self.id if self.label in (None, "") else str(self.label)
         now = utcnow()
-        if not self.created_at:
-            self.created_at = now
-        if not self.updated_at:
-            self.updated_at = now
+        self.created_at = str(self.created_at) if self.created_at else now
+        self.updated_at = str(self.updated_at) if self.updated_at else now
         self.edges = [e if isinstance(e, Edge) else Edge.from_dict(e, source=self.id) for e in self.edges]
 
     def frontmatter(self) -> dict[str, Any]:

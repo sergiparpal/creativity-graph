@@ -75,13 +75,31 @@ def test_forged_verdict_stripped(pack):
     assert e.item.authored_by.value == "agent"
 
 
-def test_deterministic_edge_needs_no_span(pack):
+def test_deterministic_authorship_claim_does_not_bypass_span_present(pack):
+    # §1.5 anti-bypass: a write can't dodge span verification by self-declaring `deterministic`.
+    # The claim is demoted to `agent`, so a span-less "deterministic" edge is REJECTED like any other.
     res = validate_payload(
         {"edges": [{"source": "a", "target": "b", "relation": "grounds", "authored_by": "deterministic"}]},
         pack=pack, source_text=SRC)
     e = _by_target(res)["b"]
-    assert e.disposition == Disposition.ACCEPTED
-    assert e.item.provenance.value == "span-present"
+    assert e.disposition == Disposition.REJECTED and e.reason == "no-supporting-span"
+    assert e.item.authored_by.value == "agent"  # the deterministic claim was stripped
+
+    # a fabricated span doesn't slip through under a deterministic claim either
+    res = validate_payload(
+        {"edges": [{"source": "a", "target": "b", "relation": "grounds",
+                    "authored_by": "deterministic", "span": "unicorns cause gravity"}]},
+        pack=pack, source_text=SRC)
+    assert _by_target(res)["b"].disposition == Disposition.REJECTED
+
+    # but a deterministic claim with a REAL verifying span is written — demoted to agent
+    res = validate_payload(
+        {"edges": [{"source": "a", "target": "b", "relation": "grounds",
+                    "authored_by": "deterministic", "span": "Heat flows from hot to cold"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["b"]
+    assert e.disposition == Disposition.DEMOTED and "deterministic-claim-stripped" in e.reason
+    assert e.item.authored_by.value == "agent"
 
 
 def test_truncated_payload_rejected_no_partial_write(pack):

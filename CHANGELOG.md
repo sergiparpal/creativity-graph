@@ -14,11 +14,55 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
-The initial end-to-end build. Engine: **67 tests green**.
+The initial end-to-end build. Engine: **79 tests green**.
 Components: **5 agents, 5 commands**, 1 skill (+3 on-demand references), the `SessionStart`/`PreToolUse`
 hooks, and the `creativity-graph` MCP server. Each stage advanced on its own automated exit test.
 The plugin was then **installed locally and the full workflow run end-to-end** (see *Packaging hardening
 + live validation* below).
+
+### Review-findings hardening pass
+
+An exhaustive multi-agent review (per-module + cross-cutting, each finding adversarially verified)
+surfaced two invariant bypasses and a set of correctness/robustness defects. All were fixed; 12
+regression tests were added (`tests/test_review_fixes.py`).
+
+- **Fixed (critical) — span-present was bypassable.** `boundary.py` now demotes a write payload's
+  `authored_by=deterministic` claim to `agent` (like `human`), so an extractor can no longer skip span
+  verification by self-declaring parser authorship. `epistemic_state` stripping was generalised from
+  the three verdicts to *any* non-`unverified` state, so `obsolete` can't be forged on a write either.
+- **Fixed (critical) — the mtime-spoof defence never ran.** The `SessionStart` reconcile now runs a
+  **full re-hash sweep** (`scan(full_sweep=True)`); the per-file mtime/size pre-filter is only a
+  within-session optimisation.
+- **Fixed (critical) — stale reads.** `Projector.is_stale()` now compares per-node content hashes (not
+  just `built_from_commit`), so a `kg_ground` verdict (written with no commit) and non-git vaults
+  reproject on the next read.
+- **Fixed (high) — `graph.json` dropped parallel typed edges.** The projector builds a `MultiDiGraph`,
+  so two edges sharing `(source, target)` but differing in `relation` both survive.
+- **Fixed (high) — projection crash on human-edited timestamps.** `Node` now coerces
+  `id`/`label`/`created_at`/`updated_at` to `str`, so an unquoted YAML datetime no longer raises
+  `TypeError` when the projector hashes the frontmatter.
+- **Fixed (high) — one malformed canon note crashed every read/scan.** `all_nodes()` and the reconciler
+  sweep skip an unreadable note instead of propagating.
+- **Fixed (high) — forged-verdict re-quarantine was replay-able.** The reconciler now *consumes* audit
+  records (counts, not set membership), so replaying a previously-audited verdict out-of-band is caught.
+- **Fixed (high) — `kg_rename` could lose a node** (old note unlinked even on rollback) and left stale
+  edge ids / dangling endpoints; it now rewrites every endpoint + id, writes verbatim (no re-merge),
+  and only deletes the old note on success.
+- **Fixed (high) — secret leaks in the scrubber** (multi-word/quoted values and underscored key names
+  like `aws_secret_access_key`); added bare-`Bearer` and IPv6 coverage; IP now scrubs before phone.
+- **Fixed (medium) — scrubber placeholder collision** across `kg_scrub` calls corrupted the restore map
+  (recovered the wrong original into the canon); the `Scrubber` now keeps one placeholder namespace per
+  session. The write boundary also caps net-new **nodes** (not just edges), demotes a forged `human`
+  verdict author on `kg_ground` (the MCP tool drops the `by` arg), span-verification applies Unicode NFC
+  normalisation and strips zero-width chars, and `confidence_score` is clamped to `[0,1]` (NaN dropped).
+- **Fixed (medium/low) — input & ops hardening:** `KG_MAX_EDGES_PER_KB=nan/inf` no longer crashes
+  `kg_write`; `query_graph` clamps a negative `LIMIT`; `kg_context` escapes SQL `LIKE` wildcards; the
+  atomic writer fsyncs the parent dir; the lease lock is now actually acquired (re-entrant, O_EXCL) and
+  excluded from git; `validate_plugin.py` rejects a non-string version and cross-checks
+  `pyproject.toml`/`__init__` versions; `f4_probe.py` validates the verdict vocabulary, parses flags
+  safely, drops non-finite confidences, and reads BOM-tolerant CSV; `bootstrap.sh` only records a
+  successful sync; the headless backend surfaces refusal `stop_details`. Bumped the `anthropic`
+  dependency floor for the backend's `output_config`/adaptive-thinking usage.
 
 ### Stage 0 — Scaffold + environment bootstrap
 

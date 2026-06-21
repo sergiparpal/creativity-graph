@@ -49,33 +49,42 @@ class Reconciler:
     def _load_state(self) -> dict:
         try:
             return json.loads(self.state_path.read_text())
-        except (FileNotFoundError, ValueError):
-            return {"files": {}, "epistemic": {}}
+        except (FileNotFoundError, ValueError, OSError):
+            return {"files": {}, "epistemic": {}, "consumed": {}}
 
     def _save_state(self, state: dict) -> None:
         from .canon import _atomic_write
         _atomic_write(self.state_path, json.dumps(state, indent=0))
 
-    def _audit_set(self) -> set[tuple[str, str]]:
-        """Set of (key, state) verdict transitions justified by a kg_ground audit record."""
-        ok: set[tuple[str, str]] = set()
+    def _audit_counts(self) -> dict[str, int]:
+        """How many kg_ground audit records justify each `key -> state` transition. Counting (rather
+        than set-membership) is what defeats a *replay*: each legitimate transition consumes exactly
+        one record, so re-applying a previously-audited verdict out-of-band has no record left to
+        justify it and is caught as a forgery."""
+        counts: dict[str, int] = {}
         try:
-            for line in self.audit_path.read_text().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
+            lines = self.audit_path.read_text().splitlines()
+        except (FileNotFoundError, OSError):
+            return counts
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
                 rec = json.loads(line)
-                ok.add((rec.get("key", ""), rec.get("to", "")))
-        except (FileNotFoundError, ValueError):
-            pass
-        return ok
+            except ValueError:
+                continue  # one corrupt audit line must not blind the reconciler to the rest
+            counts[f"{rec.get('key', '')}||{rec.get('to', '')}"] = (
+                counts.get(f"{rec.get('key', '')}||{rec.get('to', '')}", 0) + 1)
+        return counts
 
     # ---- scan
     def scan(self, full_sweep: bool = False) -> ReconcileReport:
         state = self._load_state()
         files_state: dict = state.get("files", {})
         epistemic: dict = state.get("epistemic", {})
-        audit = self._audit_set()
+        consumed: dict = state.get("consumed", {})
+        audit = self._audit_counts()
         report = ReconcileReport(full_sweep=full_sweep)
 
         for p in sorted(self.canon.notes_dir.glob("*.md")):
@@ -94,12 +103,15 @@ class Reconciler:
                 continue
 
             report.changed.append(rel)
-            node = self.canon.read_node(p.stem)
+            try:
+                node = self.canon.read_node(p.stem)
+            except Exception:  # noqa: BLE001 — a single malformed note must not crash the sweep
+                continue  # leave its file_state untouched so it's retried next scan
             mutated = False
 
             # node-level forged verdict
             nkey = f"node:{node.id}"
-            if self._forged(nkey, node.epistemic_state, epistemic, audit):
+            if self._forged(nkey, node.epistemic_state, epistemic, consumed, audit):
                 node.epistemic_state = EpistemicState.UNVERIFIED
                 report.requarantined.append(node.id)
                 mutated = True
@@ -108,7 +120,7 @@ class Reconciler:
             # edge-level forged verdicts
             for e in node.edges:
                 ekey = e.id
-                if self._forged(ekey, e.epistemic_state, epistemic, audit):
+                if self._forged(ekey, e.epistemic_state, epistemic, consumed, audit):
                     e.epistemic_state = EpistemicState.UNVERIFIED
                     e.verdict_by = None
                     e.verdict_at = None
@@ -122,24 +134,31 @@ class Reconciler:
                 digest = _sha256(p)
             files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest}
 
-        # drop state for files that disappeared
-        for rel in list(files_state):
-            if not (self.canon.notes_dir / rel).exists():
-                del files_state[rel]
+        # drop state for files that disappeared (and their epistemic entries, to bound growth)
+        live = {p.name for p in self.canon.notes_dir.glob("*.md")}
+        for rel in [r for r in files_state if r not in live]:
+            del files_state[rel]
 
-        self._save_state({"files": files_state, "epistemic": epistemic})
+        self._save_state({"files": files_state, "epistemic": epistemic, "consumed": consumed})
         return report
 
     @staticmethod
-    def _forged(key: str, current: EpistemicState, epistemic: dict, audit: set) -> bool:
-        """True if `current` is a verdict state reached out-of-band (differs from last validated and
-        is not justified by a kg_ground audit record)."""
+    def _forged(key: str, current: EpistemicState, epistemic: dict, consumed: dict,
+                audit: dict[str, int]) -> bool:
+        """True if `current` is a verdict state reached out-of-band: it differs from the last validated
+        state for this key and there is no UNCONSUMED kg_ground audit record justifying a transition
+        into `current`. Each legitimate transition consumes one audit record, so replaying a stale
+        verdict (whose record was already spent) is caught."""
         if current not in VERDICT_STATES:
             return False
         last = epistemic.get(key)
         if last == current.value:
-            return False  # already known/validated at this verdict
-        return (key, current.value) not in audit
+            return False  # unchanged since last validated — nothing new to justify
+        pair = f"{key}||{current.value}"
+        if audit.get(pair, 0) > consumed.get(pair, 0):
+            consumed[pair] = consumed.get(pair, 0) + 1  # spend exactly one record for this transition
+            return False
+        return True
 
     # ---- post-reproject reattachment
     def reattach_after_reproject(self, graph_json: str | Path) -> OrphanReport:
@@ -150,7 +169,9 @@ class Reconciler:
             return report
         derived_edge_ids = {e.get("id") for e in data.get("links", data.get("edges", []))}
         for e in self.canon.all_edges():
-            if e.epistemic_state in (VERDICT_STATES | {EpistemicState.OBSOLETE}):
+            # only true verdicts (grounded/rejected/failed) are "verdicts" that can be orphaned;
+            # OBSOLETE is a lifecycle state, not a verdict, so it is not reported here.
+            if e.epistemic_state in VERDICT_STATES:
                 if e.id in derived_edge_ids:
                     report.reattached += 1
                 else:

@@ -54,8 +54,10 @@ same identity updates the existing one, never creates a duplicate. `edge.id` is 
 
 - `ACCEPTED`  — valid; span verifies; type declared. Written to canon, `epistemic_state=unverified`.
 - `DEMOTED`   — written, but a claimed axis is downgraded. Cases: claimed `provenance=span-present` but the
-  span verifies only loosely → demote to `inferred`; claimed `authored_by=human` → demote to `agent`
-  (never forge a human verdict); payload set `epistemic_state` to a verdict → reset to `unverified`.
+  span verifies only loosely → demote to `inferred`; claimed `authored_by=human` **or** `deterministic` →
+  demote to `agent` (a write payload may not forge a human verdict *or* a parser-authored, span-exempt
+  edge); payload set `epistemic_state` to any non-`unverified` state (a verdict **or** `obsolete`) → reset
+  to `unverified` (those flow only through `kg_ground`).
 - `QUARANTINED` — structurally valid but untrusted; not merged into trusted canon. Cases: undeclared
   node/edge type (routed to the `undeclared-type` bucket, never silently accepted); reconciler-detected
   out-of-band epistemic_state transition (forged verdict re-quarantined).
@@ -67,8 +69,11 @@ same identity updates the existing one, never creates a duplicate. `edge.id` is 
 
 ## span-present enforcement (§1.5, the anti-nonsense invariant)
 
-- `authored_by=deterministic` edges are span-present by construction (parser-exact); span auto-trusted.
-- Every non-deterministic (agent) edge MUST carry a non-empty `span`. Missing → `REJECTED/no-supporting-span`.
+- An `authored_by=deterministic` edge is span-present by construction (parser-exact) **only when it comes
+  from the in-process parser**. A *write payload* cannot self-declare `deterministic` to skip the span
+  check: the boundary demotes that claim to `agent`, so the edge then needs a verifying span like any
+  other. (Span-present must be unreachable-around, not opt-out.)
+- Every agent edge MUST carry a non-empty `span`. Missing → `REJECTED/no-supporting-span`.
 - The span must verify against the **original** source text (whitespace-normalized, case-insensitive
   substring). Restore scrubber placeholders before verifying. Not found → `REJECTED/span-not-in-source`.
 
@@ -89,14 +94,16 @@ surfaced in `kg_context` as falsification counters.
 `projector.py`: canon → NetworkX node-link `graph.json` + SQLite index. Leiden communities (igraph +
 leidenalg, with a label-propagation fallback if unavailable). Precomputed ranks: local **degree** (cheap
 advisory) and a labelled **structural-bridge** signal (node whose neighbors span ≥2 Leiden communities,
-§1.4/§1.6). Incremental reproject from `git diff built_from_commit..HEAD`; mismatch → SQLite marked stale.
+§1.4/§1.6). Incremental reproject keyed by a **per-node content hash** of (frontmatter + body): a node
+whose hash changed is re-emitted; staleness (`is_stale`) compares both `built_from_commit` and the hash
+set, so an uncommitted change — a `kg_ground` verdict, a hand edit, or a non-git vault — still reprojects.
 Embeddings (`sqlite-vss`) only when `metrics_mode=with_embeddings`, as candidate generators.
 
 ## Module public API (imports: `from kg_engine import ...`)
 
 - `model`: enums `Provenance, AuthoredBy, EpistemicState, Disposition, Confidence`; dataclasses `Node`,
   `Edge`; `edge_id(src,rel,tgt)`; `normalize_text(s)`; `span_verifies(span, source_text) -> bool`;
-  frontmatter (de)serialization `node_to_frontmatter`/`node_from_markdown`.
+  frontmatter (de)serialization `node_to_markdown`/`node_from_markdown` (+ `Node.frontmatter()`).
 - `boundary`: pydantic `EdgeIn, NodeIn, WritePayload`; `Disposition` result `ValidationResult(disposition,
   item, reason, retryable)`; `validate_payload(payload, *, pack, source_text, existing) -> list[result]`.
 - `canon`: `Canon(vault_dir)` with `read_node`, `write_nodes(nodes, *, message)` (atomic + git rollback),
@@ -104,7 +111,7 @@ Embeddings (`sqlite-vss`) only when `metrics_mode=with_embeddings`, as candidate
 - `reconciler`: `Reconciler(canon, state_path)` with `scan(full_sweep=False) -> ReconcileReport`;
   `reattach_after_reproject(derived) -> OrphanReport`.
 - `scrub`: `Scrubber(sensitivity)` with `scrub(text) -> (scrubbed, mapping)`; `restore(text, mapping)`.
-- `pack`: pydantic `PackContract`; `load_pack(path) -> PackContract`; `coverage(pack, source_text) -> float`.
+- `pack`: pydantic `PackContract`; `load_pack(path) -> PackContract`; `coverage(pack, source_text) -> dict`.
 - `projector`: `Projector(canon, derived_dir)` with `project(incremental=True) -> ProjectReport`;
   `kg_context(query=None, budget=2000) -> dict`.
 - `harness`: `agreement(label_sets) -> alpha`; `specificity(graph, corpus) -> verdict`;

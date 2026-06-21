@@ -184,7 +184,13 @@ class BackendExtractor:
         )
         stop = getattr(resp, "stop_reason", None)
         if stop == "refusal":
-            raise RuntimeError(f"model refused extraction for section {title!r}")
+            details = getattr(resp, "stop_details", None)
+            cat = getattr(details, "category", None)
+            expl = getattr(details, "explanation", None)
+            raise RuntimeError(
+                f"model refused extraction for section {title!r}"
+                + (f" (category={cat})" if cat else "")
+                + (f": {expl}" if expl else ""))
         if stop == "max_tokens":
             # structured output truncated mid-JSON; surface a diagnosable error rather than a raw
             # JSONDecodeError on the partial payload.
@@ -213,9 +219,11 @@ class BackendExtractor:
         ]
         edges = [
             {
-                "source": e["source"],
-                "target": e["target"],
-                "relation": e["relation"],
+                # tolerate a malformed model edge missing a required key: emit empties so the boundary
+                # rejects it cleanly rather than crashing the whole run with a KeyError
+                "source": e.get("source", ""),
+                "target": e.get("target", ""),
+                "relation": e.get("relation", ""),
                 "span": e.get("span", ""),
                 "source_file": sf,
                 "provenance": "span-present",

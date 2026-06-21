@@ -24,6 +24,11 @@ def main() -> int:
     if not project:
         return 0
     data = os.environ.get("CLAUDE_PLUGIN_DATA") or str(pathlib.Path(project) / ".kg-data")
+    # Check the index exists BEFORE constructing the engine — Canon()/Projector() mkdir their dirs,
+    # and this hook runs on every Grep/Glob/Read; don't create the canon/derived tree as a side effect
+    # when nothing has been projected yet.
+    if not (pathlib.Path(data) / "derived" / "index.sqlite").exists():
+        return 0
     try:
         from kg_engine.canon import Canon
         from kg_engine.projector import Projector

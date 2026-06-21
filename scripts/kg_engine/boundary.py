@@ -9,6 +9,7 @@ Enforces, in the deterministic tier (§1.4):
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -25,7 +26,7 @@ from .model import (
     UNDECLARED_TYPE,
     VERDICT_STATES,
     edge_id,
-    span_verifies,
+    normalize_text,
 )
 
 # Anti-injection-flooding rate limit (§Stage 9): a hostile or oversized source must not be able to
@@ -129,35 +130,51 @@ def validate_payload(
     node_types = set(getattr(pack, "node_types", None) or []) if pack is not None else None
     edge_types = set(getattr(pack, "edge_types", None) or []) if pack is not None else None
 
+    # flood budget (§Stage 9): a single ceiling on net-new writable items, applied independently to
+    # nodes and to edges so a hostile/oversized payload can't stuff the canon with either.
+    budget = None
+    if max_edges_per_kb is not None:
+        budget = max(MIN_EDGE_BUDGET, int(len(source_text) / 1024.0 * max_edges_per_kb))
+
     results: list[ValidationResult] = []
 
     # 2. nodes ---------------------------------------------------------------
+    written_nodes = 0
     for nin in wp.nodes:
         node = _canon_node(nin)
         disp, reason = Disposition.ACCEPTED, ""
-        # never-forge-a-verdict
-        if EpistemicState(nin.epistemic_state) in VERDICT_STATES:
+        # never-forge-a-state: a write may assert only `unverified`. grounded/rejected/failed/obsolete
+        # all flow ONLY through kg_ground; reset any other claimed state.
+        if EpistemicState(nin.epistemic_state) != EpistemicState.UNVERIFIED:
             node.epistemic_state = EpistemicState.UNVERIFIED
             disp, reason = Disposition.DEMOTED, "forged-verdict-stripped"
-        if AuthoredBy(nin.authored_by) == AuthoredBy.HUMAN:
+        # never-forge-authorship: only the in-process parser is `deterministic` and only a real person
+        # is `human`; a write payload claiming either is an untrusted forge -> demote to `agent`.
+        claimed = AuthoredBy(nin.authored_by)
+        if claimed != AuthoredBy.AGENT:
             node.authored_by = AuthoredBy.AGENT
-            disp, reason = Disposition.DEMOTED, (reason + ";" if reason else "") + "human-claim-stripped"
+            tag = "human-claim-stripped" if claimed == AuthoredBy.HUMAN else "deterministic-claim-stripped"
+            disp = Disposition.DEMOTED
+            reason = (reason + ";" if reason else "") + tag
         # undeclared type -> quarantine bucket (never silently accepted)
         if node_types is not None and node.node_type not in node_types:
-            node.node_type = UNDECLARED_TYPE if node.node_type == UNDECLARED_TYPE else node.node_type
             disp = Disposition.QUARANTINED
             reason = (reason + ";" if reason else "") + "undeclared-node-type"
+        # flood guard: cap net-new writable nodes
+        if budget is not None and disp in (Disposition.ACCEPTED, Disposition.DEMOTED):
+            if written_nodes >= budget:
+                disp, reason = Disposition.REJECTED, "rate-limited-flood"
+            else:
+                written_nodes += 1
         results.append(_ok("node", node, disp, reason, retryable=False, identity=node.id))
 
     # 3. edges ---------------------------------------------------------------
     seen = {e.identity for e in (existing or [])}
     existing_count = len(seen)
-    budget = None
-    if max_edges_per_kb is not None:
-        budget = max(MIN_EDGE_BUDGET, int(len(source_text) / 1024.0 * max_edges_per_kb))
     written = 0
+    norm_source = normalize_text(source_text)  # normalize the source ONCE, not per edge
     for ein in wp.edges:
-        r = _validate_edge(ein, edge_types, source_text, restore, seen)
+        r = _validate_edge(ein, edge_types, norm_source, restore, seen)
         # rate limit: once the canon-wide writable-edge budget is exhausted, reject the overflow as a
         # flood rather than letting it grow the graph unbounded (§Stage 9). Only NET-NEW edges are
         # charged: a deduped edge (already in the canon or repeated in this payload) grows the canon by
@@ -187,7 +204,7 @@ def _slug_label(label: str) -> str:
     return slug(label)
 
 
-def _validate_edge(ein, edge_types, source_text, restore, seen) -> ValidationResult:
+def _validate_edge(ein, edge_types, norm_source, restore, seen) -> ValidationResult:
     edge = Edge(
         source=ein.source, target=ein.target, relation=ein.relation,
         provenance=ein.provenance, authored_by=ein.authored_by,
@@ -197,13 +214,26 @@ def _validate_edge(ein, edge_types, source_text, restore, seen) -> ValidationRes
     ident = edge.identity
     disp, reason = Disposition.ACCEPTED, ""
 
-    # never-forge-a-verdict (semantic, not retryable)
-    if EpistemicState(ein.epistemic_state) in VERDICT_STATES:
+    # clamp the confidence hint into [0,1]; drop NaN/inf so it can't poison downstream calibration
+    if edge.confidence_score is not None:
+        edge.confidence_score = (min(1.0, max(0.0, edge.confidence_score))
+                                 if math.isfinite(edge.confidence_score) else None)
+
+    # never-forge-a-state (semantic, not retryable): only `unverified` may be asserted by a write;
+    # grounded/rejected/failed/obsolete flow ONLY through kg_ground.
+    if EpistemicState(ein.epistemic_state) != EpistemicState.UNVERIFIED:
         edge.epistemic_state = EpistemicState.UNVERIFIED
         disp, reason = Disposition.DEMOTED, "forged-verdict-stripped"
-    if AuthoredBy(ein.authored_by) == AuthoredBy.HUMAN:
+    # never-forge-authorship (§1.5 anti-bypass): an extractor that self-declares `deterministic` would
+    # otherwise skip span-present entirely. Only the in-process parser is deterministic; a payload
+    # claiming `deterministic` (or `human`) is an untrusted forge -> demote to `agent`, which then
+    # requires a verifying span like any other agent edge.
+    claimed = AuthoredBy(ein.authored_by)
+    if claimed != AuthoredBy.AGENT:
         edge.authored_by = AuthoredBy.AGENT
-        disp, reason = Disposition.DEMOTED, (reason + ";" if reason else "") + "human-claim-stripped"
+        tag = "human-claim-stripped" if claimed == AuthoredBy.HUMAN else "deterministic-claim-stripped"
+        disp = Disposition.DEMOTED
+        reason = (reason + ";" if reason else "") + tag
 
     deterministic = edge.authored_by == AuthoredBy.DETERMINISTIC
 
@@ -212,7 +242,8 @@ def _validate_edge(ein, edge_types, source_text, restore, seen) -> ValidationRes
         if not edge.span or not edge.span.strip():
             return _ok("edge", edge, Disposition.REJECTED, "no-supporting-span", False, ident)
         check_span = restore(edge.span) if restore else edge.span
-        if not span_verifies(check_span, source_text):
+        ns = normalize_text(check_span)
+        if not ns or ns not in norm_source:  # span-present (§1.5), against the pre-normalized source
             return _ok("edge", edge, Disposition.REJECTED, "span-not-in-source", False, ident)
         # restore protects the egress, not the local canon (§1.9): the canon stores the ORIGINAL
         # (unscrubbed) span, recovered from the placeholder form the subagent emitted.

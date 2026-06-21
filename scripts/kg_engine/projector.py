@@ -19,11 +19,17 @@ from pathlib import Path
 
 import networkx as nx
 
-from .canon import Canon
+from .canon import Canon, _atomic_write
 from .model import EpistemicState, FAILURE_STATES, Provenance
 
 GRAPH_JSON = "graph.json"
 INDEX_DB = "index.sqlite"
+
+
+def _like_escape(term: str) -> str:
+    """Escape SQL LIKE wildcards so a query term like `span_present` or `100%` matches literally
+    (the matching clauses use `ESCAPE '\\'`)."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 # --------------------------------------------------------------------------- node-link (version-robust)
@@ -108,7 +114,11 @@ class Projector:
         return hashlib.sha256(payload.encode()).hexdigest()
 
     def _build_graph(self, nodes):
-        G = nx.DiGraph()
+        # MultiDiGraph (not DiGraph): two canon edges can share (source, target) but differ in
+        # relation (e.g. `grounds` and `attacked_by`). A DiGraph keys edges by (u, v) only and would
+        # silently collapse them — dropping edges from graph.json and undercounting n_edges, violating
+        # "derived contains nothing the canon does not". The `key=e.id` keeps each parallel edge.
+        G = nx.MultiDiGraph()
         for n in nodes:
             G.add_node(n.id, label=n.label, node_type=n.node_type, file_type=n.file_type,
                        provenance=n.provenance.value, authored_by=n.authored_by.value,
@@ -156,10 +166,11 @@ class Projector:
         G = self._build_graph(nodes)
         comm, degree, bridges = self._ranks(G)
 
-        # graph.json is always written in full (cheap projection, must round-trip)
+        # graph.json is always written in full (cheap projection, must round-trip). Write atomically
+        # (temp + os.replace) so a concurrent reader never observes a half-written file.
         data = _node_link_data(G)
         data.setdefault("graph", {})["built_from_commit"] = head
-        self.graph_path.write_text(json.dumps(data, indent=2))
+        _atomic_write(self.graph_path, json.dumps(data, indent=2))
 
         if do_full:
             self._write_full(nodes, comm, degree, bridges, head, cur_hashes, report)
@@ -176,6 +187,7 @@ class Projector:
     # ---- sqlite
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
+        con.execute("PRAGMA busy_timeout=5000")  # wait, don't raise, if another writer holds the lock
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript(
             """
@@ -269,10 +281,14 @@ class Projector:
     def _read_meta(self) -> dict:
         try:
             con = sqlite3.connect(self.db_path)
-            rows = dict(con.execute("SELECT key,value FROM meta").fetchall())
-            con.close()
         except sqlite3.Error:
             return {}
+        try:
+            rows = dict(con.execute("SELECT key,value FROM meta").fetchall())
+        except sqlite3.Error:
+            return {}
+        finally:
+            con.close()  # always close, even if the query raised (no leaked connection)
         out = {"built_from_commit": rows.get("built_from_commit", "")}
         try:
             out["file_hashes"] = json.loads(rows.get("file_hashes", "{}"))
@@ -281,12 +297,21 @@ class Projector:
         return out
 
     def is_stale(self) -> bool:
+        if not self.db_path.exists() or not self.graph_path.exists():
+            return True
         prior = self._read_meta()
-        return prior.get("built_from_commit", "") != self._head()
+        if prior.get("built_from_commit", "") != self._head():
+            return True
+        # commit equality alone is NOT enough: kg_ground (write_one, no commit) and non-git vaults
+        # (HEAD == "") never move HEAD. Compare per-node content hashes so any uncommitted canon
+        # change — a stamped verdict, a hand edit — still triggers a reprojection on the next read.
+        cur_hashes = {n.id: self._file_hash(n) for n in self.canon.all_nodes()}
+        return prior.get("file_hashes", {}) != cur_hashes
 
     # ---- query surface (read precomputed ranks O(1); NO centrality in-request)
     def _ro(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
+        con.execute("PRAGMA busy_timeout=5000")  # tolerate a concurrent reprojection mid-read
         con.row_factory = sqlite3.Row
         return con
 
@@ -317,6 +342,7 @@ class Projector:
 
     def query_graph(self, *, node_type: str | None = None, relation: str | None = None,
                     epistemic_state: str | None = None, limit: int = 50) -> dict:
+        limit = max(0, min(int(limit), 10_000))  # a negative LIMIT is unbounded in SQLite; clamp it
         con = self._ro()
         try:
             nq, na = "SELECT * FROM nodes", []
@@ -366,6 +392,7 @@ class Projector:
     def kg_context(self, query: str | None = None, *, budget: int = 2000) -> dict:
         """Grounding-aware, provenance-carrying, token-budgeted context. Reads precomputed columns
         only — no centrality is computed here (it is O(1) on the index)."""
+        budget = max(0, int(budget))
         con = self._ro()
         try:
             # falsification counters (memory of failures, §1.7) — surfaced, never pruned
@@ -390,15 +417,17 @@ class Projector:
                 seen: set = set()
                 terms = [t for t in _re.findall(r"[A-Za-z0-9_-]{3,}", query.lower())
                          if not (t in seen or seen.add(t))]
+                _clause = ("(source LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' "
+                           "OR relation LIKE ? ESCAPE '\\' OR span LIKE ? ESCAPE '\\')")
                 if terms:
                     clauses = []
                     for t in terms:
-                        clauses.append("(source LIKE ? OR target LIKE ? OR relation LIKE ? OR span LIKE ?)")
-                        ea += [f"%{t}%"] * 4
+                        clauses.append(_clause)
+                        ea += [f"%{_like_escape(t)}%"] * 4
                     eq += " WHERE (" + " OR ".join(clauses) + ")"
                 else:
-                    eq += " WHERE (source LIKE ? OR target LIKE ? OR relation LIKE ? OR span LIKE ?)"
-                    ea = [f"%{query}%"] * 4
+                    eq += " WHERE " + _clause
+                    ea = [f"%{_like_escape(query)}%"] * 4
             eq += f" ORDER BY {order}"
             items, used = [], 0
             for r in con.execute(eq, ea):

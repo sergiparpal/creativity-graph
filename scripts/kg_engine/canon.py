@@ -62,6 +62,9 @@ class LeaseLock:
         except (FileNotFoundError, ValueError):
             return None
 
+    def _owned_by_self(self, rec: dict) -> bool:
+        return rec.get("pid") == self.pid and rec.get("host") == self.host
+
     def is_stale(self, now: float | None = None) -> bool:
         rec = self._read()
         if rec is None:
@@ -72,31 +75,52 @@ class LeaseLock:
         return not _pid_probe(rec.get("pid", 0), rec.get("host", ""), self.host)
 
     def acquire(self, now: float | None = None) -> bool:
-        """Acquire if absent or stale. Returns True on success."""
-        rec = self._read()
+        """Acquire if absent, stale, or already held by us. Returns True on success.
+
+        The absent case uses an atomic O_EXCL create so two acquirers racing on a fresh lock can't
+        both win; a stale or self-owned lock is reclaimed by overwrite.
+        """
         now = time.time() if now is None else now
-        if rec is not None and not self.is_stale(now):
-            return False  # held by a live session
+        rec = self._read()
+        if rec is None:
+            if self._try_exclusive_create(now):
+                return True
+            rec = self._read()  # lost the create race; fall through to staleness/ownership logic
+        if rec is not None and not self.is_stale(now) and not self._owned_by_self(rec):
+            return False  # held by another live session
         self._write(now)
         return True
 
+    def _record(self, now: float) -> dict:
+        return {"pid": self.pid, "host": self.host,
+                "acquired_at": now, "ttl": self.ttl, "heartbeat_at": now}
+
+    def _try_exclusive_create(self, now: float) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self._record(now)))
+        return True
+
     def _write(self, now: float) -> None:
-        rec = {
-            "pid": self.pid, "host": self.host,
-            "acquired_at": now, "ttl": self.ttl, "heartbeat_at": now,
-        }
-        _atomic_write(self.path, json.dumps(rec))
+        _atomic_write(self.path, json.dumps(self._record(now)))
 
     def heartbeat(self, now: float | None = None) -> None:
-        rec = self._read() or {}
-        rec.update({"pid": self.pid, "host": self.host, "ttl": self.ttl,
-                    "heartbeat_at": time.time() if now is None else now})
-        rec.setdefault("acquired_at", rec["heartbeat_at"])
-        _atomic_write(self.path, json.dumps(rec))
+        rec = self._read()
+        if rec is not None and not self._owned_by_self(rec):
+            return  # never refresh another session's lock
+        now = time.time() if now is None else now
+        merged = (rec or {})
+        merged.update({"pid": self.pid, "host": self.host, "ttl": self.ttl, "heartbeat_at": now})
+        merged.setdefault("acquired_at", now)
+        _atomic_write(self.path, json.dumps(merged))
 
     def release(self) -> None:
         rec = self._read()
-        if rec and rec.get("pid") == self.pid and rec.get("host") == self.host:
+        if rec and self._owned_by_self(rec):
             self.path.unlink(missing_ok=True)
 
 
@@ -120,6 +144,21 @@ def _pid_probe(pid: int, host: str, my_host: str) -> bool:
 # --------------------------------------------------------------------------- atomic write
 
 
+def _fsync_dir(directory: Path) -> None:
+    """fsync a directory so a rename into it is durable across a crash (best-effort; not all
+    platforms/filesystems support directory fds)."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +169,7 @@ def _atomic_write(path: Path, text: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        _fsync_dir(path.parent)  # make the rename itself durable, not just the file contents
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -153,6 +193,56 @@ class Canon:
         self.notes_dir = self.root / CANON_SUBDIR
         self.notes_dir.mkdir(parents=True, exist_ok=True)
         self.lock = LeaseLock(self.root / LOCK_NAME)
+        self._lock_depth = 0  # re-entrancy guard so nested writes don't deadlock the single-writer lease
+        self._ensure_git_excludes()
+
+    def _ensure_git_excludes(self) -> None:
+        """Keep transient runtime files (session lock, temp files, reconcile state) out of git in ANY
+        git-backed vault, so `git add -A` / stash-as-rollback never commit or discard them — without
+        relying on the user having authored a .gitignore."""
+        git_dir = self.root / ".git"
+        if not git_dir.is_dir():
+            return  # not a standard repo (worktree/submodule/no-git) — best-effort only
+        info = git_dir / "info"
+        exclude = info / "exclude"
+        patterns = [LOCK_NAME, ".tmp-*", ".kg-reconcile-state.json"]
+        try:
+            info.mkdir(parents=True, exist_ok=True)
+            current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+            missing = [p for p in patterns if p not in current.split()]
+            if missing:
+                with open(exclude, "a", encoding="utf-8") as f:
+                    if current and not current.endswith("\n"):
+                        f.write("\n")
+                    f.write("\n".join(missing) + "\n")
+        except OSError:
+            pass
+
+    # ---- single-writer lease (re-entrant within this process)
+    def _acquire_lock(self) -> None:
+        if self._lock_depth == 0 and not self.lock.acquire():
+            raise RuntimeError("canon vault is locked by another live session")
+        self._lock_depth += 1
+
+    def _release_lock(self) -> None:
+        self._lock_depth -= 1
+        if self._lock_depth <= 0:
+            self._lock_depth = 0
+            self.lock.release()
+
+    def _check_slug_collision(self, node: "Node") -> None:
+        """Two distinct ids that slug to the same filename would silently merge into one note.
+        Detect and refuse rather than corrupt either node."""
+        p = self.node_path(node.id)
+        if not p.exists():
+            return
+        try:
+            existing = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=node.id)
+        except Exception:
+            return  # unreadable existing note is handled elsewhere; don't mask it as a collision
+        if existing.id != node.id:
+            raise ValueError(
+                f"node id slug collision: {node.id!r} and {existing.id!r} both map to {p.name}")
 
     # ---- paths
     def node_path(self, node_id: str) -> Path:
@@ -183,7 +273,7 @@ class Canon:
         for p in sorted(self.notes_dir.glob("*.md")):
             try:
                 out.append(node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem))
-            except ValueError:
+            except Exception:  # noqa: BLE001 — one unreadable/malformed note must not crash every read
                 continue
         return out
 
@@ -194,31 +284,50 @@ class Canon:
     def write_one(self, node: Node) -> None:
         from .model import utcnow
         node.updated_at = utcnow()
-        _atomic_write(self.node_path(node.id), node_to_markdown(node))
+        self._acquire_lock()
+        try:
+            self._check_slug_collision(node)
+            _atomic_write(self.node_path(node.id), node_to_markdown(node))
+        finally:
+            self._release_lock()
 
     # ---- multi-file mutation with git-as-rollback
-    def write_nodes(self, nodes: list[Node], *, message: str, commit: bool = True) -> RollbackInfo:
-        """Write/merge a batch of nodes, then one commit. On any failure: stash-before-reset and
-        surface the stash so parallel human edits are never lost (§Stage 1)."""
+    def write_nodes(self, nodes: list[Node], *, message: str, commit: bool = True,
+                    merge: bool = True) -> RollbackInfo:
+        """Write a batch of nodes, then one commit. With `merge` (default) incoming edges are merged
+        into existing notes (single-canonical-edge rule); with `merge=False` each node is written
+        verbatim (used by kg_rename, which has already rewritten every endpoint and must NOT re-merge
+        the pre-rename edges back in). On any failure: stash-before-reset (git) or restore the pre-write
+        snapshot (non-git), so a partial batch never persists (§Stage 1)."""
         repo = self.root
+        self._acquire_lock()
         try:
-            for node in nodes:
-                merged = self._merge_into_existing(node)
-                from .model import utcnow
-                merged.updated_at = utcnow()
-                _atomic_write(self.node_path(merged.id), node_to_markdown(merged))
-            if commit and _git_ok(repo):
-                _git(repo, "add", "-A")
-                # allow empty so a no-op batch still succeeds
-                _git(repo, "commit", "-m", message, "--allow-empty")
-            return RollbackInfo(False, None, "")
-        except Exception as e:  # noqa: BLE001 — rollback must catch everything
-            return self._rollback(repo, str(e))
+            # snapshot every target file BEFORE writing so a non-git/pre-commit vault can still roll back
+            snapshot = {}
+            for n in nodes:
+                p = self.node_path(n.id)
+                snapshot[p] = p.read_bytes() if p.exists() else None
+            try:
+                for node in nodes:
+                    merged = self._merge_into_existing(node) if merge else node
+                    from .model import utcnow
+                    merged.updated_at = utcnow()
+                    _atomic_write(self.node_path(merged.id), node_to_markdown(merged))
+                if commit and _git_ok(repo):
+                    _git(repo, "add", "-A")
+                    # allow empty so a no-op batch still succeeds
+                    _git(repo, "commit", "-m", message, "--allow-empty")
+                return RollbackInfo(False, None, "")
+            except Exception as e:  # noqa: BLE001 — rollback must catch everything
+                return self._rollback(repo, str(e), snapshot)
+        finally:
+            self._release_lock()
 
     def _merge_into_existing(self, node: Node) -> Node:
         """Apply the single-canonical-edge rule: merge incoming edges into an existing note."""
         if not self.exists(node.id):
             return node
+        self._check_slug_collision(node)
         cur = self.read_node(node.id)
         by_ident = {e.identity: e for e in cur.edges}
         for e in node.edges:
@@ -231,13 +340,21 @@ class Canon:
             cur.node_type = node.node_type
         return cur
 
-    def _rollback(self, repo: Path, error: str) -> RollbackInfo:
-        if not _git_ok(repo) or not _has_commit(repo):
-            return RollbackInfo(False, None, error)
-        stash_ref = None
-        st = _git(repo, "stash", "push", "-u", "-m", f"kg-rollback-{int(time.time())}", check=False)
-        if st.returncode == 0 and "No local changes" not in (st.stdout + st.stderr):
-            ref = _git(repo, "rev-parse", "stash@{0}", check=False)
-            stash_ref = ref.stdout.strip() or "stash@{0}"
-        _git(repo, "reset", "--hard", "HEAD", check=False)
-        return RollbackInfo(stash_ref is not None, stash_ref, error)
+    def _rollback(self, repo: Path, error: str, snapshot: dict | None = None) -> RollbackInfo:
+        if _git_ok(repo) and _has_commit(repo):
+            # git path: stash-before-reset so concurrent human edits are preserved, not discarded.
+            # Detect a real stash by comparing the stash ref before/after (locale-independent).
+            before = _git(repo, "rev-parse", "--verify", "--quiet", "refs/stash", check=False).stdout.strip()
+            _git(repo, "stash", "push", "-u", "-m", f"kg-rollback-{int(time.time())}", check=False)
+            after = _git(repo, "rev-parse", "--verify", "--quiet", "refs/stash", check=False).stdout.strip()
+            stash_ref = after if (after and after != before) else None
+            _git(repo, "reset", "--hard", "HEAD", check=False)
+            return RollbackInfo(stash_ref is not None, stash_ref, error)
+        # non-git / pre-first-commit: restore the snapshot we captured before the batch began
+        if snapshot:
+            for p, original in snapshot.items():
+                if original is None:
+                    p.unlink(missing_ok=True)
+                else:
+                    p.write_bytes(original)
+        return RollbackInfo(False, None, error)

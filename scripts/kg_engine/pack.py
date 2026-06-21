@@ -6,12 +6,13 @@ per-term specificity seeds (IDF over the corpus). Types absent from the pack are
 """
 from __future__ import annotations
 
+import math
 import re
 import sys
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .model import normalize_text
 
@@ -34,6 +35,28 @@ class PackContract(BaseModel):
             raise ValueError("type names must be non-empty")
         return v
 
+    @field_validator("domain")
+    @classmethod
+    def _domain_nonempty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("domain must be non-empty")
+        return v
+
+    @field_validator("specificity_seeds")
+    @classmethod
+    def _seeds_finite(cls, v: dict[str, float]) -> dict[str, float]:
+        bad = [t for t, s in v.items() if not math.isfinite(s)]
+        if bad:
+            raise ValueError(f"specificity seeds must be finite numbers: {bad}")
+        return v
+
+    @model_validator(mode="after")
+    def _types_disjoint(self) -> "PackContract":
+        overlap = sorted(set(self.node_types) & set(self.edge_types))
+        if overlap:
+            raise ValueError(f"a type may not be both a node_type and an edge_type: {overlap}")
+        return self
+
 
 def load_pack(path: str | Path) -> PackContract:
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
@@ -48,11 +71,14 @@ def coverage(pack: PackContract, source_text: str) -> dict:
     """
     norm_src = normalize_text(source_text)
     defined = _defined_terms(source_text)
-    glossary_terms = {normalize_text(t) for t in pack.glossary}
+    # ignore empty/whitespace glossary keys: normalize_text("") == "" is a substring of everything and
+    # would otherwise count as "grounded" against any source, inflating the metric.
+    glossary_norms = [n for n in (normalize_text(t) for t in pack.glossary) if n]
+    glossary_terms = set(glossary_norms)
     in_glossary = sum(1 for t in defined if normalize_text(t) in glossary_terms)
-    glossary_in_source = sum(1 for t in pack.glossary if normalize_text(t) in norm_src)
+    glossary_in_source = sum(1 for t in glossary_norms if t in norm_src)
     n_def = max(len(defined), 1)
-    n_gloss = max(len(pack.glossary), 1)
+    n_gloss = max(len(glossary_norms), 1)
     return {
         "source_defined_terms": len(defined),
         "glossary_terms": len(pack.glossary),
@@ -62,7 +88,9 @@ def coverage(pack: PackContract, source_text: str) -> dict:
     }
 
 
-_DEFN_RE = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`|\"([^\"]{3,40})\"|“([^”]{3,40})”")
+# Quoted/bold/code "defined terms". Quote caps match the 60-char post-filter below so a long bold or
+# quoted phrase isn't silently dropped by an inconsistent inner cap.
+_DEFN_RE = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`|\"([^\"]{3,60})\"|“([^”]{3,60})”")
 
 
 def _defined_terms(text: str) -> set[str]:

@@ -24,7 +24,7 @@ embeddings = ["sqlite-vss>=0.1"]
 treesitter = ["tree_sitter>=0.21", "tree-sitter-languages>=1.10"]
 # Headless API-driven extraction backend (§2.2): the CI / non-interactive path. The in-session
 # path needs no API keys; this extra is only for `python -m kg_engine.backend`.
-backend = ["anthropic>=0.40"]
+backend = ["anthropic>=0.69"]  # floor for output_config structured outputs + adaptive thinking (Opus 4.x)
 # Test + dev tooling.
 dev = ["pytest>=8"]
 
