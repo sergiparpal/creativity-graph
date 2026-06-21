@@ -59,7 +59,7 @@ For the no-PII demo source (`examples/source.md`), `kg_scrub` is a **no-op**: `r
 ### 1.3 `mcp__plugin_creativity-graph_creativity-graph__kg_write(payload: dict)`
 
 The boundary (§1.5). Validates an extraction payload, writes ACCEPTED/DEMOTED nodes & edges to the canon,
-quarantines or rejects the rest. `payload` is the write contract (see `references/payload.md` / the shared
+quarantines or rejects the rest. `payload` is the write contract (see `references/contract.md` / the shared
 contract): `{nodes:[…], edges:[…], complete:true}`. **`complete` MUST be `true`** or the whole payload is
 REJECTED as `truncated-payload`.
 
