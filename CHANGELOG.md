@@ -14,9 +14,9 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
-The initial end-to-end build, staged per the implementation plan (§5). Engine: **67 tests green**.
+The initial end-to-end build. Engine: **67 tests green**.
 Components: **5 agents, 5 commands**, 1 skill (+3 on-demand references), the `SessionStart`/`PreToolUse`
-hooks, and the `creativity-graph` MCP server. Each stage advanced on its own automated exit test (§4).
+hooks, and the `creativity-graph` MCP server. Each stage advanced on its own automated exit test.
 The plugin was then **installed locally and the full workflow run end-to-end** (see *Packaging hardening
 + live validation* below).
 
@@ -98,8 +98,8 @@ The plugin was then **installed locally and the full workflow run end-to-end** (
   `correct | fabricated | vague | wrong_type` and records `span_found` (`y|n`), judged strictly
   against the source — producing the gold CSV `f4_probe score` consumes.
 - **Exit test:** `python scripts/f4_probe.py score labels.csv` prints precision; on a miss the pack
-  and extractor prompt auto-iterate (≤ 3) and the best result is recorded — the plan never halts on a
-  metric (§4).
+  and extractor prompt auto-iterate (≤ 3) and the best result is recorded — the flow never halts on a
+  metric.
 
 ### Stage 5 — Projector + derived layer + query surface
 
@@ -150,7 +150,7 @@ The plugin was then **installed locally and the full workflow run end-to-end** (
   **gated** until the harness validates it; degree + the labelled structural-bridge signal remain the
   honest advisory (§1.6).
 - **Exit test:** `python -m kg_engine.harness agreement && python -m kg_engine.harness specificity`
-  print α and the metric verdict; the outcome is logged and execution proceeds (§4).
+  print α and the metric verdict; the outcome is logged and execution proceeds.
 
 ### Stage 8 — Ideation comparison
 
@@ -161,7 +161,7 @@ The plugin was then **installed locally and the full workflow run end-to-end** (
   "source": "<text>"}`).
 - Command `commands/kg-experiment.md` (`/kg-experiment`) runs and reports the comparison.
 - **Exit test:** `python -m kg_engine.harness ideation` prints the per-condition table plus a verdict;
-  the result is logged and execution proceeds (§4).
+  the result is logged and execution proceeds.
 
 ### Stage 9 — Hardening + packaging + component layer
 

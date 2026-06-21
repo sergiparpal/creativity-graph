@@ -1,7 +1,7 @@
 # Architecture & shared contract — `kg_engine`
 
 The single source of truth for the data model, the boundary semantics, and every module's public API.
-Tests and implementations both bind to this. Derived from the IMPLEMENTATION-PLAN (§1 design foundations).
+Tests and implementations both bind to this.
 
 ## Canon note format
 
