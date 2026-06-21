@@ -9,3 +9,4 @@ __pycache__/
 .tmp-*
 *.Zone.Identifier
 /derived/
+uv.lock
