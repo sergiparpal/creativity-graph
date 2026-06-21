@@ -253,7 +253,7 @@ Stage 9 task list — implemented, then hardened against a 6-dimension adversari
   validate`, the Stage 7/8 harness commands, and a deterministic manifest/component check (the hard
   gate — parses every manifest, checks each component exists, and that the plugin/marketplace versions
   agree). A best-effort job runs the real `claude plugin validate --strict` when the CLI is installable.
-- **`RELEASE.md`** documents the one remaining outward-facing step left deliberately manual: public
+- The one remaining outward-facing step is left deliberately manual: public
   marketplace publish + `claude plugin tag`.
 
 [Unreleased]: https://github.com/sergiparpal/creativity-graph/commits/main
