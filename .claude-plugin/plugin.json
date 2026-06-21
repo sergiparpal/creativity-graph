@@ -1,6 +1,6 @@
 {
   "name": "creativity-graph",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Turn a non-self-grounding conceptual document into a rigorously-grounded, queryable knowledge graph: a human-editable canon with three-axis provenance, a span-present write boundary, a grounding loop with memory of failures, and a regenerable NetworkX/SQLite derived layer.",
   "author": {
     "name": "Sergi Parpal",

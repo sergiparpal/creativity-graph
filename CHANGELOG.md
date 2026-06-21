@@ -2,7 +2,7 @@
 
 All notable changes to the **creativity-graph** Claude Code plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html); `version` is set to `0.1.0` in
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html); `version` is set to `0.2.0` in
 `.claude-plugin/plugin.json` and the matching `marketplace.json` entry.
 
 The plugin turns a non-self-grounding conceptual document into a grounded, queryable knowledge
@@ -13,6 +13,16 @@ hard guarantees; the Claude Code session and its subagents do the language work 
 JSON back across the MCP boundary.
 
 ## [Unreleased]
+
+_Nothing yet — changes accrue here._
+
+## [0.2.0] — 2026-06-21
+
+Hardening release. Cuts the **review-findings hardening pass** (below) on top of the initial 0.1.0
+build: two invariant bypasses closed, a range of correctness/robustness fixes, and 12 new regression
+tests (79 green). **Breaking:** the `kg_ground` MCP tool dropped its `by` parameter (verdicts via the
+tool are always attributed to the agent — a human verdict can no longer be forged through the tool
+surface), and `kg_write` now demotes a forged `authored_by=deterministic` claim to `agent`.
 
 The initial end-to-end build. Engine: **79 tests green**.
 Components: **5 agents, 5 commands**, 1 skill (+3 on-demand references), the `SessionStart`/`PreToolUse`
