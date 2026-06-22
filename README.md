@@ -105,8 +105,15 @@ These are enforced by the engine — agents cannot opt out:
 This is a Claude Code plugin. Add it via the `claude` CLI / plugin marketplace, then enable it:
 
 ```bash
-claude plugin install creativity-graph     # from your marketplace
+claude plugin install creativity-graph@sergiparpal   # from your marketplace
 # or, for local development, point Claude Code at this repo as a plugin source.
+```
+
+**Updating to the latest version.** If you don't have the latest version of the plugin installed,
+update it by running:
+
+```bash
+claude plugin update creativity-graph@sergiparpal
 ```
 
 On `SessionStart` a cross-platform hook (`hooks/provision.mjs` → an OS launcher →
