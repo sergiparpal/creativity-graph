@@ -73,7 +73,16 @@ only Python ≥3.10 and Node (always present in the Claude Code runtime) require
 - **Removed** `hooks/bootstrap.sh` and `scripts/launch_server.sh` (superseded). `.mcp.json` and
   `hooks/hooks.json` rewired to the Node entrypoints; `scripts/validate_plugin.py` updated to assert the
   new component set; `tests/test_bootstrap.py` adds hermetic coverage (path resolution, stamp, readiness,
-  lock, failure cleanup). **92 tests green.**
+  lock, failure cleanup). **140 tests green.**
+
+### Fixed — Python 3.10 + Windows compatibility (CI matrix)
+
+The cross-platform CI matrix (Windows + macOS, Python 3.10 and 3.12) surfaced two portability bugs:
+`tests/test_manifests.py` imported `tomllib` (stdlib only on 3.11+) and now parses `pyproject.toml` as
+text, so the suite runs on the declared `requires-python = ">=3.10"` floor; and `LeaseLock._pid_probe`
+called `os.kill(pid, 0)`, which on Windows is not a no-op existence check — the liveness probe is now
+skipped on Windows (falling back to heartbeat/TTL staleness) and the dead-pid reclaim assertion is
+POSIX-only.
 
 ## [0.2.0] — 2026-06-21
 

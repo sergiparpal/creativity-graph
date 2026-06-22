@@ -29,7 +29,7 @@ From `pack.py`, `class PackContract(BaseModel)`:
 `extra="forbid"` means an unknown top-level key (typo, stray field) makes the pack **invalid** — the
 loader raises and `validate` prints `PACK INVALID: ...` (exit 1). The `_nonempty_unique` validator runs
 on both type lists: a duplicate type → `types must be unique`; a blank/whitespace type → `type names must
-be non-empty`.
+be non-empty`. Two further validators also reject a pack: a name appearing in both `node_types` and `edge_types` → `a type may not be both a node_type and an edge_type`; and a non-finite `specificity_seeds` value (NaN/inf) → `specificity seeds must be finite numbers`.
 
 `load_pack(path)` reads the YAML and calls `PackContract.model_validate(data)`. `data or {}` means an
 empty file validates the *empty* dict, which then fails on the missing required `domain`/`node_types`/
@@ -143,13 +143,13 @@ validator are strict, a fat-fingered edit fails loudly rather than corrupting th
 directions. It normalizes text via `model.normalize_text` and extracts the source's *defined terms* with:
 
 ```python
-_DEFN_RE = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`|\"([^\"]{3,40})\"|“([^”]{3,40})”")
+_DEFN_RE = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`|\"([^\"]{3,60})\"|“([^”]{3,60})”")
 ```
 
-i.e. bold, inline-code, and short straight/curly-quoted phrases. Two distinct limits apply: (1) the
-quoted-phrase alternatives cap the match in-pattern at **3–40 chars** (`{3,40}`), so a quote outside that
-length is not matched as a term at all; (2) `_defined_terms` then applies a separate post-filter that
-drops **any** extracted term (bold, code, or quote) longer than **60 chars** (`len(term) <= 60`). It
+i.e. bold, inline-code, and short straight/curly-quoted phrases. The quoted-phrase alternatives cap the
+match in-pattern at **3–60 chars** (`{3,60}`), deliberately aligned with the 60-char post-filter so a long
+quote isn't silently dropped by an inconsistent inner cap; `_defined_terms` then applies the matching
+post-filter that drops any extracted term (bold, code, or quote) longer than **60 chars** (`len(term) <= 60`). It
 returns:
 
 | key                          | meaning |
@@ -224,7 +224,7 @@ out-scores a vague hub.
   **specificity-weighted betweenness** (`btw[n] * spec[n]`). It declares the confound present when the
   top raw-betweenness leaders are *vaguer than the graph average*
   (`betweenness_leader_specificity < mean_specificity`), and turns the gate on only when weighting also
-  churns the leaderboard (`gate_on = confound and rank_churn > 0.2`).
+  churns the leaderboard AND the specificity scores actually spread (`gate_on = confound and rank_churn > 0.2 and has_spread`, where `has_spread = spread > 1e-9` — a degenerate corpus with uniform specificity keeps the gate closed).
 
 ```bash
 python -m kg_engine.harness specificity derived/graph.json examples/source.md   # JSON verdict

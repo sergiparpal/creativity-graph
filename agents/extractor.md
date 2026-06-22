@@ -72,7 +72,7 @@ Field rules:
   (the normal case). Use `hypothesized` only for a relation you genuinely inferred across sentences — it still
   needs a span that anchors it, but signals lower confidence.
 - `authored_by` MUST be `agent`. **Never** `human` (the boundary DEMOTES it: `human-claim-stripped`), and never
-  `deterministic` (that axis is reserved for the tree_sitter parser on code/SQL — see below).
+  `deterministic` (that axis is reserved for the in-process parser, never an LLM — see below).
 - `epistemic_state` MUST be `unverified`. **Never** assert `grounded`/`rejected`/`failed`/`obsolete` — that is
   forging a verdict (§1.4/§1.8). The boundary DEMOTES it (`forged-verdict-stripped`); verdicts come ONLY from
   `kg_ground`, run by the grounder subagent or a human.
@@ -97,9 +97,9 @@ The span need not be the whole sentence — it must just (a) be a real substring
 relation between the two endpoints. Prefer the tightest substring that still names both ideas and the relation.
 
 ## Deterministic inputs (why your edges differ from a parser's)
-If a section were **code/SQL/structured** data, the engine would parse it with tree_sitter FIRST and emit edges
+If a section were **code/SQL/structured** data, the engine's in-process parser would parse it FIRST and emit edges
 with `authored_by: deterministic` and `provenance: span-present` by construction — **no LLM, no agent span
-needed**. But the demo corpus (`examples/source.md`) is **pure prose**, so tree_sitter has nothing to parse:
+needed**. But the demo corpus (`examples/source.md`) is **pure prose**, so the in-process parser has nothing to parse:
 **every** edge here is `authored_by: agent` and **every** edge here needs a verbatim span from you. Do not mark
 prose edges `deterministic`.
 
@@ -114,7 +114,7 @@ prose edges `deterministic`.
    b. Identify the relations → **edges**. For each, choose the pack `relation`, set `source`/`target` to the
       node slugs, and **copy the verbatim span** that states it.
    c. Assemble ONE payload with `complete: true` and call `mcp__plugin_creativity-graph_creativity-graph__kg_write`.
-3. Read the return: `{dispositions, details[], written_nodes[], rolled_back, stash_ref}`. Report the
+3. Read the return: `{dispositions, details[], written_nodes[], rolled_back, error}`. Report the
    `dispositions` counts (ACCEPTED / DEMOTED / QUARANTINED / REJECTED) and any DEMOTED/QUARANTINED/REJECTED
    `details` (each has `kind`, `id`, `disposition`, `reason`, `retryable`).
 4. **Retry policy:**

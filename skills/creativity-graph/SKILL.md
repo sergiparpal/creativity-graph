@@ -15,7 +15,7 @@ A conceptual document does not verify itself the way code verifies against a par
 (`examples/source.md` §intro). A naive extractor turns such prose into convincing nonsense.
 This plugin extracts a graph, then forces every non-trivial edge to earn its place against the
 *original text* and against adversarial attack. A deterministic Python engine (`scripts/kg_engine`,
-79 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
+140 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
 hand structured JSON back across the MCP boundary. Your job is to orchestrate, not to forge.
 
 ## The model: canon vs derived (§1.2)
@@ -41,8 +41,7 @@ collapse the three into one "quality" number.
 ## The workflow: build → ground → query → eval → experiment
 
 1. **`/kg-build [source_path]`** — extract candidate nodes/edges from prose and write them through
-   the boundary. Orchestrates **kg-extractor** (emits a `kg_write` payload), then optionally
-   **kg-annotator** for an F4-probe label sheet. Output edges land `unverified`.
+   the boundary. Orchestrates **kg-extractor** (emits a `kg_write` payload). Output edges land `unverified`.
 2. **`/kg-ground [node_or_query]`** — adjudicate `unverified` edges. **kg-grounder** confirms or
    rejects on the merits and stamps verdicts via `kg_ground`; **kg-adversarial-grounder** tries to
    *falsify* surviving edges, recording `attacked_by` edges + `kg_ground(verdict="failed")`.
@@ -51,18 +50,18 @@ collapse the three into one "quality" number.
    answers with provenance.
 4. **`/kg-eval`** — run the deterministic gates: extraction precision (`f4_probe.py score`, gate
    ≥ 0.70), inter-coder agreement (`harness agreement`, Krippendorff α ≥ 0.67), and the
-   bridge-metric gate (`harness specificity`). **kg-evaluator** drives these and reports verdicts.
+   bridge-metric gate (`harness specificity`). **kg-annotator** drives these and reports verdicts.
 5. **`/kg-experiment`** — control \| graph \| rag ideation comparison via `harness ideation`.
 
 ## Who does what
 
 | command | subagent(s) | engine surface |
 | --- | --- | --- |
-| `/kg-build` | `kg-extractor`, `kg-annotator` | `kg_write`, `f4_probe.py` |
+| `/kg-build` | `kg-extractor` | `kg_write` |
 | `/kg-ground` | `kg-grounder`, `kg-adversarial-grounder` | `kg_ground`, `query_graph`, `kg_write` |
 | `/kg-query` | (none; direct reads) | `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` |
-| `/kg-eval` | `kg-evaluator` | `f4_probe.py`, `kg_engine.harness`, `kg_metrics` |
-| `/kg-experiment` | (orchestration) | `kg_engine.harness ideation` |
+| `/kg-eval` | `kg-annotator` | `f4_probe.py`, `kg_engine.harness`, `query_graph` |
+| `/kg-experiment` | `kg-evaluator` | `kg_engine.harness ideation` |
 
 The MCP server is named `creativity-graph`; tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`
 (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`, `query_graph`,
@@ -100,8 +99,7 @@ graph tools — `kg-build`, `kg-query`, etc. are slash commands, not tools.
 `ACCEPTED` (written, `unverified`) · `DEMOTED` (written, one axis downgraded) ·
 `QUARANTINED` (structurally valid but untrusted, e.g. undeclared type) · `REJECTED` (not written).
 `retryable=false` for SEMANTIC rejections (no-span, span-not-in-source, vague); `retryable=true`
-for TRANSPORT failures (truncation, schema). Every `kg_write` payload MUST set `"complete": true` —
-a false/missing flag is `REJECTED` as truncated.
+for TRANSPORT failures (truncation, schema). A `kg_write` payload may set `"complete": true` (it defaults to `true` for a single-shot write); only an explicit `"complete": false` is `REJECTED` as truncated (a streaming producer sets it on a non-final chunk).
 
 ## Domain pack
 

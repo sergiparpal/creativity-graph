@@ -74,7 +74,7 @@ REJECTED as `truncated-payload`.
   ],
   "written_nodes": ["generality-confound", "specificity", "compression"],
   "rolled_back": false,
-  "stash_ref": null
+  "error": null
 }
 ```
 
@@ -85,7 +85,7 @@ REJECTED as `truncated-payload`.
   `human-claim-stripped`, `undeclared-node-type`, `undeclared-edge-type`), `retryable` (**`false`** for SEMANTIC rejections — no-span,
   span-not-in-source; **`true`** for TRANSPORT — truncation, schema-invalid).
 - `written_nodes[]` — node ids actually committed (includes boundary-auto-created placeholder source nodes).
-- `rolled_back` / `stash_ref` — set when the canon write stashed instead of committing.
+- `rolled_back` / `error` — `rolled_back` is `true` (and `error` carries the failure message) when the multi-file canon write could not commit and was rolled back.
 
 A write may never set a non-`unverified` state or claim parser/human authorship: such payloads are
 **DEMOTED** — any verdict or `obsolete` is reset to `unverified` (`forged-verdict-stripped`); `human` →
@@ -127,8 +127,7 @@ single-canonical-edge rule. Both ids are slugged.
  "touched": ["betweenness", "generality-confound", "specificity"]}
 ```
 
-Failure: `{"ok": false, "error": "node not found"}` or `"target id exists"`. `ok` is `false` if the write had
-to stash.
+Failure: `{"ok": false, "error": "node not found"}` or `"target id exists"`. `ok` is `false` (with `error: "rename rolled back: …"`) if the multi-file write had to roll back.
 
 ### 1.6 `mcp__plugin_creativity-graph_creativity-graph__kg_metrics()`
 
@@ -343,6 +342,7 @@ betweenness over the derived graph, using IDF seeds from the source corpus (or a
 {
   "n": 24,
   "mean_specificity": 1.42,
+  "specificity_spread": 1.9,
   "betweenness_leader_specificity": 0.91,
   "top_raw_betweenness": ["system", "idea", "specificity"],
   "top_specificity_weighted": ["specificity", "betweenness", "reconciler"],
@@ -354,7 +354,7 @@ betweenness over the derived graph, using IDF seeds from the source corpus (or a
 ```
 
 `gate_on` is `true` only when the generality confound is detected (raw-betweenness leaders are vaguer than
-average) **and** rank churn `> 0.2`. Until this returns `gate_on:true` on real data, the specificity-weighted
+average), rank churn `> 0.2`, **and** the node specificities actually spread (a degenerate corpus where every specificity is equal keeps the gate closed). Until this returns `gate_on:true` on real data, the specificity-weighted
 bridge metric stays advisory and `kg_context` exposes only the structural-bridge heuristic. (Graphs with
 `< 3` nodes return `{"gate_on": false, "reason": "graph too small", "n": …}`.)
 
@@ -388,8 +388,7 @@ unsupported_rate` and a `verdict` comparing **graph vs control**:
 }
 ```
 
-The `graph` condition "wins" only if it is `>=` control on diversity AND novelty AND its `unsupported_rate`
-is no more than `control + 0.05` — i.e. more/better ideas **without** more unsupported claims.
+The `graph` condition "wins" only if it is `>=` control on diversity AND novelty, **strictly greater** on at least one of them, AND its `unsupported_rate` is no more than `control + 0.05` — i.e. measurably more/better ideas **without** more unsupported claims (an exact tie on both axes is not a win).
 
 ---
 

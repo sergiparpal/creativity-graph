@@ -36,7 +36,7 @@ these fields, no more.
 
 | field            | type            | default          | notes |
 |------------------|-----------------|------------------|-------|
-| `id`             | str \| null     | slug of `label`  | optional; if absent, derived via `slug(label)` (lowercase, non-word stripped, runs of space/`_`/`-` → `-`) |
+| `id`             | str \| null     | slug of `label`  | optional; if absent, derived via `slug(label)` (lowercase, non-word chars → `-`, then runs of space/`_`/`-` collapsed to a single `-`) |
 | `label`          | str             | **required**     | human-readable name |
 | `node_type`      | str             | `undeclared-type`| MUST be a declared pack `node_types` value or it quarantines (§3) |
 | `file_type`      | str             | `prose`          | `prose` \| `code` \| `sql` \| … (used by projector/probe) |
@@ -91,7 +91,7 @@ These are independent. A span-present, agent-authored edge can be unverified; gr
 
 ## 3. Dispositions — `validate_payload` returns one `ValidationResult` per item
 
-`kg_write` returns `{dispositions, details[], written_nodes[], rolled_back, stash_ref}` where `dispositions`
+`kg_write` returns `{dispositions, details[], written_nodes[], rolled_back, error}` where `dispositions`
 is the count per bucket and each `details[]` entry carries `{kind, id, disposition, reason, retryable}`.
 
 ### ACCEPTED
@@ -124,6 +124,7 @@ edited straight into canon, bypassing `kg_ground`).
 |-----------------------|-----------|---------|
 | `no-supporting-span`  | false     | non-deterministic edge had empty/whitespace `span` (§5) |
 | `span-not-in-source`  | false     | `span` does not verify against the source — **fabrication** (§5) |
+| `span-too-short`      | false     | `span` found but shorter than 4 non-whitespace chars — degenerate anchor (§5) |
 | `truncated-payload`   | true      | `complete` was false (§1.3) — transport failure, whole payload dropped |
 | `schema-invalid: N errors` | true | Pydantic rejected the shape (extra/missing/mistyped field) |
 | `rate-limited-flood`  | false     | net-new writable **edges or nodes** past the per-payload budget `max(64, kb·20)` — anti-injection cap (§Stage 9) |
@@ -147,7 +148,7 @@ A `kg_write` payload may **not** assert `grounded`/`rejected`/`failed` (in `epis
 `authored_by=human`. The boundary does not error — it **silently demotes** (DEMOTED, §3), so a forged
 verdict is wasted, not honored.
 
-Verdicts come **only** from `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, by, kind, note)` with
+Verdicts come **only** from `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind, note)` with
 `verdict ∈ {grounded, rejected, failed, obsolete}`, which stamps `verdict_by`/`verdict_at` and appends an
 audit record. The reconciler re-quarantines any verdict that appears in canon without a matching audit
 record. **Extractors emit `unverified` only.**
@@ -168,6 +169,7 @@ reorder** — the span has to be a literal contiguous run of source words. Copy 
 
 - empty / whitespace-only `span` → `REJECTED/no-supporting-span` (not retryable).
 - present but not found in source → `REJECTED/span-not-in-source` (not retryable — fabrication).
+- present and found but fewer than 4 non-whitespace characters → `REJECTED/span-too-short` (not retryable — a degenerate 1-char anchor cites nothing).
 
 Verification is always against the ORIGINAL (unscrubbed) source. When the subagent saw scrubbed text (§1.9
 `kg_scrub`), it emits the placeholder span; `kg_write` restores it to the original via the scrub mapping
@@ -191,8 +193,8 @@ edge.id = e_{slug(source)}__{slug(relation)}__{slug(target)}
 ```
 
 Identity is the triple `(source, relation, target)`. A second ACCEPTED/DEMOTED edge with the same identity
-updates the existing one (`deduped`, §3.5) — never a duplicate. `slug()` lowercases, strips non-word
-characters, and collapses spaces/`_`/`-` into `-`.
+updates the existing one (`deduped`, §3.5) — never a duplicate. `slug()` lowercases, maps non-word
+characters to `-`, and collapses runs of spaces/`_`/`-` into a single `-`.
 
 Example: an edge `{source: "generality-confound", relation: "attacked_by", target: "specificity"}` has id
 `e_generality-confound__attacked-by__specificity` (`slug` collapses the `_` in `attacked_by` to `-`).

@@ -20,7 +20,7 @@ A prose theory does not verify itself the way code verifies against a parse tree
 everything, edges no one ever checked, confident verdicts no one ever earned. This plugin
 exists to make that failure mode *structurally impossible*.
 
-A deterministic Python engine (`scripts/kg_engine`, 79 tests green) does the work that must be
+A deterministic Python engine (`scripts/kg_engine`, 140 tests green) does the work that must be
 exact — schema validation, span verification, verdict stamping, projection, scrubbing. The
 Claude Code session and its subagents do the **language** work — reading prose, proposing typed
 edges, copying spans, arguing the adversarial case — and hand structured JSON back across an
@@ -122,10 +122,9 @@ full chain.
 
 | option | values | default | effect |
 |---|---|---|---|
-| `domain` | string | `conceptual theory` | conceptual domain of the source; shapes the pack vocabulary. |
 | `source_path` | absolute path | — | the document the graph is built and grounded against. |
 | `sensitivity` | `low` \| `medium` \| `high` | `medium` | egress scrubbing: `low` = secrets only; `medium` = + structured PII; `high` = + person/address heuristics. |
-| `metrics_mode` | `structure_only` \| `with_embeddings` | `structure_only` | `with_embeddings` adds a gated `sqlite-vss` candidate generator. |
+| `metrics_mode` | `structure_only` \| `with_embeddings` | `structure_only` | `structure_only` uses graph structure as the bridge signal; `with_embeddings` is accepted but currently inert (the former `sqlite-vss` candidate generator was removed). |
 
 Confirm the server sees your config:
 
@@ -152,7 +151,8 @@ creativity-graph/
 │   ├── extractor.md               # kg-extractor          → kg_write
 │   ├── grounder.md                # kg-grounder           → kg_ground (grounded/rejected)
 │   ├── adversarial-grounder.md    # kg-adversarial-grounder → attacked_by + kg_ground(failed)
-│   └── annotator.md               # kg-annotator          → f4_probe labels / α label passes
+│   ├── annotator.md               # kg-annotator          → f4_probe labels / α label passes
+│   └── evaluator.md               # kg-evaluator          → blind ideation experiment (control|graph|rag)
 ├── skills/creativity-graph/       # SKILL.md operating guide + references/
 ├── pack/{pack.yaml,glossary.md}   # the declared vocabulary
 ├── hooks/                         # SessionStart provisioning + PreToolUse context (cross-platform)
@@ -229,8 +229,8 @@ tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash com
 |---|---|
 | `kg_ping()` | `{name, version, metrics_mode, sensitivity, pack_loaded}` — health + config. |
 | `kg_scrub(text=None)` | the §1.9 **egress** scrub → `{scrubbed, redactions, sensitivity, categories}`; redacts secrets (always) + PII (per sensitivity) with consistent placeholders (`⟦SECRET:1⟧` etc.) before text reaches a subagent. No-op (0 redactions) on the no-PII demo source. |
-| `kg_write(payload)` | the span-present write boundary → `{dispositions, details[], written_nodes[], rolled_back, stash_ref}`; egress scrubbing is wired in here too — placeholder spans are restored to the original source text for the canon. |
-| `kg_ground(target_id, verdict, by, kind, note)` | **the only way to set a verdict**; `verdict ∈ {grounded, rejected, failed, obsolete}`, `kind ∈ {edge, node}`. |
+| `kg_write(payload)` | the span-present write boundary → `{dispositions, details[], written_nodes[], rolled_back, error}`; egress scrubbing is wired in here too — placeholder spans are restored to the original source text for the canon. |
+| `kg_ground(target_id, verdict, kind, note)` | **the only way to set a verdict** (always attributed to the agent — `by` is not a parameter); `verdict ∈ {grounded, rejected, failed, obsolete}`, `kind ∈ {edge, node}`. |
 | `kg_rename(old_id, new_id)` | rename a node and re-key its edges. |
 | `kg_metrics()` | `{nodes, edges, edges_by_epistemic_state}`. |
 | `query_graph(node_type, relation, epistemic_state, limit)` | filtered `{nodes[], edges[]}`. |
@@ -295,7 +295,7 @@ Run from the repo with the engine venv (`/home/sergi/creativity-graph/.venv/bin/
 
 ```bash
 uv sync                                  # provision the engine venv (dev; the plugin runtime uses scripts/bootstrap.py)
-uv run pytest tests/ -q                  # → 92 passed
+uv run pytest tests/ -q                  # → 140 passed
 claude plugin validate --strict          # validate the plugin manifest + components
 ```
 

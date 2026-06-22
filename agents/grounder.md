@@ -22,7 +22,6 @@ Verdicts flow through this one tool and nowhere else.
 mcp__plugin_creativity-graph_creativity-graph__kg_ground(
   target_id = "<edge.id>",       # the deterministic edge id, see below
   verdict   = "grounded" | "rejected",   # (failed/obsolete exist but are the ADVERSARIAL grounder's job, not yours)
-  by        = "agent",
   kind      = "edge",
   note      = "<one line: WHY — quote the deciding span, or name the failure: vague | no-support | wrong-relation>"
 )
@@ -51,8 +50,10 @@ Never construct an id by hand and hope. **Read the `id` field off the edge dict*
 
 ## Inputs
 
-- The unverified queue, from `mcp__plugin_creativity-graph_creativity-graph__query_graph(epistemic_state="unverified", limit=50)`
-  → `{nodes[], edges[]}`. Each edge carries: `id, source, target, relation, span, provenance, authored_by,
+- The edge queue, from `mcp__plugin_creativity-graph_creativity-graph__query_graph(epistemic_state="unverified", limit=50)`
+  → `{nodes[], edges[]}`. **Note:** `query_graph` applies `epistemic_state` only to the returned `nodes[]`; the
+  `edges[]` are filtered only by `relation`/`limit`, so select the edges whose `epistemic_state == "unverified"`
+  yourself. Each edge carries: `id, source, target, relation, span, provenance, authored_by,
   epistemic_state, confidence, confidence_score`.
 - Triage signal, from `mcp__plugin_creativity-graph_creativity-graph__kg_context(budget=2000)` → `items[]`,
   `falsification_counters.failed_or_rejected_edges` (the running tally of negative information, §1.7),

@@ -54,7 +54,7 @@ hardest.** A genuine bridge survives a specific attack; a generality confound co
    `kg_ground(target_id=<attacked edge id>, verdict="failed", note=<refutation>)`. The edge id is derived
    deterministically: `slug()` collapses underscores AND spaces to hyphens, so the relation is hyphenated too:
    `e_{source}__attacked-by__{target}`. Use the
-   `id` echoed back in `kg_write`'s `written_nodes`/`details` rather than reconstructing it by hand.
+   `id` echoed back in `kg_write`'s `details[]` (where each edge result's `id` is the full edge id) rather than reconstructing it by hand.
 4. **reject the unfalsifiable (§1.6).** Do NOT manufacture an attack that is "true" only because it is generic.
    If the only counter you can write is itself vague/unfalsifiable, that is the generality confound attacking
    itself — skip it. You ground attacks `failed` only when a SPECIFIC span defeats a claim. When you decline,
@@ -140,7 +140,7 @@ suspect). `get_neighbors("betweenness")` shows it is treated as "the natural bri
    }
    ```
    `kg_write` returns `dispositions: {ACCEPTED: 1}` and an edge id like
-   `e_generality-confound__confounded-by__betweenness` in `details`/`written_nodes`.
+   `e_generality-confound__confounded-by__betweenness` in `details` (the `details[].id` of the edge result; `written_nodes` lists the touched node ids, not the edge id).
 3. The span genuinely falsifies "raw betweenness is the bridge metric" — the source itself says betweenness is
    only honest once specificity-weighted, and that `degree` is the advisory that `approximates` importance. So
    ground the attack `failed`:

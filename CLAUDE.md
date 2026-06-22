@@ -31,7 +31,7 @@ below and `.mcp.json`; that's a runtime detail, not how you develop.)
 ```sh
 # Environment
 uv sync                                   # or: pip install -e ".[dev,backend]"
-# extras: dev (pytest) · backend (anthropic) · embeddings (sqlite-vss) · treesitter
+# extras: dev (pytest) · backend (anthropic)
 
 # Tests (pytest config in pyproject: testpaths=["tests"], addopts="-q")
 uv run pytest                             # full suite
@@ -170,9 +170,8 @@ cleanup); `scripts/validate_plugin.py` asserts every entrypoint file is present.
 `source_path` → `KG_SOURCE_PATH` (default `examples/source.md`); `sensitivity` →
 `CLAUDE_PLUGIN_OPTION_SENSITIVITY` (default `medium`); `metrics_mode` →
 `CLAUDE_PLUGIN_OPTION_METRICS_MODE` (default `structure_only`). `.mcp.json` also hardcodes
-`KG_PROJECT_DIR`, `KG_DATA`, `KG_PACK_PATH`, and `PYTHONPATH=…/scripts`. **Gotcha:** `domain` exists
-in the `userConfig` schema for the enable-time UI but is *not* wired to any env var — the engine never
-reads it.
+`KG_PROJECT_DIR`, `KG_DATA`, `KG_PACK_PATH`, and `PYTHONPATH=…/scripts`. `source_path`, `sensitivity`,
+and `metrics_mode` are the only three `userConfig` keys (the former unwired `domain` knob was removed).
 
 ## Releasing
 

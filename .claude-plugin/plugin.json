@@ -23,7 +23,7 @@
     "metrics_mode": {
       "type": "string",
       "title": "Metrics mode",
-      "description": "One of structure_only | with_embeddings (structure_only uses graph structure as signal; with_embeddings adds a gated sqlite-vss candidate generator). Validated by the engine; unknown values fall back to structure_only.",
+      "description": "One of structure_only | with_embeddings (structure_only uses graph structure as the signal; with_embeddings is currently inert — the former sqlite-vss candidate generator was removed). Validated by the engine; unknown values fall back to structure_only.",
       "default": "structure_only"
     }
   }
