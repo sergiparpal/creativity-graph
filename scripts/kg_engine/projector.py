@@ -16,14 +16,22 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import networkx as nx
 
 from .canon import Canon, _atomic_write
+from .harness import _node_specificity, idf_seeds
+from .harness import specificity as _specificity_gate
 from .model import EpistemicState, FAILURE_STATES, Provenance
 
 GRAPH_JSON = "graph.json"
 INDEX_DB = "index.sqlite"
+# The full set of `nodes` columns the current schema declares. The four generative-layer columns
+# (betweenness/spec_betweenness/specificity/gate_on, PLAN Stage 2) were added after the original 11;
+# an index.sqlite built before them lacks the columns, so a projection that finds them missing forces
+# a full rebuild (CREATE TABLE IF NOT EXISTS cannot add a column to an existing table).
+_NEW_NODE_COLUMNS = {"betweenness", "spec_betweenness", "specificity", "gate_on"}
 # Hard ceiling on the kg_context token budget so a client passing a huge value can't make the engine
 # serialize the entire edge table into one response (server-4). The limit clamp on query_graph is the
 # row-count analogue.
@@ -93,17 +101,46 @@ class ProjectReport:
     built_from_commit: str = ""
 
 
+@dataclass
+class Ranks:
+    """All precomputed per-node signals from one projection (PLAN Stage 2). Computed OFF the hot path
+    (`_ranks`); read O(1) by the query surface. `betweenness` and `spec_betweenness` complete the
+    partially-implemented bridge metric; `gate_on` (one value per projection) records whether the
+    specificity-weighting earned promotion this projection (`harness.specificity`)."""
+    community: dict = field(default_factory=dict)
+    degree: dict = field(default_factory=dict)
+    bridges: dict = field(default_factory=dict)
+    betweenness: dict = field(default_factory=dict)
+    spec_betweenness: dict = field(default_factory=dict)
+    specificity: dict = field(default_factory=dict)
+    gate_on: int = 0
+
+
 # --------------------------------------------------------------------------- projector
 
 
 class Projector:
-    def __init__(self, canon: Canon, derived_dir: str | Path | None = None, *, metrics_mode: str = "structure_only"):
+    def __init__(self, canon: Canon, derived_dir: str | Path | None = None, *,
+                 metrics_mode: str = "structure_only", source_text: "str | Callable[[], str] | None" = None):
         self.canon = canon
         self.derived = Path(derived_dir) if derived_dir else (canon.root / "derived")
         self.derived.mkdir(parents=True, exist_ok=True)
         self.graph_path = self.derived / GRAPH_JSON
         self.db_path = self.derived / INDEX_DB
         self.metrics_mode = metrics_mode
+        # The source text feeds the IDF specificity weighting (PLAN Stage 2). Accept a str OR a
+        # zero-arg callable (KGEngine passes its bound `source_text`, read lazily once per real
+        # reprojection — off the hot path). Absent -> an empty corpus, so specificity is uniform and the
+        # bridge-metric gate stays closed (spec_betweenness degrades to raw betweenness).
+        self._source_text = source_text
+
+    def _corpus(self) -> list[str]:
+        """The source split into sections (on `\\n## `) for IDF — the corpus `harness.idf_seeds`
+        consumes. Empty when no source is configured."""
+        src = self._source_text() if callable(self._source_text) else self._source_text
+        if not src:
+            return []
+        return [s for s in src.split("\n## ") if s.strip()]
 
     # ---- helpers
     def _head(self) -> str:
@@ -138,7 +175,7 @@ class Projector:
         return G
 
     # ---- ranks (off the hot path)
-    def _ranks(self, G: nx.DiGraph):
+    def _ranks(self, G: nx.DiGraph) -> Ranks:
         und = G.to_undirected()
         comm = _leiden(und)
         degree = dict(und.degree())
@@ -147,7 +184,30 @@ class Projector:
             neigh_comms = {comm.get(nb) for nb in und.neighbors(n)}
             neigh_comms.discard(None)
             bridges[n] = len(neigh_comms)
-        return comm, degree, bridges
+
+        # complete the bridge metric (PLAN Stage 2 / §2/§4), all OFF the hot path:
+        #  - raw betweenness: the natural bridge metric, but confounded by generality (a vague node sits
+        #    on many shortest paths for empty reasons).
+        #  - specificity: IDF rarity of a node's label terms over the source corpus (the confound control).
+        #  - spec_betweenness = betweenness * specificity: down-weights vague high-traffic hubs.
+        betweenness = nx.betweenness_centrality(und) if und.number_of_nodes() > 2 else {n: 0.0 for n in und}
+        corpus = self._corpus()
+        seeds = idf_seeds(corpus) if corpus else {}
+        default = (sum(seeds.values()) / len(seeds)) if seeds else 1.0
+        specificity = {n: _node_specificity(G.nodes[n].get("label") or n, seeds, default) for n in G.nodes()}
+        spec_betweenness = {n: betweenness.get(n, 0.0) * specificity.get(n, default) for n in G.nodes()}
+
+        # the gate (one value per projection): does specificity-weighting separate real bridges from
+        # vague high-traffic nodes beyond a churn band? Computed once via the harness (it measures the
+        # confound + rank churn). gate_on decides only whether spec_betweenness is TRUSTED for ranking —
+        # both raw and weighted values are always stored, so nothing is hidden.
+        gate_on = 0
+        try:
+            verdict = _specificity_gate(_node_link_data(G), corpus)
+            gate_on = 1 if verdict.get("gate_on") else 0
+        except Exception:  # noqa: BLE001 — a gate-computation hiccup must never break projection
+            gate_on = 0
+        return Ranks(comm, degree, bridges, betweenness, spec_betweenness, specificity, gate_on)
 
     # ---- main
     def project(self, incremental: bool = True) -> ProjectReport:
@@ -181,7 +241,7 @@ class Projector:
         cur_hashes = {n.id: self._file_hash(n) for n in nodes}
 
         do_full = (not incremental) or (not self.db_path.exists()) or (not prior_hashes) \
-            or (not self.graph_path.exists())
+            or (not self.graph_path.exists()) or self._schema_outdated()
         report = ProjectReport(full_rebuild=do_full, built_from_commit=head)
 
         if not do_full and prior.get("built_from_commit") == head and prior_hashes == cur_hashes:
@@ -191,7 +251,7 @@ class Projector:
             return report
 
         G = self._build_graph(nodes)
-        comm, degree, bridges = self._ranks(G)
+        ranks = self._ranks(G)
 
         # graph.json is always written in full (cheap projection, must round-trip). Write atomically
         # (temp + os.replace) so a concurrent reader never observes a half-written file.
@@ -200,29 +260,33 @@ class Projector:
         _atomic_write(self.graph_path, json.dumps(data, indent=2))
 
         if do_full:
-            self._write_full(nodes, comm, degree, bridges, head, cur_hashes, report)
+            self._write_full(nodes, ranks, head, cur_hashes, report)
         else:
             changed = [n for n in nodes if cur_hashes.get(n.id) != prior_hashes.get(n.id)]
             removed = [nid for nid in prior_hashes if nid not in cur_hashes]
-            self._write_incremental(nodes, changed, removed, comm, degree, bridges, head, cur_hashes, report)
+            self._write_incremental(nodes, changed, removed, ranks, head, cur_hashes, report)
 
         report.n_nodes = G.number_of_nodes()
         report.n_edges = G.number_of_edges()
-        report.communities = len(set(comm.values()))
+        report.communities = len(set(ranks.community.values()))
         return report
 
     # ---- sqlite
+    _NODES_DDL = (
+        "CREATE TABLE IF NOT EXISTS nodes("
+        "id TEXT PRIMARY KEY, label TEXT, node_type TEXT, file_type TEXT, "
+        "provenance TEXT, authored_by TEXT, epistemic_state TEXT, "
+        "degree INTEGER, community INTEGER, bridge_communities INTEGER, structural_bridge INTEGER, "
+        "betweenness REAL, spec_betweenness REAL, specificity REAL, gate_on INTEGER)")
+
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
         con.execute("PRAGMA busy_timeout=5000")  # wait, don't raise, if another writer holds the lock
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-            CREATE TABLE IF NOT EXISTS nodes(
-                id TEXT PRIMARY KEY, label TEXT, node_type TEXT, file_type TEXT,
-                provenance TEXT, authored_by TEXT, epistemic_state TEXT,
-                degree INTEGER, community INTEGER, bridge_communities INTEGER, structural_bridge INTEGER);
+            {self._NODES_DDL};
             CREATE TABLE IF NOT EXISTS edges(
                 id TEXT PRIMARY KEY, source TEXT, target TEXT, relation TEXT,
                 provenance TEXT, authored_by TEXT, epistemic_state TEXT, span TEXT,
@@ -232,36 +296,62 @@ class Projector:
             CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree);
             """
         )
+        # CREATE TABLE IF NOT EXISTS cannot add the Stage-2 columns to a pre-existing 11-column `nodes`
+        # table. If they are missing, drop and recreate it empty (a full reprojection — forced by
+        # _schema_outdated — repopulates it). Done here so every connect path heals the schema.
+        cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
+        if not _NEW_NODE_COLUMNS <= cols:
+            con.executescript(f"DROP TABLE IF EXISTS nodes; {self._NODES_DDL};"
+                              "CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree);")
         return con
 
-    def _node_row(self, n, comm, degree, bridges):
-        bc = bridges.get(n.id, 0)
+    def _schema_outdated(self) -> bool:
+        """True if an index.sqlite exists but its `nodes` table predates the Stage-2 columns — forces a
+        full rebuild so the betweenness/specificity/gate columns get populated for every node, not just
+        the ones an incremental pass happens to touch."""
+        if not self.db_path.exists():
+            return False  # no db -> do_full is already True via the exists() check
+        try:
+            con = sqlite3.connect(self.db_path)
+            try:
+                cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return True
+        return not _NEW_NODE_COLUMNS <= cols
+
+    def _node_row(self, n, ranks: Ranks):
+        bc = ranks.bridges.get(n.id, 0)
         return (n.id, n.label, n.node_type, n.file_type, n.provenance.value, n.authored_by.value,
-                n.epistemic_state.value, degree.get(n.id, 0), comm.get(n.id, -1), bc, 1 if bc >= 2 else 0)
+                n.epistemic_state.value, ranks.degree.get(n.id, 0), ranks.community.get(n.id, -1), bc,
+                1 if bc >= 2 else 0,
+                float(ranks.betweenness.get(n.id, 0.0)), float(ranks.spec_betweenness.get(n.id, 0.0)),
+                float(ranks.specificity.get(n.id, 1.0)), int(ranks.gate_on))
 
     @staticmethod
     def _edge_row(e):
         return (e.id, e.source, e.target, e.relation, e.provenance.value, e.authored_by.value,
                 e.epistemic_state.value, e.span, e.source_file, e.confidence.value, e.confidence_score)
 
-    def _write_full(self, nodes, comm, degree, bridges, head, hashes, report):
+    def _write_full(self, nodes, ranks: Ranks, head, hashes, report):
         con = self._connect()
         try:
             con.execute("DELETE FROM nodes")
             con.execute("DELETE FROM edges")
             con.executemany(
-                "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                [self._node_row(n, comm, degree, bridges) for n in nodes])
+                "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [self._node_row(n, ranks) for n in nodes])
             erows = [self._edge_row(e) for n in nodes for e in n.edges]
             con.executemany("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", erows)
             report.touched_nodes = [n.id for n in nodes]
             report.touched_edges = [e.id for n in nodes for e in n.edges]
-            self._save_meta(con, head, hashes)
+            self._save_meta(con, head, hashes, ranks.gate_on)
             con.commit()
         finally:
             con.close()
 
-    def _write_incremental(self, nodes, changed, removed, comm, degree, bridges, head, hashes, report):
+    def _write_incremental(self, nodes, changed, removed, ranks: Ranks, head, hashes, report):
         con = self._connect()
         try:
             changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
@@ -270,8 +360,8 @@ class Projector:
                 con.execute("DELETE FROM nodes WHERE id=?", (nid,))
                 con.execute("DELETE FROM edges WHERE source=?", (nid,))
             for n in changed:
-                con.execute("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                            self._node_row(n, comm, degree, bridges))
+                con.execute("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            self._node_row(n, ranks))
                 report.touched_nodes.append(n.id)
                 # diff this node's edges against the DB; upsert only changed rows, delete vanished
                 cur = {r[0]: r for r in con.execute(
@@ -286,17 +376,23 @@ class Projector:
                     if eid not in new:
                         con.execute("DELETE FROM edges WHERE id=?", (eid,))
                         report.touched_edges.append(eid)
-            # refresh ranks for unchanged nodes only when a rank value actually moved
+            # refresh ranks for unchanged nodes only when a rank value actually moved. Betweenness/
+            # spec_betweenness/specificity are GLOBAL — one new edge shifts them for distant nodes — so
+            # they are diffed and refreshed here too, not just degree/community/bridge.
             for n in nodes:
                 if n.id in changed_ids:
                     continue
-                row = self._node_row(n, comm, degree, bridges)
-                old = con.execute("SELECT degree,community,bridge_communities FROM nodes WHERE id=?",
+                row = self._node_row(n, ranks)
+                old = con.execute("SELECT degree,community,bridge_communities,betweenness,"
+                                  "spec_betweenness,specificity,gate_on FROM nodes WHERE id=?",
                                   (n.id,)).fetchone()
-                if old != (row[7], row[8], row[9]):
-                    con.execute("UPDATE nodes SET degree=?,community=?,bridge_communities=?,structural_bridge=? "
-                                "WHERE id=?", (row[7], row[8], row[9], row[10], n.id))
-            self._save_meta(con, head, hashes)
+                new_vals = (row[7], row[8], row[9], row[11], row[12], row[13], row[14])
+                if old != new_vals:
+                    con.execute("UPDATE nodes SET degree=?,community=?,bridge_communities=?,"
+                                "structural_bridge=?,betweenness=?,spec_betweenness=?,specificity=?,"
+                                "gate_on=? WHERE id=?",
+                                (row[7], row[8], row[9], row[10], row[11], row[12], row[13], row[14], n.id))
+            self._save_meta(con, head, hashes, ranks.gate_on)
             con.commit()
         finally:
             con.close()
@@ -316,10 +412,13 @@ class Projector:
             h.update(f"{p.name}\x00{st.st_size}\x00{st.st_mtime_ns}\x00".encode())
         return h.hexdigest()
 
-    def _save_meta(self, con, head, hashes):
+    def _save_meta(self, con, head, hashes, gate_on=0):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('built_from_commit', ?)", (head,))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('file_hashes', ?)", (json.dumps(hashes),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(self._cheap_sig()),))
+        # the bridge-metric gate verdict for this projection (PLAN Stage 2): one value, read by
+        # kg_context to decide whether spec_betweenness is the TRUSTED ranking signal this projection.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('gate_on', ?)", (str(int(gate_on)),))
 
     def _read_meta(self) -> dict:
         try:
@@ -500,13 +599,35 @@ class Projector:
             bridges = [dict(r) for r in con.execute(
                 "SELECT id,label,degree,bridge_communities FROM nodes WHERE structural_bridge=1 "
                 "ORDER BY degree DESC LIMIT 10")]
+            # the completed bridge metric (PLAN Stage 2): when the gate is ON, the trusted ranking signal
+            # is spec_betweenness (the confound-corrected bridge metric); when OFF, fall back to the
+            # honest structural-bridge / degree advisory. Both raw and weighted values are always carried
+            # so a reader can see the correction. Read precomputed columns only — no centrality here.
+            grow = con.execute("SELECT value FROM meta WHERE key='gate_on'").fetchone()
+            gate_on = int(grow[0]) if grow and grow[0] is not None and str(grow[0]).isdigit() else 0
+            if gate_on:
+                bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes "
+                          "ORDER BY spec_betweenness DESC, degree DESC LIMIT 10")
+                ranked_by = "spec_betweenness"
+            else:
+                bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes "
+                          "ORDER BY structural_bridge DESC, betweenness DESC, degree DESC LIMIT 10")
+                ranked_by = "structural_bridge"
+            bridge_metric = {
+                "gate_on": gate_on,
+                "ranked_by": ranked_by,
+                "note": ("specificity-weighting earned promotion this projection — spec_betweenness is "
+                         "the trusted bridge signal" if gate_on else
+                         "gated: spec_betweenness stays advisory; ranking by structural-bridge/degree (§1.6)"),
+                "nodes": [dict(r) for r in con.execute(bm_sql)],
+            }
             return {
                 "items": items,
                 "approx_tokens": used,
                 "budget": budget,
                 "falsification_counters": counters,
                 "advisory": {"signal": "structural-bridge", "note": "advisory heuristic, not a guarantee",
-                             "nodes": bridges},
+                             "nodes": bridges, "bridge_metric": bridge_metric},
             }
         finally:
             con.close()

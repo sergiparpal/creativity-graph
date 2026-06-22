@@ -4,6 +4,8 @@ correct get_neighbors / shortest_path on a fixture graph.
 from __future__ import annotations
 
 import json
+import math
+import sqlite3
 
 import networkx as nx
 import pytest
@@ -164,6 +166,91 @@ def test_query_graph_ranked_by_degree(canon: Canon):
     assert len(res["nodes"]) == 4
     degs = [n["degree"] for n in res["nodes"]]
     assert degs == sorted(degs, reverse=True)  # ranked by precomputed degree
+
+
+def _confound_graph(canon: Canon):
+    """A vague hub ('system') carries more cross-cluster traffic than a specific bridge
+    ('entropy-arrow'); the corpus makes 'system' common and the bridge's terms rare."""
+    nodes = [
+        Node(id="system", label="system", node_type="claim", edges=[
+            Edge(source="system", target="a1", relation="bridges", span="x"),
+            Edge(source="system", target="b1", relation="bridges", span="x"),
+            Edge(source="system", target="a2", relation="bridges", span="x"),
+            Edge(source="system", target="b2", relation="bridges", span="x"),
+        ]),
+        Node(id="entropy-arrow", label="thermodynamic entropy arrow", node_type="claim", edges=[
+            Edge(source="entropy-arrow", target="a3", relation="bridges", span="x"),
+            Edge(source="entropy-arrow", target="b3", relation="bridges", span="x"),
+        ]),
+        Node(id="a1", label="a1", edges=[Edge(source="a1", target="a2", relation="bridges", span="x"),
+                                         Edge(source="a1", target="a3", relation="bridges", span="x")]),
+        Node(id="a2", label="a2", edges=[Edge(source="a2", target="a3", relation="bridges", span="x")]),
+        Node(id="a3", label="a3"),
+        Node(id="b1", label="b1", edges=[Edge(source="b1", target="b2", relation="bridges", span="x"),
+                                         Edge(source="b1", target="b3", relation="bridges", span="x")]),
+        Node(id="b2", label="b2", edges=[Edge(source="b2", target="b3", relation="bridges", span="x")]),
+        Node(id="b3", label="b3"),
+    ]
+    canon.write_nodes(nodes, message="seed confound graph")
+    corpus = "\n".join(["## intro"] + ["## s the system is a system"] * 19
+                       + ["## s the system thermodynamic entropy arrow rare once"])
+    return corpus
+
+
+def test_stage2_columns_finite_and_gate_binary(canon: Canon):
+    _seed(canon)
+    proj = Projector(canon)
+    proj.project()
+    for r in proj.query_graph(limit=50)["nodes"]:
+        assert math.isfinite(r["betweenness"]) and math.isfinite(r["spec_betweenness"])
+        assert math.isfinite(r["specificity"])
+        assert r["gate_on"] in (0, 1)
+
+
+def test_stage2_specificity_corrects_generality_confound(canon: Canon):
+    corpus = _confound_graph(canon)
+    proj = Projector(canon, source_text=corpus)
+    proj.project(incremental=False)
+    rows = {r["id"]: r for r in proj.query_graph(limit=50)["nodes"]}
+    sysr, entr = rows["system"], rows["entropy-arrow"]
+    # the vague hub is the high-traffic node ...
+    assert sysr["betweenness"] > entr["betweenness"]
+    # ... but its terms are common, so spec-weighting pulls it BELOW the specific bridge.
+    assert sysr["specificity"] < entr["specificity"]
+    assert sysr["spec_betweenness"] < entr["spec_betweenness"]
+
+
+def test_stage2_bridge_metric_advisory_nonempty(canon: Canon):
+    _seed(canon)
+    proj = Projector(canon)
+    proj.project()
+    bm = proj.kg_context(budget=2000)["advisory"]["bridge_metric"]
+    assert bm["gate_on"] in (0, 1)
+    assert bm["ranked_by"] in ("spec_betweenness", "structural_bridge")
+    assert bm["nodes"]  # non-empty ranked list
+    assert {"betweenness", "spec_betweenness", "specificity"} <= set(bm["nodes"][0])
+
+
+def test_stage2_outdated_schema_forces_full_rebuild(canon: Canon):
+    # simulate an index.sqlite built before the Stage-2 columns: a legacy 11-column nodes table.
+    _seed(canon)
+    proj = Projector(canon)
+    proj.db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(proj.db_path)
+    con.executescript(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);"
+        "CREATE TABLE nodes(id TEXT PRIMARY KEY, label TEXT, node_type TEXT, file_type TEXT,"
+        " provenance TEXT, authored_by TEXT, epistemic_state TEXT, degree INTEGER, community INTEGER,"
+        " bridge_communities INTEGER, structural_bridge INTEGER);"
+        "INSERT INTO meta VALUES ('built_from_commit','deadbeef');"
+        "INSERT INTO meta VALUES ('file_hashes','{}');")
+    con.commit(); con.close()
+    assert proj._schema_outdated() is True
+    rep = proj.project(incremental=True)
+    assert rep.full_rebuild is True  # outdated schema forced a full rebuild
+    # the migrated table now carries the new columns and finite values
+    r = proj.get_node("a")
+    assert "spec_betweenness" in r and math.isfinite(r["spec_betweenness"])
 
 
 def test_derived_contains_nothing_canon_does_not(canon: Canon):
