@@ -320,6 +320,37 @@ class KGEngine:
             by_state[e.epistemic_state.value] = by_state.get(e.epistemic_state.value, 0) + 1
         return {"nodes": len(nodes), "edges": len(edges), "edges_by_epistemic_state": by_state}
 
+    def _failure_ids(self) -> set:
+        """Forward edge ids in failure memory (rejected/failed). The generators also check the reverse,
+        so forward ids suffice for invariant 5 (PLAN §13: failure memory binds generation)."""
+        from .model import FAILURE_STATES
+        return {e.id for e in self.canon.all_edges() if e.epistemic_state in FAILURE_STATES}
+
+    def kg_generate(self, mechanism: str = "bridge", k: int = 10, second_graph: str | None = None) -> dict:
+        """Generate hypothesized candidates from the derived graph (PLAN Stage 3 — the generative
+        engine). Projects if stale, reads precomputed ranks O(1), dispatches to the chosen mechanism(s)
+        (`bridge|seed|compression|regroup|transplant|ensemble`, or `all`/`default`), and returns ranked
+        candidates. **READ-ONLY** — it never writes the canon; `/kg-generate` routes the candidates
+        through the propose lane (`kg_propose`). Generate offensively; grounding judges later."""
+        from .generate import load_second_graph, run_generators
+        self._ensure_projected()
+        G = self.projector.load_graph()
+        corpus = self.projector._corpus()
+        failures = self._failure_ids()
+        gate_on = int(next((G.nodes[n].get("gate_on", 0) for n in G.nodes()), 0))
+        G2, note = None, ""
+        if second_graph:
+            try:
+                G2 = load_second_graph(second_graph)
+            except Exception as e:  # noqa: BLE001 — a bad second graph degrades, never crashes
+                note = f"second_graph could not be loaded ({e}); ensemble degraded to regroup"
+        if not note and G2 is None and mechanism in ("ensemble", "all"):
+            note = "no second construction supplied; ensemble degraded to regroup (run /kg-perturb to supply one)"
+        cands = run_generators(G, mechanism, pack=self.pack, corpus=corpus, failures=failures,
+                               k=k, second_graph=G2)
+        return {"mechanism": mechanism, "k": int(k), "gate_on": gate_on, "count": len(cands),
+                "candidates": [c.to_dict() for c in cands], "note": note}
+
     # ---- read surface (projects if stale, then reads precomputed ranks)
     def _ensure_projected(self) -> None:
         if not self.projector.db_path.exists() or self.projector.is_stale():
@@ -414,6 +445,14 @@ def _register(mcp, engine: KGEngine) -> None:
     def kg_metrics() -> dict:
         """Summary counts: nodes, edges, edges by epistemic state."""
         return engine.kg_metrics()
+
+    @mcp.tool()
+    def kg_generate(mechanism: str = "bridge", k: int = 10, second_graph: str = None) -> dict:
+        """Generate hypothesized idea candidates from the graph's structure (PLAN Stage 3). Mechanisms:
+        bridge (§2/§4), seed (§3 residual), compression (§7 new nodes), regroup (§8), transplant (§5),
+        ensemble (§9) — or "all"/"default". READ-ONLY: candidates are proposals (provenance=hypothesized,
+        no span); route them through kg_propose. Generate offensively; kg_ground judges later."""
+        return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph)
 
     @mcp.tool()
     def query_graph(node_type: str = None, relation: str = None, epistemic_state: str = None,

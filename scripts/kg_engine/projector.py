@@ -464,6 +464,24 @@ class Projector:
         con.row_factory = sqlite3.Row
         return con
 
+    def load_graph(self) -> nx.MultiDiGraph:
+        """Build an in-memory MultiDiGraph from the derived index, with every precomputed rank column
+        attached as a node attribute (PLAN Stage 3 — the generative layer reads ranks O(1) off this).
+        Read-only; assumes the caller has already projected. A dangling edge target (a node referenced
+        but not itself a canon note) is auto-created attribute-less, so generators must `.get()` ranks."""
+        con = self._ro()
+        try:
+            G = nx.MultiDiGraph()
+            for r in con.execute("SELECT * FROM nodes"):
+                d = dict(r)
+                G.add_node(d.pop("id"), **d)
+            for r in con.execute("SELECT * FROM edges"):
+                d = dict(r)
+                G.add_edge(d["source"], d["target"], key=d["id"], **d)
+            return G
+        finally:
+            con.close()
+
     def owner_of_edge(self, edge_id: str) -> str | None:
         """Source node id for an edge, via the indexed edges table (O(1) lookup); None if absent.
         Lets kg_ground resolve an edge's owner without an O(N) full-canon scan per call (server-2)."""
