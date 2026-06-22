@@ -102,18 +102,28 @@ These are enforced by the engine — agents cannot opt out:
 
 ## Install & enable
 
-This is a Claude Code plugin. Add it via the `claude` CLI / plugin marketplace, then enable it:
+This is a Claude Code plugin. From inside Claude Code (works in both the **CLI** and the
+**Desktop** app), run these two commands:
 
-```bash
-claude plugin install creativity-graph@sergiparpal   # from your marketplace
-# or, for local development, point Claude Code at this repo as a plugin source.
+```
+/plugin marketplace add sergiparpal/creativity-graph
+/plugin install creativity-graph@sergiparpal
 ```
 
-**Updating to the latest version.** If you don't have the latest version of the plugin installed,
-update it by running:
+The first command registers this repo as a plugin marketplace (Claude Code reads
+`.claude-plugin/marketplace.json` from `github.com/sergiparpal/creativity-graph`); the second
+installs the `creativity-graph` plugin from it. Restart the session if prompted so the plugin's
+hooks and MCP server load.
 
-```bash
-claude plugin update creativity-graph@sergiparpal
+> For **local development** instead of installing from GitHub, point Claude Code at this checkout:
+> `claude --plugin-dir /path/to/creativity-graph`.
+
+**Updating to the latest version.** If you don't have the latest version installed, update it from
+inside Claude Code:
+
+```
+/plugin marketplace update sergiparpal
+/plugin install creativity-graph@sergiparpal
 ```
 
 On `SessionStart` a cross-platform hook (`hooks/provision.mjs` → an OS launcher →

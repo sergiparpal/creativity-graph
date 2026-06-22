@@ -1,11 +1,11 @@
 {
-  "name": "creativity-graph-dev",
+  "name": "sergiparpal",
   "owner": {
     "name": "Sergi Parpal",
     "email": "sergiparpal@gmail.com"
   },
   "metadata": {
-    "description": "Local dev marketplace for the creativity-graph plugin."
+    "description": "Sergi Parpal's Claude Code plugin marketplace."
   },
   "plugins": [
     {

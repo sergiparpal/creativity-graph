@@ -217,12 +217,13 @@ python -m kg_engine.backend extract            # extract → boundary → canon 
 
 ### 4. Publish + tag (manual, outward-facing — run by a human)
 
-These steps push to an external marketplace and are **not** automated:
+The bundled `.claude-plugin/marketplace.json` **is** the public single-plugin marketplace
+(`name: sergiparpal`, `source: "."`): pushing this repo to `github.com/sergiparpal/creativity-graph`
+makes it installable via `/plugin marketplace add sergiparpal/creativity-graph` +
+`/plugin install creativity-graph@sergiparpal`. These steps are **not** automated:
 
 1. Commit the version bump and changelog on `main`.
-2. Create the marketplace entry in the **public** marketplace repo (the bundled
-   `.claude-plugin/marketplace.json` is a single-plugin **local/dev** marketplace for
-   `--plugin-dir` installs, not the public listing).
+2. Push `main` to the public repo so the updated `marketplace.json` (with the bumped version) is live.
 3. Tag the release: `claude plugin tag creativity-graph <version>`.
 4. `git tag vX.Y.Z && git push --tags`.
 
