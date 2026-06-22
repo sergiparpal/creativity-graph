@@ -12,9 +12,19 @@ import os
 from pathlib import Path
 
 from . import __version__
-from .boundary import DEFAULT_MAX_EDGES_PER_KB, merge_results_into_nodes, validate_payload
+from .boundary import DEFAULT_MAX_EDGES_PER_KB, MIN_SPAN_CHARS, merge_results_into_nodes, validate_payload
 from .canon import Canon
-from .model import Disposition, EpistemicState, GROUNDABLE_STATES, Node, Provenance, slug, utcnow
+from .model import (
+    Disposition,
+    EpistemicState,
+    GROUNDABLE_STATES,
+    Node,
+    Provenance,
+    normalize_text,
+    slug,
+    span_verifies,
+    utcnow,
+)
 from .pack import load_pack
 from .projector import Projector
 from .reconciler import GROUND_AUDIT, Reconciler
@@ -144,9 +154,16 @@ class KGEngine:
         return out
 
     def kg_ground(self, target_id: str, verdict: str, *, by: str = "agent", kind: str = "edge",
-                  note: str = "") -> dict:
+                  note: str = "", support_span: str = "", support_note: str = "") -> dict:
         """Apply a grounding verdict (the ONLY path that may set a verdict state). Stamps the verdict
-        and appends an audit record so the reconciler treats the transition as legitimate (§1.8)."""
+        and appends an audit record so the reconciler treats the transition as legitimate (§1.8).
+
+        **Promotion of a hypothesis requires support (PLAN Stage 8 / §1.2-3).** A `hypothesized` edge
+        may become `grounded` ONLY when a grounder supplies support, which UPGRADES its provenance:
+        `support_span` (a verbatim substring of the source) → `span-present`; `support_note` (an external
+        citation, no span) → `inferred`. Without either, grounding a hypothesis to `grounded` is refused
+        with `hypothesis-needs-support` — generated ideas become grounded knowledge only by earning it.
+        `support_*` are ignored for non-hypothesized edges and for any verdict other than `grounded`."""
         verdict = verdict.lower()
         if verdict not in VALID_VERDICTS:
             return {"ok": False, "error": f"invalid verdict {verdict!r}"}
@@ -154,6 +171,7 @@ class KGEngine:
         # masquerade as a verdict author (the MCP tool surface already pins this to "agent").
         by = by if by in ("agent", "human", "deterministic") else "agent"
         state = EpistemicState(verdict)
+        promoted_to = None
         if kind == "node":
             if not self.canon.exists(target_id):
                 return {"ok": False, "error": "node not found"}
@@ -166,6 +184,26 @@ class KGEngine:
             if node is None:
                 return {"ok": False, "error": "edge not found"}
             edge = next(e for e in node.edges if e.id == target_id)
+            # the hypothesized→grounded promotion gate: a span-less proposal earns grounding only with
+            # support, which upgrades its provenance. Decided BEFORE any state change so a refusal leaves
+            # the edge untouched (no audit record, no write).
+            if edge.provenance == Provenance.HYPOTHESIZED and state == EpistemicState.GROUNDED:
+                restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
+                if support_span and support_span.strip():
+                    check = restore(support_span) if restore else support_span
+                    if not span_verifies(check, self.source_text()):
+                        return {"ok": False, "error": "support-span-not-in-source"}
+                    if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
+                        return {"ok": False, "error": "support-span-too-short"}
+                    edge.span = check
+                    edge.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
+                    promoted_to = Provenance.SPAN_PRESENT.value
+                elif support_note and support_note.strip():
+                    edge.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
+                    edge.notes = (edge.notes + " | " if edge.notes else "") + f"citation: {support_note.strip()}"
+                    promoted_to = Provenance.INFERRED.value
+                else:
+                    return {"ok": False, "error": "hypothesis-needs-support"}
             frm = edge.epistemic_state.value
             edge.epistemic_state = state
             edge.verdict_by = by
@@ -193,7 +231,10 @@ class KGEngine:
             except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
                 self._truncate_audit(audit_offset)  # the transition never happened; drop its record
                 return {"ok": False, "error": f"write failed: {e}"}
-            return {"ok": True, "key": key, "from": frm, "to": verdict, "by": by}
+            out = {"ok": True, "key": key, "from": frm, "to": verdict, "by": by}
+            if promoted_to:  # a hypothesis was promoted — its provenance was upgraded (PLAN Stage 8)
+                out["provenance_upgraded_to"] = promoted_to
+            return out
         finally:
             self.canon._release_lock()
 
@@ -505,11 +546,16 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_propose(payload)
 
     @mcp.tool()
-    def kg_ground(target_id: str, verdict: str, kind: str = "edge", note: str = "") -> dict:
+    def kg_ground(target_id: str, verdict: str, kind: str = "edge", note: str = "",
+                  support_span: str = "", support_note: str = "") -> dict:
         """Apply a grounding verdict (grounded|rejected|failed|obsolete) to an edge or node. Verdicts
         applied via this tool are always attributed to the agent — a human verdict cannot be forged
-        through the tool surface (§1.4)."""
-        return engine.kg_ground(target_id, verdict, by="agent", kind=kind, note=note)
+        through the tool surface (§1.4). To PROMOTE a hypothesized edge to grounded you MUST supply
+        support, which upgrades its provenance: `support_span` (a verbatim source substring → span-present)
+        or `support_note` (an external citation → inferred); without either, the promotion is refused with
+        `hypothesis-needs-support`."""
+        return engine.kg_ground(target_id, verdict, by="agent", kind=kind, note=note,
+                                support_span=support_span, support_note=support_note)
 
     @mcp.tool()
     def kg_rename(old_id: str, new_id: str) -> dict:

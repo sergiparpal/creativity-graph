@@ -583,13 +583,13 @@ class Projector:
             order = ("epistemic_state='grounded' DESC, "
                      "CASE provenance WHEN 'span-present' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, "
                      "confidence_score DESC")
-            eq = ("SELECT id,source,target,relation,provenance,authored_by,epistemic_state,span,"
-                  "confidence,confidence_score FROM edges")
-            ea: list = []
+            cols = ("id,source,target,relation,provenance,authored_by,epistemic_state,span,"
+                    "confidence,confidence_score")
+            # term-wise OR match: a natural-language question matches edges that contain ANY of its terms
+            # in any field. A single LIKE on the whole string would only match a verbatim substring of
+            # the question, so multi-word queries always missed. Built ONCE and reused for both lanes.
+            term_clause, term_args = "", []
             if query:
-                # term-wise OR match: a natural-language question matches edges that contain ANY of its
-                # terms in any field. A single LIKE on the whole string would only match a verbatim
-                # substring of the question, so multi-word queries always missed.
                 import re as _re
                 seen: set = set()
                 terms = [t for t in _re.findall(r"[A-Za-z0-9_-]{3,}", query.lower())
@@ -597,23 +597,40 @@ class Projector:
                 _clause = ("(source LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' "
                            "OR relation LIKE ? ESCAPE '\\' OR span LIKE ? ESCAPE '\\')")
                 if terms:
-                    clauses = []
+                    parts = []
                     for t in terms:
-                        clauses.append(_clause)
-                        ea += [f"%{_like_escape(t)}%"] * 4
-                    eq += " WHERE (" + " OR ".join(clauses) + ")"
+                        parts.append(_clause)
+                        term_args += [f"%{_like_escape(t)}%"] * 4
+                    term_clause = "(" + " OR ".join(parts) + ")"
                 else:
-                    eq += " WHERE " + _clause
-                    ea = [f"%{_like_escape(query)}%"] * 4
-            eq += f" ORDER BY {order}"
-            items, used = [], 0
-            for r in con.execute(eq, ea):
-                rec = dict(r)
-                tok = max(1, len(json.dumps(rec)) // 4)
-                if used + tok > budget:
-                    break
-                used += tok
-                items.append(rec)
+                    term_clause = _clause
+                    term_args = [f"%{_like_escape(query)}%"] * 4
+
+            def _fill(where_sql, args, order_sql, cap):
+                rows, used = [], 0
+                for r in con.execute(f"SELECT {cols} FROM edges WHERE {where_sql} ORDER BY {order_sql}", args):
+                    rec = dict(r)
+                    tok = max(1, len(json.dumps(rec)) // 4)
+                    if used + tok > cap:
+                        break
+                    used += tok
+                    rows.append(rec)
+                return rows, used
+
+            # GROUNDED LANE — items[] never includes a hypothesized proposal (PLAN Stage 8). A
+            # hypothesized edge is a machine proposal, not grounded content, and must never be laundered
+            # into a grounded answer.
+            iwhere = "provenance != 'hypothesized'"
+            iargs = list(term_args)
+            if term_clause:
+                iwhere += " AND " + term_clause
+            items, used = _fill(iwhere, iargs, order, budget)
+            # HYPOTHESIS LANE — a SEPARATE block of hypothesized, unverified proposals, clearly distinct.
+            hwhere = "provenance = 'hypothesized' AND epistemic_state = 'unverified'"
+            hargs = list(term_args)
+            if term_clause:
+                hwhere += " AND " + term_clause
+            hypotheses, _hused = _fill(hwhere, hargs, "confidence_score DESC", budget)
             bridges = [dict(r) for r in con.execute(
                 "SELECT id,label,degree,bridge_communities FROM nodes WHERE structural_bridge=1 "
                 "ORDER BY degree DESC LIMIT 10")]
@@ -641,6 +658,7 @@ class Projector:
             }
             return {
                 "items": items,
+                "hypotheses": hypotheses,   # the SEPARATE hypothesized lane — proposals, NOT grounded content
                 "approx_tokens": used,
                 "budget": budget,
                 "falsification_counters": counters,

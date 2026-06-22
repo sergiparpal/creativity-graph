@@ -23,11 +23,19 @@ Question: **$ARGUMENTS**
 
 ### 1. Get grounded, token-budgeted context
 Call `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=$ARGUMENTS)`. This is the primary source. It returns:
-- `items[]` — edges ordered **grounded → span-present → inferred**, each carrying
+- `items[]` — **grounded-lane** edges ordered **grounded → span-present → inferred**, each carrying
   `{id, source, target, relation, provenance, authored_by, epistemic_state, span, confidence, confidence_score}`.
+  This lane **never** contains a hypothesized proposal.
+- `hypotheses[]` — the **SEPARATE** hypothesized lane: machine proposals from `/kg-generate`
+  (`provenance: hypothesized`, `epistemic_state: unverified`, **no span**). These are NOT facts and NOT
+  grounded content — present them only under an explicit "Hypotheses (unverified proposals)" heading, never
+  mixed into the grounded answer. A hypothesis becomes a fact only after `/kg-ground` promotes it with
+  support (which upgrades its provenance to `span-present`/`inferred`).
 - `approx_tokens`, `budget` — the fill is capped (default budget 2000); note if you were truncated.
 - `falsification_counters: {failed_or_rejected_edges}` — the **memory of failures** (§1.7). NEVER omit this.
-- `advisory: {signal: "structural-bridge", note: "advisory heuristic, not a guarantee", nodes: [{id, label, degree, bridge_communities}]}`.
+- `advisory: {signal: "structural-bridge", note: "advisory heuristic, not a guarantee", nodes:[...],
+  bridge_metric: {gate_on, ranked_by, nodes:[...]}}` — `bridge_metric` ranks by the confound-corrected
+  `spec_betweenness` when `gate_on`, else falls back to the structural-bridge/degree advisory (§1.6).
 
 If `query` matches nothing, the items list may be empty even though the graph is non-empty — fall back to the
 structural lookups below before concluding "not in the graph."

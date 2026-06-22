@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 
-from kg_engine.model import Edge, EpistemicState, Node, edge_id
+from kg_engine.model import Edge, EpistemicState, Node, Provenance, edge_id
 from kg_engine.projector import Projector
 from kg_engine.reconciler import Reconciler
 
@@ -116,6 +116,82 @@ def test_adversarial_counter_edge_persists(engine):
     engine.kg_ground(counter, "failed", by="agent", note="falsified: vague hub, not a real bridge")
     e = next(x for x in engine.canon.all_edges() if x.id == counter)
     assert e.epistemic_state == EpistemicState.FAILED
+
+
+# --------------------------------------------------------------------------- Stage 8: the hypothesized lane
+
+
+def test_kg_context_segregates_hypotheses_from_items(engine):
+    # a grounded span-present edge ...
+    engine.kg_write({"edges": [{"source": "compression", "target": "claim", "relation": "grounds",
+                                "span": "A compression stands in for many observations",
+                                "authored_by": "agent"}]})
+    geid = edge_id("compression", "grounds", "claim")
+    engine.kg_ground(geid, "grounded")
+    # ... and a hypothesized proposal
+    engine.kg_propose({"edges": [{"source": "betweenness", "target": "degree", "relation": "bridges"}]})
+    heid = edge_id("betweenness", "bridges", "degree")
+
+    ctx = engine.kg_context(budget=5000)
+    item_ids = {i["id"] for i in ctx["items"]}
+    hyp_ids = {h["id"] for h in ctx["hypotheses"]}
+    assert geid in item_ids and heid not in item_ids        # grounded answers exclude the proposal
+    assert heid in hyp_ids and geid not in hyp_ids           # the proposal lives in its own lane
+    assert all(h["provenance"] == "hypothesized" for h in ctx["hypotheses"])
+
+
+def test_hypothesis_grounding_requires_support(engine):
+    engine.kg_propose({"edges": [{"source": "betweenness", "target": "degree", "relation": "bridges"}]})
+    eid = edge_id("betweenness", "bridges", "degree")
+    out = engine.kg_ground(eid, "grounded")                  # no support
+    assert out["ok"] is False and out["error"] == "hypothesis-needs-support"
+    e = next(x for x in engine.canon.all_edges() if x.id == eid)
+    assert e.epistemic_state == EpistemicState.UNVERIFIED    # untouched: no verdict forged
+    assert e.provenance == Provenance.HYPOTHESIZED
+
+
+def test_hypothesis_promoted_with_span_upgrades_to_span_present(engine):
+    engine.kg_propose({"edges": [{"source": "compression", "target": "claim", "relation": "grounds"}]})
+    eid = edge_id("compression", "grounds", "claim")
+    out = engine.kg_ground(eid, "grounded",
+                           support_span="A compression stands in for many observations")
+    assert out["ok"] and out["provenance_upgraded_to"] == "span-present"
+    e = next(x for x in engine.canon.all_edges() if x.id == eid)
+    assert e.epistemic_state == EpistemicState.GROUNDED
+    assert e.provenance == Provenance.SPAN_PRESENT and e.span     # now citable, earned its grounding
+
+
+def test_hypothesis_promoted_with_citation_is_inferred(engine):
+    engine.kg_propose({"edges": [{"source": "betweenness", "target": "degree", "relation": "bridges"}]})
+    eid = edge_id("betweenness", "bridges", "degree")
+    out = engine.kg_ground(eid, "grounded", support_note="Swanson 1986, undiscovered public knowledge")
+    assert out["ok"] and out["provenance_upgraded_to"] == "inferred"
+    e = next(x for x in engine.canon.all_edges() if x.id == eid)
+    assert e.provenance == Provenance.INFERRED and e.epistemic_state == EpistemicState.GROUNDED
+
+
+def test_hypothesis_fabricated_support_span_refused(engine):
+    engine.kg_propose({"edges": [{"source": "betweenness", "target": "degree", "relation": "bridges"}]})
+    eid = edge_id("betweenness", "bridges", "degree")
+    out = engine.kg_ground(eid, "grounded", support_span="this phrase is nowhere in the source at all")
+    assert out["ok"] is False and out["error"] == "support-span-not-in-source"
+    e = next(x for x in engine.canon.all_edges() if x.id == eid)
+    assert e.provenance == Provenance.HYPOTHESIZED and e.epistemic_state == EpistemicState.UNVERIFIED
+
+
+def test_rejected_hypothesis_binds_next_generation(engine):
+    # invariant-5 round trip: propose -> reject -> failure memory -> re-proposal quarantined
+    engine.kg_propose({"edges": [{"source": "alpha", "target": "beta", "relation": "bridges"}]})
+    eid = edge_id("alpha", "bridges", "beta")
+    engine.kg_ground(eid, "rejected", note="vague")
+    assert eid in engine._failure_ids()
+    out = engine.kg_propose({"edges": [{"source": "alpha", "target": "beta", "relation": "bridges"}]})
+    assert "collapses-into-known-failure" in [d["reason"] for d in out["details"]]
+    # the reverse identity is bound too, and a generator that runs would consult the same failure set
+    rev = engine.kg_propose({"edges": [{"source": "beta", "target": "alpha", "relation": "bridges"}]})
+    assert "collapses-into-known-failure" in [d["reason"] for d in rev["details"]]
+    assert not any({c["source"], c["target"]} == {"alpha", "beta"}
+                   for c in engine.kg_generate("all", k=20)["candidates"])
 
 
 def test_failed_edge_not_pruned_and_surfaced(engine):

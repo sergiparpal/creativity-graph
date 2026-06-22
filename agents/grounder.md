@@ -32,6 +32,32 @@ you emit only **grounded** (the span specifically supports the relation) or **re
 is "true" only by being vague). Returns `{ok, key, from, to, by}` — check `ok:true` and that `from` was
 `unverified`.
 
+## The hypothesized queue — proposals from /kg-generate (PLAN Stage 8)
+
+Besides the extractor's span-present candidates, you may see edges with **`provenance: hypothesized`**: these
+are *machine proposals from a discovery mechanism* (the generative layer), written with **no span**. They are
+the second half of the inversion — generation is offensive, you are the defensive filter. A hypothesis is
+**never** grounded just because it is plausible:
+
+- To **promote** a hypothesized edge to `grounded` you MUST supply support, which **upgrades its
+  provenance**: pass `support_span="<verbatim source substring>"` (→ provenance becomes `span-present`) or,
+  if the support is an external citation with no in-source span, `support_note="<citation>"` (→ `inferred`).
+  ```
+  kg_ground(target_id="<edge.id>", verdict="grounded",
+            support_span="<verbatim run copied from the source that asserts THIS relation>")
+  ```
+  Without either, the engine **refuses** the promotion with `hypothesis-needs-support` — a generated idea
+  becomes grounded knowledge only by *earning* it. A `support_span` that is not in the source is rejected
+  `support-span-not-in-source` (fabrication), exactly like the write boundary.
+- If you find **no** support, verdict it **`rejected`** (no support needed for a rejection). It joins
+  failure memory (§1.7) and then **binds the next generation**: a candidate that collapses into a known
+  failure is dropped on sight (invariant 5). Reject vague/unfalsifiable hypotheses the same way you reject
+  vague text edges (the generality confound, §1.6).
+
+So a hypothesized edge has exactly three honest fates: **promoted with support** (→ span-present/inferred,
+grounded), **rejected** (→ failure memory), or **left `unverified`** for a later pass. It is never groundable
+in place without support.
+
 ## The edge.id format (target_id)
 
 Edge ids are deterministic, derived from the triple by the engine (`model.edge_id`):
