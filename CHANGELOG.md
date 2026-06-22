@@ -14,7 +14,33 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
-_Nothing yet — changes accrue here._
+### Changed — cross-platform, background, `uv`-optional install system
+
+Replaced the bash-only, blocking, `uv`-required provisioning with a cross-platform one modelled on the
+sibling `creativity-amplifier` plugin. It now runs on **Windows, macOS, Linux, and WSL/Git-Bash** with
+only Python ≥3.10 and Node (always present in the Claude Code runtime) required.
+
+- **New `scripts/bootstrap.py`** — the single source of truth for building the engine venv: resolves the
+  venv dir (`--venv` > `$KG_ENGINE_VENV` > `$CLAUDE_PLUGIN_DATA/.venv` > `<repo>/.venv`), installs
+  **dependencies only** with `uv sync --no-install-project` when `uv` is on PATH, **else falls back to
+  the stdlib `venv` + `pip install <repo>`** (no hard `uv` dependency). Idempotent via a content
+  `install.stamp` (hash of `pyproject.toml`), concurrency-safe via an atomic lock dir that steals stale
+  locks, writes a cross-platform interpreter pointer `<venv>/engine-python.txt`, and removes a half-built
+  venv on failure. `kg_engine` keeps resolving off `PYTHONPATH=scripts` (never installed), so engine
+  source edits need no rebuild.
+- **New SessionStart chain** — `hooks/provision.mjs` (Node dispatcher) → `hooks/provision.{sh,ps1}` (OS
+  launchers) → `bootstrap.py --background`, a **detached** worker that returns in milliseconds and no
+  longer blocks the session. The per-session canon reconcile (§1.8) moved into the worker
+  (`bootstrap.py --reconcile`).
+- **New `scripts/launch_server.mjs`** — the MCP server now launches via `node` (was `bash`), so the
+  spawn succeeds on every OS; it resolves the engine python via the pointer and self-heals the venv in
+  the foreground on a cold first session before running `kg_engine.server`.
+- **New `hooks/precontext.mjs`** — the PreToolUse context hook is now a Node launcher (was
+  `sh -c '<venv>/bin/python …'`), resolving the interpreter via the pointer.
+- **Removed** `hooks/bootstrap.sh` and `scripts/launch_server.sh` (superseded). `.mcp.json` and
+  `hooks/hooks.json` rewired to the Node entrypoints; `scripts/validate_plugin.py` updated to assert the
+  new component set; `tests/test_bootstrap.py` adds hermetic coverage (path resolution, stamp, readiness,
+  lock, failure cleanup). **92 tests green.**
 
 ## [0.2.0] — 2026-06-21
 

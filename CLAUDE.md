@@ -24,9 +24,9 @@ docs refer to that shared conceptual model (not to any external file).
 
 Development runs through `uv` from the repo root. `uv run …` syncs the venv and installs the project
 editable (`kg_engine` ← `scripts/kg_engine`, per `[tool.hatch.build.targets.wheel]`), so imports and
-`python -m kg_engine.*` resolve. (The *plugin runtime* instead uses `uv sync --no-install-project`
-plus `PYTHONPATH=scripts` — see `hooks/bootstrap.sh` and `.mcp.json`; that's a runtime detail, not how
-you develop.)
+`python -m kg_engine.*` resolve. (The *plugin runtime* instead provisions a standalone deps-only venv
+via `scripts/bootstrap.py` and resolves `kg_engine` off `PYTHONPATH=scripts` — see *Installation system*
+below and `.mcp.json`; that's a runtime detail, not how you develop.)
 
 ```sh
 # Environment
@@ -134,6 +134,35 @@ Namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`:
 - **Mutations (write canon):** `kg_write` (the boundary), `kg_ground` (the *sole* verdict gateway — stamps `verdict_by`/`verdict_at` + audit record), `kg_rename`.
 - **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`.
 - **Utility:** `kg_ping`, `kg_metrics`, `kg_scrub` (egress PII/secret redaction with consistent placeholders; `kg_write` restores placeholders to original text for the canon).
+
+## Installation system (cross-platform engine provisioning)
+
+The plugin ships **no vendored venv**; it builds one on the user's machine. The entrypoints are Node
+and Python (always present in the Claude Code runtime / required to run the engine) — **never bash**, so
+it works on Windows, macOS, Linux, and WSL/Git-Bash alike, with or without `uv`.
+
+- **`scripts/bootstrap.py`** is the single source of truth. It resolves the venv dir (`--venv` >
+  `$KG_ENGINE_VENV` > `$CLAUDE_PLUGIN_DATA/.venv` > `<repo>/.venv`), installs **dependencies only**
+  (`uv sync --no-install-project` if `uv` is on PATH, else stdlib `venv` + `pip install <repo>`), and
+  writes a cross-platform interpreter pointer `<venv>/engine-python.txt` + a content `install.stamp`
+  (hash of `pyproject.toml`). It is idempotent (stamp fast-path), concurrency-safe (atomic lock dir that
+  steals stale locks), and removes a half-built venv on failure. `kg_engine` is **not** installed — it
+  resolves off `PYTHONPATH=scripts` at runtime, so engine source edits never need a rebuild; only a
+  `pyproject.toml` dependency change does.
+- **SessionStart (`hooks/hooks.json` → `hooks/provision.mjs`, `async`):** the Node dispatcher picks the
+  OS launcher (`provision.sh` / `provision.ps1`), which finds a Python ≥3.10 and runs `bootstrap.py
+  --background` — a **detached** worker that returns in milliseconds (never blocks the session). The
+  worker also runs the per-session canon reconcile (`bootstrap.py --reconcile`, §1.8) once the venv is
+  ready.
+- **MCP launch (`.mcp.json` → `node scripts/launch_server.mjs`):** resolves the engine python via the
+  pointer; if the venv is not ready yet (cold first session), it runs a **foreground catch-up** via
+  `bootstrap.py` before spawning `kg_engine.server` (stdio inherited). Going through Node means the MCP
+  spawn always succeeds, so the server is never cached as "needs-auth" (§2.1).
+- **PreToolUse (`hooks/precontext.mjs`):** a Node launcher that runs `precontext.py` via the pointer;
+  best-effort, silent when the venv isn't ready.
+
+Hermetic coverage in `tests/test_bootstrap.py` (path resolution, stamp, readiness, lock, failure
+cleanup); `scripts/validate_plugin.py` asserts every entrypoint file is present.
 
 ## Configuration
 

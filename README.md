@@ -109,9 +109,14 @@ claude plugin install creativity-graph     # from your marketplace
 # or, for local development, point Claude Code at this repo as a plugin source.
 ```
 
-On `SessionStart` the bootstrap hook provisions an isolated engine venv under
-`${CLAUDE_PLUGIN_DATA}/.venv`, so the MCP server in `.mcp.json` starts cleanly on a fresh
-machine.
+On `SessionStart` a cross-platform hook (`hooks/provision.mjs` → an OS launcher →
+`scripts/bootstrap.py`) provisions an isolated engine venv under `${CLAUDE_PLUGIN_DATA}/.venv` **in a
+detached background process**, so it never blocks the session. It uses `uv` when present and falls back
+to the stdlib `venv` + `pip` otherwise — only Python ≥3.10 and Node (always present in Claude Code) are
+required, on Windows, macOS, Linux, or WSL/Git-Bash. The MCP server (`.mcp.json` → `node
+scripts/launch_server.mjs`) self-heals the venv in the foreground if it is spawned before the build
+finishes, so it starts cleanly on a fresh machine. See *Installation system* in `CLAUDE.md` for the
+full chain.
 
 ### userConfig (`.claude-plugin/plugin.json`)
 
@@ -136,7 +141,7 @@ mcp__plugin_creativity-graph_creativity-graph__kg_ping()
 ```
 creativity-graph/
 ├── .claude-plugin/plugin.json     # manifest + userConfig
-├── .mcp.json                      # MCP server "creativity-graph" (kg_engine.server)
+├── .mcp.json                      # MCP server "creativity-graph" (node → launch_server.mjs)
 ├── commands/                      # slash commands (the orchestration layer)
 │   ├── kg-build.md                # /kg-build   — extract → canon → project
 │   ├── kg-ground.md               # /kg-ground  — grounding loop + adversarial red-team
@@ -150,12 +155,18 @@ creativity-graph/
 │   └── annotator.md               # kg-annotator          → f4_probe labels / α label passes
 ├── skills/creativity-graph/       # SKILL.md operating guide + references/
 ├── pack/{pack.yaml,glossary.md}   # the declared vocabulary
-├── hooks/{hooks.json,bootstrap.sh,precontext.py}
+├── hooks/                         # SessionStart provisioning + PreToolUse context (cross-platform)
+│   ├── hooks.json
+│   ├── provision.mjs              # SessionStart dispatcher → provision.sh / provision.ps1
+│   ├── provision.sh provision.ps1 # OS launchers → bootstrap.py --background
+│   └── precontext.mjs precontext.py
 ├── examples/source.md             # the demo corpus (a theory of grounded knowledge)
 ├── scripts/
-│   ├── kg_engine/                 # the deterministic engine (79 tests)
+│   ├── kg_engine/                 # the deterministic engine
 │   │   ├── model.py boundary.py canon.py reconciler.py
 │   │   └── projector.py scrub.py pack.py harness.py server.py
+│   ├── bootstrap.py               # cross-platform self-provisioning installer (uv | venv+pip)
+│   ├── launch_server.mjs          # Node MCP launcher (pointer + foreground catch-up)
 │   └── f4_probe.py                # extraction-precision scorer CLI
 └── tests/                         # pytest suite
 ```
@@ -283,8 +294,8 @@ Run from the repo with the engine venv (`/home/sergi/creativity-graph/.venv/bin/
 `uv run`:
 
 ```bash
-uv sync                                  # provision the engine venv (also the SessionStart bootstrap)
-uv run pytest tests/ -q                  # → 79 passed
+uv sync                                  # provision the engine venv (dev; the plugin runtime uses scripts/bootstrap.py)
+uv run pytest tests/ -q                  # → 92 passed
 claude plugin validate --strict          # validate the plugin manifest + components
 ```
 

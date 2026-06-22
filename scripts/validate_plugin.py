@@ -89,9 +89,14 @@ def main() -> int:
         if not (ROOT / "commands" / f"{stem}.md").exists():
             errors.append(f"missing command: commands/{stem}.md")
 
-    for rel in ("skills/creativity-graph/SKILL.md", "scripts/launch_server.sh",
+    for rel in ("skills/creativity-graph/SKILL.md",
                 "scripts/kg_engine/server.py", "pack/pack.yaml",
-                "hooks/bootstrap.sh", "hooks/precontext.py"):  # hook-referenced scripts must exist too
+                # cross-platform install system: SessionStart dispatcher + OS launchers,
+                # the self-provisioning bootstrap, the Node MCP launcher, and the
+                # PreToolUse precontext launcher (all referenced by .mcp.json/hooks.json).
+                "scripts/bootstrap.py", "scripts/launch_server.mjs",
+                "hooks/provision.mjs", "hooks/provision.sh", "hooks/provision.ps1",
+                "hooks/precontext.mjs", "hooks/precontext.py"):
         if not (ROOT / rel).exists():
             errors.append(f"missing file: {rel}")
 

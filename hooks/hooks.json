@@ -5,7 +5,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/bootstrap.sh\""
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/provision.mjs\"",
+            "async": true,
+            "timeout": 600,
+            "statusMessage": "Provisioning the creativity-graph engine (one-time)…"
           }
         ]
       }
@@ -16,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c '\"${CLAUDE_PLUGIN_DATA}/.venv/bin/python\" \"${CLAUDE_PLUGIN_ROOT}/hooks/precontext.py\" 2>/dev/null || true'"
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/precontext.mjs\""
           }
         ]
       }

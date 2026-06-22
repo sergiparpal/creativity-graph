@@ -8,7 +8,7 @@ under `/tmp/kg-demo/` by driving the real engine (boundary → canon → project
 
 | Stage | Exit test | Result |
 |---|---|---|
-| 0 — Scaffold + env bootstrap | `claude plugin validate --strict`; MCP `kg_ping` | PASS — manifest, `.mcp.json`, SessionStart bootstrap (diff-the-manifest `uv sync`), `kg_ping` stub all present |
+| 0 — Scaffold + env bootstrap | `claude plugin validate --strict`; MCP `kg_ping` | PASS — manifest, `.mcp.json`, cross-platform SessionStart provisioning (`provision.mjs` → `bootstrap.py`, background, `uv`-or-`venv+pip`), `kg_ping` stub all present |
 | 1 — Canon + transactional writes + lease lock + reconciler | `pytest tests/test_chaos.py -q` | PASS — crash-mid-write recovers via git; stale lock reclaimed; out-of-band forged verdict re-quarantined |
 | 2 — Domain pack + glossary | `python -m kg_engine.pack validate pack/pack.yaml examples/source.md` | PASS — `PackContract` valid: 6 node_types, 10 edge_types, 12 glossary terms; source_coverage 1.0, glossary_grounded_in_source 1.0 |
 | 3 — Staged extractor + boundary + PII scrubber | `pytest tests/test_invariants.py tests/test_scrub_egress.py -q` | PASS — fabricated/undeclared/span-less edges rejected/demoted; truncated JSON rejected with no partial write; seeded secret never leaves via `kg_scrub`; placeholder spans restored to original in the canon (§1.9 wired live) |
@@ -52,8 +52,9 @@ bugs static review could not (committed):
    the corrected grants let the `kg-extractor` subagent reach the boundary.
 2. **userConfig env wiring** — `${CLAUDE_PLUGIN_OPTION_*}` doesn't expand in `.mcp.json` and was clobbering
    the auto-injected values; `KG_SOURCE_PATH` now uses `${user_config.source_path}` so the server reads the source.
-3. **Cold-start spawn race** — the server now launches via `scripts/launch_server.sh` (bash always exists →
-   spawn never fails → no spurious "needs-auth" caching; the wrapper self-heals the venv).
+3. **Cold-start spawn race** — the server now launches via `node scripts/launch_server.mjs` (Node always
+   exists in the Claude Code runtime → spawn never fails → no spurious "needs-auth" caching; the launcher
+   self-heals the venv in the foreground via `bootstrap.py`).
 4. **`kg_context` query matching** — tokenize + OR-match terms so a natural-language `/kg-query` hits
    (was a 0-item whole-string `LIKE` miss).
 
