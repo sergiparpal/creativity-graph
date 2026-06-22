@@ -2,7 +2,7 @@
 
 All notable changes to the **creativity-graph** Claude Code plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html); `version` is set to `0.2.0` in
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html); `version` is set to `0.2.1` in
 `.claude-plugin/plugin.json` and the matching `marketplace.json` entry.
 
 The plugin turns a non-self-grounding conceptual document into a grounded, queryable knowledge
@@ -13,6 +13,8 @@ hard guarantees; the Claude Code session and its subagents do the language work 
 JSON back across the MCP boundary.
 
 ## [Unreleased]
+
+## [0.2.1] — 2026-06-22
 
 ### Fixed — exhaustive review hardening sweep
 
@@ -83,6 +85,19 @@ text, so the suite runs on the declared `requires-python = ">=3.10"` floor; and 
 called `os.kill(pid, 0)`, which on Windows is not a no-op existence check — the liveness probe is now
 skipped on Windows (falling back to heartbeat/TTL staleness) and the dead-pid reclaim assertion is
 POSIX-only.
+
+### Documentation — re-synced the docs with the engine and manifests
+
+A per-file fan-out audit of every doc against the engine at HEAD (each finding adversarially verified)
+corrected the drift the install-system and hardening commits left behind. Removed references to features
+that no longer exist (the `embeddings`/`treesitter` extras, the `userConfig.domain` knob, the `sqlite-vss`
+candidate generator, the `tree_sitter` parser, `kg_ground`'s `by` parameter, and `kg_write`'s `stash_ref`
+return key — now `error`); refreshed stale test counts and API facts (`ValidationResult` fields, `slug()`
+mapping, `is_stale`, the specificity/ideation gate conditions, the `span-too-short` rejection, the
+`complete`-flag default, and `query_graph`'s node-only `epistemic_state` scope); fixed the skill's
+subagent/tool mappings; and restored the missing `kg_scrub` tool and `evaluator.md` agent to the
+component listings. Touched `README`, `ARCHITECTURE`, `CLAUDE.md`, `PROGRESS`, the skill `SKILL.md` +
+references, and the agent docs.
 
 ## [0.2.0] — 2026-06-21
 
