@@ -10,7 +10,10 @@ This command runs the one experiment that justifies the whole pipeline: a **blin
 set of ideation prompts, in three conditions that differ ONLY in what context the idea-generator is given.
 
 - **control** — the prompt alone, no source, no graph.
-- **graph** — the prompt + a `kg_context` pack drawn from the grounded knowledge graph.
+- **graph** — the prompt + a `kg_context` pack drawn from the **grounded** knowledge graph (`items[]` only).
+- **graph+generate** — the prompt + the graph pack **plus the hypothesized slate** (`kg_context.hypotheses[]`
+  / a `/kg-generate` run): the generative layer's proposals, clearly flagged as unverified candidates.
+  Tests whether *generating* lifts ideation beyond grounded context alone (PLAN Stage 9).
 - **rag** — the prompt + a naive flat-text retrieval slice of the source document (the strawman to beat).
 
 The generator is BLIND to which condition it is in (it receives only an opaque context block), so the
@@ -93,9 +96,13 @@ generation; this command never sees which arm is which until the JSON comes back
 1. For **each** of the N prompts, build three context blocks:
    - **control** → no context.
    - **graph** → the result of `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=<prompt>, budget=2000)`, rendered as
-     opaque text. Carry through the pack's `advisory` (e.g. `signal:"structural-bridge"`) and the
-     `falsification_counters` so the generator can *avoid* re-proposing failed edges (§1.7) — but it MUST NOT
-     fabricate verdicts or spans; this arm only *reads* the graph.
+     opaque text — the **grounded** `items[]` only. Carry through the pack's `advisory` (e.g.
+     `signal:"structural-bridge"`, `bridge_metric`) and the `falsification_counters` so the generator can
+     *avoid* re-proposing failed edges (§1.7) — but it MUST NOT fabricate verdicts or spans; this arm only
+     *reads* the graph.
+   - **graph+generate** → the graph block PLUS the same call's `hypotheses[]` (or a `/kg-generate` slate),
+     rendered as opaque text and clearly marked *unverified candidates*. This arm reads grounded context
+     AND the generative proposals; it still must not fabricate verdicts or spans.
    - **rag** → a naive flat slice of `examples/source.md`: the top text chunks by keyword overlap with the
      prompt, no graph structure. This is the honest strawman.
 2. Present the three blocks to the generator **without labels** (shuffle; refer to them only as context A/B/C),
@@ -106,13 +113,19 @@ generation; this command never sees which arm is which until the JSON comes back
 ```json
 {
   "outputs": {
-    "control": ["…one string per prompt…"],
-    "graph":   ["…"],
-    "rag":     ["…"]
+    "control":        ["…one string per prompt…"],
+    "graph":          ["…"],
+    "graph+generate": ["…"],
+    "rag":            ["…"]
   },
   "source": "<the full text of examples/source.md>"
 }
 ```
+
+`harness ideation` scores every condition key it finds. When `graph+generate` is present it emits a second
+**`generate_verdict`** alongside the headline graph-vs-control `verdict`: whether *generating* (graph context
++ the hypothesized slate) lifted diversity/novelty beyond control without materially more unsupported
+claims, and whether it exceeded `graph` alone.
 
 Constraints to put in the Task prompt: each `outputs` list has the **same length** (= number of prompts);
 one output string per prompt per condition; `source` is the verbatim source text so the harness can compute

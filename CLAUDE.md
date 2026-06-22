@@ -121,18 +121,25 @@ bundles these; its `references/{contract,tools,pack-schema}.md` are loaded on de
 |---|---|---|
 | `/kg-build` | `kg-extractor` | Section-by-section extraction → `kg_scrub` (egress) → `kg_write` boundary; lands `unverified` edges with verbatim spans |
 | `/kg-ground` | `kg-grounder`, `kg-adversarial-grounder` | Drain the unverified queue (`grounded`/`rejected`); red-team hubs, write counter-edges, mark `failed` — all via `kg_ground` |
-| `/kg-query` | — | `kg_context` (budgeted, grounding-aware) + structural reads; answers cite all three axes and report falsification counters |
+| `/kg-generate` | `kg-generator` | Run the discovery mechanisms (`kg_generate`: bridge/seed/compression/regroup/transplant/ensemble), phrase/name them, write `hypothesized`/`unverified` via `kg_propose`/`kg_operate` — generation is offensive, never metric-gated |
+| `/kg-perturb` | `kg-generator` | Build a second construction and cross-generate (`kg_generate` ensemble §9/§15) — the only mechanism that attacks coverage |
+| `/kg-query` | — | `kg_context` (budgeted, grounding-aware; grounded `items[]` vs separate `hypotheses[]`) + structural reads; answers cite all three axes and report falsification counters |
 | `/kg-eval` | `kg-annotator` | Stage 4 extraction precision (`f4_probe`) + Stage 7 inter-coder α and the specificity gate (`harness`) |
-| `/kg-experiment` | `kg-evaluator` | Blind A/B/C ideation (control vs graph vs rag), scored by `harness ideation` |
+| `/kg-experiment` | `kg-evaluator` | Blind A/B/C/D ideation (control vs graph vs graph+generate vs rag), scored by `harness ideation` |
+
+The generative layer (`/kg-generate`, `/kg-perturb`) is the inversion: **generate offensively, judge
+defensively.** Candidates enter a separate `hypothesized` lane never gatekept by a metric; the existing
+grounding loop is the post-hoc filter, and promotion (`kg_ground` with support) upgrades provenance.
 
 Evaluation **measures, never gates** (§4): below-threshold results iterate up to 3× then record the
 best and proceed — no human gate blocks the flow. Results are appended to `PROGRESS.md`.
 
-## MCP tool surface (11 tools)
+## MCP tool surface (15 tools)
 
 Namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`:
-- **Mutations (write canon):** `kg_write` (the boundary), `kg_ground` (the *sole* verdict gateway — stamps `verdict_by`/`verdict_at` + audit record), `kg_rename`.
-- **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`.
+- **Mutations (write canon):** `kg_write` (the boundary), `kg_propose` (the *hypothesized* write lane — forces hypothesized provenance, refuses text claims), `kg_ground` (the *sole* verdict gateway — stamps `verdict_by`/`verdict_at` + audit record; `support_span`/`support_note` promote a hypothesis and upgrade its provenance), `kg_rename`.
+- **Generative (read derived → propose; §2–§14):** `kg_generate` (six discovery mechanisms, read-only), `kg_operate` (the four §8 endo operations, write via the propose lane), `kg_absorption` (the §14 absorption window).
+- **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` (grounded `items[]` + a separate `hypotheses[]` + `advisory.bridge_metric`).
 - **Utility:** `kg_ping`, `kg_metrics`, `kg_scrub` (egress PII/secret redaction with consistent placeholders; `kg_write` restores placeholders to original text for the canon).
 
 ## Installation system (cross-platform engine provisioning)

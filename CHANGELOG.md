@@ -14,6 +14,48 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-22
+
+### Added — The generative layer
+
+The plugin gains its second half: the mechanisms that turn the grounded graph from a **verification
+machine** into an **idea-generation machine** — without weakening one anti-nonsense guarantee. The
+design rests on **the inversion**: *generate offensively, judge defensively.* Entry into the graph is
+never gatekept by a quality metric; the existing grounding loop is the filter, applied **after**.
+
+- **The hypothesized write lane (`kg_propose`).** A generated candidate enters as
+  `provenance=hypothesized`, `epistemic_state=unverified`, **with no span** — a proposal from a discovery
+  mechanism, never a text claim, stored in a lane that can never be mistaken for grounded content. The
+  write boundary accepts span-less hypothesized items while keeping every `span-present`/`inferred`
+  guarantee intact, preserves `authored_by=deterministic` for a genuine discovery mechanism, still demotes
+  forged verdicts, and **quarantines** any candidate that collapses into a known failure
+  (`collapses-into-known-failure`, invariant 5). `kg_propose` refuses text claims with
+  `propose-lane-text-claim`.
+- **The completed bridge metric.** The projector now precomputes `betweenness`,
+  specificity-weighted `spec_betweenness`, `specificity`, and a per-projection `gate_on` (via
+  `harness.specificity`), off the hot path. `kg_context.advisory.bridge_metric` ranks by the
+  confound-corrected `spec_betweenness` when the gate earns it, else falls back to the honest
+  structural-bridge/degree advisory (§1.6). A legacy index is migrated with a forced rebuild.
+- **Six deterministic generators + `kg_generate` (read-only).** `bridge` (§2/§4), `seed` (§3 — the
+  positive residual `c − E[c|d]`, never `d×c`), `compression` (§7 — dense clusters passing an MDL +
+  specificity screen → a new node the language layer names), `regroup` (§8 — bridges invisible under the
+  prior partition), `transplant` (§5 — a hub's reorganising pattern into the most absorptive community),
+  `ensemble` (§9 — cross two constructions). Every generator is generality-controlled and drops
+  candidates colliding with failure memory.
+- **The four §8 endo operations (`kg_operate`).** `collapse` / `explode` / `regroup` / `open`, each
+  writing hypothesized structure through the propose lane — never a verdict, never a span.
+- **The absorption window (`kg_absorption`, §14).** Scores each grounded-from-hypothesized node as
+  `fertile | absorbed | isolated` with a novelty half-life, so a slate can prefer the productive middle.
+- **Promotion upgrades provenance.** `kg_ground` gains `support_span` / `support_note`: a hypothesis
+  becomes `grounded` ONLY with support, which upgrades its provenance (`hypothesized → span-present` for a
+  verbatim source span, else `inferred`); without support the promotion is refused
+  `hypothesis-needs-support`. `kg_context` returns a **separate** `hypotheses[]` block; the grounded
+  `items[]` lane never contains a proposal.
+- **Workflow + orchestration.** New `/kg-generate` command + `kg-generator` (language-only) agent, and
+  `/kg-perturb` (§9/§15 exo cross-generation). The skill workflow becomes
+  `build → ground → generate → ground → query`. `/kg-experiment` gains a `graph+generate` condition with
+  its own verdict. The MCP surface grows to **fifteen** tools.
+
 ## [0.2.1] — 2026-06-22
 
 ### Fixed — exhaustive review hardening sweep

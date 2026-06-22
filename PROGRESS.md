@@ -93,3 +93,29 @@ implemented, then hardened against a 6-dimension adversarial review (+14 tests, 
 
 Still deliberately **not** automated: public marketplace publish + `claude plugin tag` — an
 outward-facing, hard-to-reverse human action documented in `CLAUDE.md`.
+
+---
+
+## The generative layer (v0.3.0) — generate offensively, judge defensively
+
+The second half of the system landed: deterministic discovery mechanisms propose `hypothesized`
+candidates into a separate write lane (`kg_propose`), and the existing grounding loop is the post-hoc
+filter (promotion via `kg_ground` requires support and upgrades provenance). Six generators
+(`kg_generate`: bridge §2/§4, seed §3, compression §7, regroup §8, transplant §5, ensemble §9), the
+four §8 endo operations (`kg_operate`), the §14 absorption window (`kg_absorption`), the completed
+specificity-weighted-betweenness bridge metric (precomputed + gated), and the `/kg-generate` +
+`/kg-perturb` commands with the `kg-generator` language agent. `/kg-experiment` gained a
+`graph+generate` condition. Full suite green; MCP surface = 15 tools.
+
+### Out of scope (deliberately not built)
+
+- **§12 temporal triad as an automated scorer.** Scoring a candidate on whether the *problem it
+  addresses is still alive* needs an exogenous "is this problem fresh?" signal the repo does not have
+  (citation recency, issue activity, a domain freshness feed). A future
+  `kg_generate(mechanism="temporal")` would consume such an external freshness feed — e.g. a
+  `derived/freshness.json` mapping node ids to a recency/decay score sourced outside the graph — and
+  rank candidates by the *triad* (alive problem × novel connection × specific claim) rather than by
+  structure alone. It is intentionally **not** implemented: without the exogenous signal it would
+  invent the very freshness it is meant to measure. Left as a documented extension point.
+- **Embedding-based candidate generation** (`metrics_mode=with_embeddings`). The structure-only path is
+  the default; the embedding extra was removed in 0.2.1 and is not a dependency here.

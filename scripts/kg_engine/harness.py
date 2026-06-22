@@ -224,20 +224,39 @@ def _key_terms(sentence: str) -> list[str]:
     return [w.lower() for w in _WORD.findall(sentence) if len(w) > 5][:3]
 
 
+def _beats(a: dict, c: dict) -> bool:
+    """`a` beats baseline `c`: no regression on diversity/novelty/unsupported (with 0.05 slack on the
+    hallucination guard) AND a strict gain on at least one of diversity/novelty (a tie is not a win)."""
+    no_regression = (a["diversity"] >= c["diversity"] and a["novelty"] >= c["novelty"]
+                     and a["unsupported_rate"] <= c["unsupported_rate"] + 0.05)
+    strict_gain = (a["diversity"] > c["diversity"] or a["novelty"] > c["novelty"])
+    return no_regression and strict_gain
+
+
 def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
-    """Score pooled outputs per condition (control | graph | rag) and emit a verdict."""
+    """Score pooled outputs per condition (control | graph | graph+generate | rag) and emit a verdict.
+
+    The headline `verdict` is graph-vs-control. When a `graph+generate` arm is present (the graph context
+    PLUS the hypothesized slate from /kg-generate, PLAN Stage 9), a second `generate_verdict` reports
+    whether generation lifted ideation further — diversity/novelty up vs control without materially more
+    unsupported claims, and whether it exceeded `graph` alone."""
     table = {cond: _score_condition(outs, source_text) for cond, outs in outputs_by_condition.items()}
     g, c = table.get("graph"), table.get("control")
     verdict = "insufficient data"
     if g and c and g["n"] and c["n"]:
-        no_regression = (g["diversity"] >= c["diversity"] and g["novelty"] >= c["novelty"]
-                         and g["unsupported_rate"] <= c["unsupported_rate"] + 0.05)
-        # require a STRICT improvement on at least one axis: an exact tie is not a graph win
-        strict_gain = (g["diversity"] > c["diversity"] or g["novelty"] > c["novelty"])
-        better = no_regression and strict_gain
         verdict = ("graph condition produced more diverse/novel ideas without more unsupported claims"
-                   if better else "graph condition did NOT clearly beat control")
-    return {"table": table, "verdict": verdict}
+                   if _beats(g, c) else "graph condition did NOT clearly beat control")
+    out = {"table": table, "verdict": verdict}
+    gg = table.get("graph+generate")
+    if gg and c and gg["n"] and c["n"]:
+        if _beats(gg, c):
+            exceeds_graph = bool(g and g["n"]) and (gg["diversity"] > g["diversity"] or gg["novelty"] > g["novelty"])
+            out["generate_verdict"] = ("graph+generate beat control on diversity/novelty without more "
+                                       "unsupported claims" + (" — and exceeded graph alone" if exceeds_graph
+                                                               else " (on par with graph alone)"))
+        else:
+            out["generate_verdict"] = "graph+generate did NOT clearly beat control"
+    return out
 
 
 # --------------------------------------------------------------------------- CLI

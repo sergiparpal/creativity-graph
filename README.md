@@ -5,11 +5,16 @@ A Claude Code plugin that turns a *non-self-grounding* conceptual document into 
 a span-present write boundary, a grounding loop with memory of failures, and a regenerable
 NetworkX/SQLite derived layer.
 
-It is **not an idea generator.** The graph does not assert that an idea is good. Idea value
-is a *hypothesis under test*: every non-trivial edge starts `unverified`, earns a verdict only
-when a grounder (agent or human) re-checks it against the source, and edges that fail are kept
-forever as negative information. Whether the graph *actually* helps ideation is itself a
-question you measure — see `/kg-experiment` (§Stage 8).
+It both **generates** ideas and **grounds** them — in that order, and never confusing the two.
+The graph *generates offensively*: deterministic discovery mechanisms (bridges, residual
+connectability, compression, re-partition, hub transplant, cross-construction ensemble) propose
+candidates into a separate **hypothesized** lane, never gatekept by a quality metric. Then it
+*judges defensively*: the **same** grounding loop is the filter, applied afterward. A generated
+candidate is a *hypothesis under test* — `provenance=hypothesized`, `epistemic_state=unverified`,
+**no span** — and becomes grounded knowledge only when a grounder supplies support, which *upgrades*
+its provenance; the rest are kept forever as negative information that binds the next generation.
+Whether generation *actually* helps ideation is itself a question you measure — see
+`/kg-experiment` (§Stage 8). The portico that stood at the door of imagination is moved to after it.
 
 ---
 
