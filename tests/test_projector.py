@@ -30,18 +30,28 @@ def _seed(canon: Canon):
 
 def test_graph_json_roundtrips_through_networkx(canon: Canon):
     _seed(canon)
+    # add a PARALLEL edge: same (source, target) as the existing a->b grounds edge but a different
+    # relation. A plain DiGraph would silently collapse the two; the projector must keep both
+    # (tests-6 — derived contains nothing the canon does not).
+    node_a = canon.read_node("a")
+    node_a.edges.append(Edge(source="a", target="b", relation="contradicts", span="s5"))
+    canon.write_one(node_a)
+
     proj = Projector(canon)
     rep = proj.project()
-    assert rep.full_rebuild and rep.n_nodes == 4 and rep.n_edges == 3
+    assert rep.full_rebuild and rep.n_nodes == 4 and rep.n_edges == 4  # 3 + the parallel edge
 
     data = json.loads(proj.graph_path.read_text())
     G = node_link_graph(data)
-    assert isinstance(G, nx.DiGraph)
-    assert G.number_of_nodes() == 4 and G.number_of_edges() == 3
-    # re-serialize and reload -> stable
+    assert isinstance(G, nx.MultiDiGraph)  # NOT a plain DiGraph (which can't hold parallel edges)
+    assert G.number_of_nodes() == 4 and G.number_of_edges() == 4
+    # both parallel a->b edges survive the round-trip, keyed by distinct edge ids
+    ab = G.get_edge_data("a", "b")
+    assert len(ab) == 2 and {d["relation"] for d in ab.values()} == {"grounds", "contradicts"}
+    # re-serialize and reload -> stable, parallel edges preserved
     from kg_engine.projector import _node_link_data
     G2 = node_link_graph(_node_link_data(G))
-    assert set(G2.nodes()) == set(G.nodes())
+    assert set(G2.nodes()) == set(G.nodes()) and G2.number_of_edges() == 4
 
 
 def test_incremental_reproject_touches_only_changed_edge(canon: Canon):
@@ -74,9 +84,11 @@ def test_kg_context_within_budget_and_no_centrality(canon: Canon, monkeypatch):
     proj = Projector(canon)
     proj.project()
 
-    # if kg_context computed centrality in-request, this would raise
-    monkeypatch.setattr(nx, "betweenness_centrality",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("centrality in-request!")))
+    # kg_context must read precomputed columns ONLY. Patch the rank computation (Leiden/degree/bridge)
+    # to blow up: if kg_context recomputed ranks in-request, this would raise. The old test patched
+    # nx.betweenness_centrality, which the projector never calls — so it asserted nothing (tests-4).
+    monkeypatch.setattr(proj, "_ranks",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ranks computed in-request!")))
     ctx = proj.kg_context(budget=200)
     assert ctx["approx_tokens"] <= 200
     assert "falsification_counters" in ctx

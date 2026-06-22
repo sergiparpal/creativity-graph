@@ -76,7 +76,9 @@ def coverage(pack: PackContract, source_text: str) -> dict:
     glossary_norms = [n for n in (normalize_text(t) for t in pack.glossary) if n]
     glossary_terms = set(glossary_norms)
     in_glossary = sum(1 for t in defined if normalize_text(t) in glossary_terms)
-    glossary_in_source = sum(1 for t in glossary_norms if t in norm_src)
+    # word-boundary match, not raw substring: a short term ('io','ml','a') must not count as grounded
+    # because it appears INSIDE an unrelated word ('ratio','html'), which inflated the metric (model-pack-4).
+    glossary_in_source = sum(1 for t in glossary_norms if _term_in_text(t, norm_src))
     n_def = max(len(defined), 1)
     n_gloss = max(len(glossary_norms), 1)
     return {
@@ -86,6 +88,12 @@ def coverage(pack: PackContract, source_text: str) -> dict:
         "source_coverage": round(in_glossary / n_def, 3),
         "glossary_grounded_in_source": round(glossary_in_source / n_gloss, 3),
     }
+
+
+def _term_in_text(term: str, text: str) -> bool:
+    """True iff `term` occurs in `text` not embedded inside a larger word (so 'io' matches 'io' but
+    not 'ratio'). Word-boundary lookarounds, robust to terms with leading/trailing non-word chars."""
+    return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) is not None
 
 
 # Quoted/bold/code "defined terms". Quote caps match the 60-char post-filter below so a long bold or

@@ -59,6 +59,16 @@ def _flag_int(args, name, default):
         sys.exit(f"{name} must be an integer, got {raw!r}")
 
 
+def _median(sorted_vals):
+    """True median of an already-sorted, non-empty list: average the two central elements on even
+    length rather than reporting the upper-middle one (finding harness-f4-2)."""
+    m = len(sorted_vals)
+    mid = m // 2
+    if m % 2:
+        return sorted_vals[mid]
+    return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2
+
+
 def load(path):
     with open(path, encoding="utf-8-sig") as f:  # utf-8-sig tolerates a BOM-prefixed export
         data = json.load(f)
@@ -93,7 +103,7 @@ def summary(path):
     if scores:
         scores.sort()
         print(f"\nINFERRED confidence_score: n={len(scores)} "
-              f"min={scores[0]:.2f} median={scores[len(scores)//2]:.2f} max={scores[-1]:.2f}")
+              f"min={scores[0]:.2f} median={_median(scores):.2f} max={scores[-1]:.2f}")
 
     judged = sum(1 for e in edges if e.get("confidence") in (INFERRED, AMBIGUOUS))
     print(f"\njudged edges (INFERRED+AMBIGUOUS): {judged} / {len(edges)} "
@@ -101,6 +111,10 @@ def summary(path):
 
 
 def sheet(path, n, out, include_extracted):
+    # n<=0 would slice an empty/mis-sliced pool and write a 0-row sheet while exiting success
+    # (finding harness-f4-3). Reject it loudly so the labeling run can't silently produce nothing.
+    if n <= 0:
+        sys.exit(f"--n must be a positive integer, got {n}")
     _, edges, id2label, _ = load(path)
     pool = list(enumerate(edges))
     if not include_extracted:

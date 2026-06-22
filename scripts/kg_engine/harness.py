@@ -57,7 +57,11 @@ def agreement(label_sets: list[dict]) -> float:
 
 # --------------------------------------------------------------------------- IDF / specificity
 
-_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+# floor of {1,} (2-char minimum) so short alpha labels like "AI"/"ML"/"OS" still match a term and
+# carry their IDF rarity into _node_specificity, instead of matching nothing and silently falling back
+# to the corpus default (finding harness-f4-4). Single-char tokens stay excluded as noise. Determinism
+# is unaffected — the same regex drives idf_seeds, _ngrams, _key_terms, and _node_specificity alike.
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{1,}")
 
 
 def idf_seeds(documents: list[str]) -> dict[str, float]:
@@ -158,7 +162,11 @@ def _score_condition(outputs: list[str], source_text: str) -> dict:
         # condition can't game the experiment by emitting blank or one-word "ideas".
         novelties.append(1.0 - overlap if ong else 0.0)
         util.append(min(1.0, len(re.findall(r"\bbecause\b|\bif\b|\btherefore\b|\bbridge|\bconnect", o.lower())) / 5))
-        sents = [s for s in _SENT.split(o) if len(s.split()) >= 4]
+        # only sentences that have >=1 scorable key term can be judged supported/unsupported.
+        # a sentence whose words are all short (<=5 chars) yields no key terms — we can't decide it
+        # either way, so it's excluded from BOTH numerator and denominator rather than counted as a
+        # free "unsupported" (which would bias the unsupported_rate axis upward — finding harness-f4-1).
+        sents = [s for s in _SENT.split(o) if len(s.split()) >= 4 and _key_terms(s)]
         if sents:
             unsup = sum(1 for s in sents if not any(t in src_norm for t in _key_terms(s)))
             unsupported.append(unsup / len(sents))

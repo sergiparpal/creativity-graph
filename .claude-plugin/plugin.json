@@ -9,12 +9,6 @@
   "license": "MIT",
   "keywords": ["knowledge-graph", "grounding", "provenance", "networkx", "mcp"],
   "userConfig": {
-    "domain": {
-      "type": "string",
-      "title": "Conceptual domain",
-      "description": "The conceptual domain of the source (shapes the domain pack vocabulary).",
-      "default": "conceptual theory"
-    },
     "source_path": {
       "type": "file",
       "title": "Source document path",

@@ -14,6 +14,39 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+### Fixed — exhaustive review hardening sweep
+
+A multi-agent review of the whole codebase (each finding adversarially verified, then the fixes
+re-verified) closed a set of correctness, edge-case, and dependency issues. Highlights:
+
+- **Falsification-memory integrity (the honesty guarantee).** The batch-write rollback now restores
+  **only the failing batch's files** from a pre-write snapshot instead of a repo-wide
+  `git reset --hard HEAD`, so a failed `kg_write`/`kg_rename` no longer silently discards unrelated
+  uncommitted grounding verdicts or hand edits. The grounding audit log is git-excluded. `kg_rename`
+  migrates a renamed edge/node's verdict↔audit linkage so a grounded/`failed` edge is no longer
+  re-quarantined at the next reconcile. The reconciler prunes the dead `epistemic` baseline of
+  deleted edges (closing a delete→recreate→forge bypass) and now polices out-of-band `obsolete`.
+- **Edge/node identity.** `slug()` NFC-normalizes and maps punctuation to a separator (instead of
+  deleting it), so visually-identical or punctuation-differing endpoints no longer collide or fork;
+  the write boundary dedups on the canonical `edge.id`, matching the canon merge and disk.
+- **Single-writer + projection safety.** The lease lock now heartbeats during long batches and uses an
+  atomic compare-and-swap to reclaim a stale lock; lazy reprojection is serialized under the lease and
+  the staleness check is a cheap per-file `(name,size,mtime)` digest pre-gate (no git fork / full parse
+  on the read hot path). `kg_ground`/`kg_rename` hold the lease across the audit-append+write+compensate
+  sequence.
+- **Egress scrub.** Removed catastrophic-backtracking in the secret regex; broadened secret coverage so
+  bespoke keys are redacted whole instead of partially leaked by the phone/CC rules; the Title-Case
+  "person" rule no longer mass-redacts ordinary concept terms; pre-existing placeholder-shaped text
+  round-trips.
+- **Resilience & rate limits.** A malformed enum / edge entry in a canon note is coerced/skipped instead
+  of dropping the whole node from every read; the node flood budget is seeded canon-wide yet exempts
+  idempotent re-emission and never-pruned failure memory; the context budget is clamped.
+- **Headless backend.** Per-section extraction failures are isolated and the derived layer is always
+  reprojected; non-JSON output is surfaced clearly; `max_tokens` default raised.
+- **Dependencies / manifests.** Raised the `anthropic` floor to `>=0.77` (first GA of `output_config`),
+  removed the unused/unmaintained `embeddings` and `treesitter` extras, added Windows/macOS to CI, and
+  dropped the unwired `userConfig.domain` knob.
+
 ### Changed — cross-platform, background, `uv`-optional install system
 
 Replaced the bash-only, blocking, `uv`-required provisioning with a cross-platform one modelled on the

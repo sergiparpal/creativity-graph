@@ -35,6 +35,12 @@ def main() -> int:
         proj = Projector(Canon(project), pathlib.Path(data) / "derived")
         if not proj.db_path.exists():
             return 0  # nothing projected yet
+        # Mirror the server's lazy-reproject gate (server._ensure_projected): a raw
+        # kg_context read off a stale projection would inject obsolete provenance /
+        # epistemic labels. The index already exists (guarded above), so this is a cheap
+        # incremental reproject, never a side-effecting cold build. Best-effort.
+        if proj.is_stale():
+            proj.project()
         ti = payload.get("tool_input", {})
         query = ti.get("pattern") or ti.get("query") \
             or (pathlib.Path(ti.get("file_path", "")).stem or None)

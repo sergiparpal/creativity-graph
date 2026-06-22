@@ -61,20 +61,42 @@ def test_verdict_survives_full_reproject(engine):
 
 
 def test_orphaned_verdict_surfaced(engine):
+    """A verdict whose backing edge SURVIVES in the canon but vanished from the derived layer must be
+    reported in orphaned_verdicts (the genuine orphan invariant — tests-1)."""
+    _seed_queue(engine)
+    eid = edge_id("degree", "approximates", "importance")
+    engine.kg_ground(eid, "grounded", by="agent")
+    proj = engine.projector
+    proj.project(incremental=False)
+    data = json.loads(proj.graph_path.read_text())
+    assert any(x["id"] == eid for x in data["links"])  # present in the derived layer initially
+
+    # simulate the derived layer losing this edge while the canon verdict remains (partial projection
+    # / dropped link), then ask the reconciler to reattach
+    data["links"] = [x for x in data["links"] if x["id"] != eid]
+    proj.graph_path.write_text(json.dumps(data))
+    report = Reconciler(engine.canon).reattach_after_reproject(proj.graph_path)
+
+    assert eid in report.orphaned_verdicts                     # surfaced as an orphan...
+    assert eid in {e.id for e in engine.canon.all_edges()}     # ...because it is still in the canon
+
+
+def test_deleted_edge_leaves_no_orphan(engine):
+    """The companion case: an edge deleted from the canon entirely yields NO orphan (nothing to
+    reattach, no false orphan)."""
     _seed_queue(engine)
     eid = edge_id("degree", "approximates", "importance")
     engine.kg_ground(eid, "grounded", by="agent")
     proj = engine.projector
     proj.project(incremental=False)
 
-    # remove the edge from the canon out-of-band, then reproject: the verdict is now orphaned
     node = engine.canon.read_node("degree")
     node.edges = [e for e in node.edges if e.id != eid]
     engine.canon.write_one(node)
     proj.project(incremental=False)
     report = Reconciler(engine.canon).reattach_after_reproject(proj.graph_path)
-    # the grounded edge is gone from canon, so nothing to re-attach and no false orphan from it
     assert eid not in {e.id for e in engine.canon.all_edges()}
+    assert eid not in report.orphaned_verdicts
 
 
 def test_adversarial_counter_edge_persists(engine):

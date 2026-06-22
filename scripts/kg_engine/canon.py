@@ -19,6 +19,9 @@ from .model import Edge, Node, node_from_markdown, node_to_markdown, slug
 
 LOCK_NAME = ".kg-session-lock"
 CANON_SUBDIR = "canon"
+# Grounding audit log (kg_ground tamper-evidence). Defined here — the lowest layer that must keep it
+# out of git — and re-exported by reconciler so server/tests have one source of truth.
+GROUND_AUDIT = ".kg-ground-audit.jsonl"
 
 
 # --------------------------------------------------------------------------- git helpers
@@ -33,10 +36,6 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
 
 def _git_ok(repo: Path) -> bool:
     return (repo / ".git").exists() or _git(repo, "rev-parse", "--git-dir", check=False).returncode == 0
-
-
-def _has_commit(repo: Path) -> bool:
-    return _git(repo, "rev-parse", "--verify", "HEAD", check=False).returncode == 0
 
 
 # --------------------------------------------------------------------------- lease lock (§Stage 1)
@@ -65,31 +64,75 @@ class LeaseLock:
     def _owned_by_self(self, rec: dict) -> bool:
         return rec.get("pid") == self.pid and rec.get("host") == self.host
 
-    def is_stale(self, now: float | None = None) -> bool:
-        rec = self._read()
+    def _rec_stale(self, rec: dict | None, now: float) -> bool:
+        """Staleness of a specific record (no re-read), so the reclaim path can re-validate the exact
+        record it moved aside rather than whatever is at the path now."""
         if rec is None:
             return True
-        now = time.time() if now is None else now
         if (now - rec.get("heartbeat_at", 0)) > rec.get("ttl", self.ttl):
             return True
         return not _pid_probe(rec.get("pid", 0), rec.get("host", ""), self.host)
 
+    def is_stale(self, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        return self._rec_stale(self._read(), now)
+
     def acquire(self, now: float | None = None) -> bool:
         """Acquire if absent, stale, or already held by us. Returns True on success.
 
-        The absent case uses an atomic O_EXCL create so two acquirers racing on a fresh lock can't
-        both win; a stale or self-owned lock is reclaimed by overwrite.
+        Every transition is a compare-and-swap so two sessions can't both believe they hold the lock:
+        the absent case uses an atomic O_EXCL create; a STALE lock is reclaimed by atomically renaming
+        it aside (only one racer can move a given inode) and then O_EXCL-creating a fresh one. A blind
+        overwrite of a stale lock (the old behavior) let two racers that both observed it stale each
+        write and both return True (canon-4).
         """
         now = time.time() if now is None else now
         rec = self._read()
         if rec is None:
             if self._try_exclusive_create(now):
                 return True
-            rec = self._read()  # lost the create race; fall through to staleness/ownership logic
-        if rec is not None and not self.is_stale(now) and not self._owned_by_self(rec):
+            rec = self._read()  # lost the create race; re-evaluate below
+        if rec is not None and self._owned_by_self(rec):
+            self._write(now)  # refresh our own lock (re-acquire is idempotent)
+            return True
+        if rec is not None and not self.is_stale(now):
             return False  # held by another live session
-        self._write(now)
-        return True
+        # stale (or vanished after our read): reclaim atomically. Rename the stale lock aside — only
+        # ONE racer can move a given inode, so exactly one wins the right to recreate; a racer whose
+        # rename fails (someone already moved/removed it) falls through and competes on the O_EXCL.
+        sidelined = self.path.with_name(f"{self.path.name}.stale-{self.pid}-{int(now * 1000)}")
+        try:
+            os.replace(self.path, sidelined)
+        except FileNotFoundError:
+            pass  # already reclaimed/removed; just try to create
+        except OSError:
+            return False
+        else:
+            # Re-validate the record we actually moved: if the owner refreshed its heartbeat in the
+            # window between our is_stale() read and this move, we just sidelined a LIVE lock. Put it
+            # back and lose the race rather than steal it (closes the residual reclaim TOCTOU).
+            moved = self._read_path(sidelined)
+            if moved is not None and not self._rec_stale(moved, now):
+                try:
+                    os.replace(sidelined, self.path)
+                except OSError:
+                    pass
+                return False
+            try:
+                os.unlink(sidelined)
+            except OSError:
+                pass
+        if self._try_exclusive_create(now):
+            return True
+        rec2 = self._read()  # lost the recreate race to a fresh acquirer; honor theirs unless it's us
+        return bool(rec2 and self._owned_by_self(rec2))
+
+    @staticmethod
+    def _read_path(p: Path) -> dict | None:
+        try:
+            return json.loads(p.read_text())
+        except (FileNotFoundError, ValueError, OSError):
+            return None
 
     def _record(self, now: float) -> dict:
         return {"pid": self.pid, "host": self.host,
@@ -180,9 +223,13 @@ def _atomic_write(path: Path, text: str) -> None:
 
 @dataclass
 class RollbackInfo:
-    stashed: bool
-    stash_ref: str | None
-    error: str
+    rolled_back: bool
+    error: str = ""
+    stash_ref: str | None = None  # retained for response back-compat; rollback no longer stashes
+
+    @property
+    def stashed(self) -> bool:  # back-compat alias for callers that asked "did we roll back?"
+        return self.rolled_back
 
 
 class Canon:
@@ -205,7 +252,10 @@ class Canon:
             return  # not a standard repo (worktree/submodule/no-git) — best-effort only
         info = git_dir / "info"
         exclude = info / "exclude"
-        patterns = [LOCK_NAME, ".tmp-*", ".kg-reconcile-state.json"]
+        # The grounding audit log is runtime tamper-evidence, NOT canon content: it must never be
+        # committed by `git add -A` nor swept by a rollback. (Even with the snapshot-scoped rollback
+        # below it is untouched, but excluding it keeps it out of commits and out of `stash -u`.)
+        patterns = [LOCK_NAME, ".tmp-*", ".kg-reconcile-state.json", GROUND_AUDIT]
         try:
             info.mkdir(parents=True, exist_ok=True)
             current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
@@ -229,6 +279,15 @@ class Canon:
         if self._lock_depth <= 0:
             self._lock_depth = 0
             self.lock.release()
+
+    def try_acquire_lock(self) -> bool:
+        """Non-raising acquire for best-effort callers (the lazy projector): take the single-writer
+        lease if free/ours, else return False so the caller can serve what it has instead of blocking
+        or crashing. Re-entrant within this process like _acquire_lock."""
+        if self._lock_depth == 0 and not self.lock.acquire():
+            return False
+        self._lock_depth += 1
+        return True
 
     def _check_slug_collision(self, node: "Node") -> None:
         """Two distinct ids that slug to the same filename would silently merge into one note.
@@ -268,9 +327,15 @@ class Canon:
         p = self.node_path(node_id)
         return node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=node_id)
 
+    def note_paths(self) -> list[Path]:
+        """Canon note files, excluding the `.tmp-*.md` atomic-write temporaries (a crash between
+        mkstemp and os.replace can leave one behind; globbing `*.md` would otherwise treat it as a
+        phantom node — canon-5). One place so every reader (here + reconciler) filters identically."""
+        return [p for p in sorted(self.notes_dir.glob("*.md")) if not p.name.startswith(".")]
+
     def all_nodes(self) -> list[Node]:
         out = []
-        for p in sorted(self.notes_dir.glob("*.md")):
+        for p in self.note_paths():
             try:
                 out.append(node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem))
             except Exception:  # noqa: BLE001 — one unreadable/malformed note must not crash every read
@@ -308,16 +373,19 @@ class Canon:
                 p = self.node_path(n.id)
                 snapshot[p] = p.read_bytes() if p.exists() else None
             try:
+                from .model import utcnow
                 for node in nodes:
+                    # refresh the lease while a long batch is in flight so a concurrent session can't
+                    # judge it stale (TTL) and steal the lock mid-write, breaking single-writer.
+                    self.lock.heartbeat()
                     merged = self._merge_into_existing(node) if merge else node
-                    from .model import utcnow
                     merged.updated_at = utcnow()
                     _atomic_write(self.node_path(merged.id), node_to_markdown(merged))
                 if commit and _git_ok(repo):
                     _git(repo, "add", "-A")
                     # allow empty so a no-op batch still succeeds
                     _git(repo, "commit", "-m", message, "--allow-empty")
-                return RollbackInfo(False, None, "")
+                return RollbackInfo(False)
             except Exception as e:  # noqa: BLE001 — rollback must catch everything
                 return self._rollback(repo, str(e), snapshot)
         finally:
@@ -329,10 +397,12 @@ class Canon:
             return node
         self._check_slug_collision(node)
         cur = self.read_node(node.id)
-        by_ident = {e.identity: e for e in cur.edges}
+        # key by the canonical edge id (the slug) — the same key the boundary dedup and disk use, so
+        # all three layers agree on what "one edge" is (boundary-1 / §1.4).
+        by_id = {e.id: e for e in cur.edges}
         for e in node.edges:
-            by_ident[e.identity] = e  # incoming wins (already validated)
-        cur.edges = list(by_ident.values())
+            by_id[e.id] = e  # incoming wins (already validated)
+        cur.edges = list(by_id.values())
         if node.body:
             cur.body = node.body
         cur.label = node.label or cur.label
@@ -341,20 +411,18 @@ class Canon:
         return cur
 
     def _rollback(self, repo: Path, error: str, snapshot: dict | None = None) -> RollbackInfo:
-        if _git_ok(repo) and _has_commit(repo):
-            # git path: stash-before-reset so concurrent human edits are preserved, not discarded.
-            # Detect a real stash by comparing the stash ref before/after (locale-independent).
-            before = _git(repo, "rev-parse", "--verify", "--quiet", "refs/stash", check=False).stdout.strip()
-            _git(repo, "stash", "push", "-u", "-m", f"kg-rollback-{int(time.time())}", check=False)
-            after = _git(repo, "rev-parse", "--verify", "--quiet", "refs/stash", check=False).stdout.strip()
-            stash_ref = after if (after and after != before) else None
-            _git(repo, "reset", "--hard", "HEAD", check=False)
-            return RollbackInfo(stash_ref is not None, stash_ref, error)
-        # non-git / pre-first-commit: restore the snapshot we captured before the batch began
+        """Undo a failed batch by restoring ONLY the files it touched, from the pre-batch snapshot.
+
+        This is the same scoped restore on both git and non-git vaults. A repo-wide `git reset --hard
+        HEAD` (the old git path) would also discard unrelated UNCOMMITTED work — most importantly the
+        grounding verdicts kg_ground writes via write_one without a commit, plus in-progress hand
+        edits — silently reverting them to their last committed state. Scoping to `snapshot` keeps the
+        rollback confined to this batch and never disturbs anything else in the working tree.
+        """
         if snapshot:
             for p, original in snapshot.items():
                 if original is None:
-                    p.unlink(missing_ok=True)
+                    p.unlink(missing_ok=True)  # file was newly created by this batch -> remove it
                 else:
                     p.write_bytes(original)
-        return RollbackInfo(False, None, error)
+        return RollbackInfo(True, error)

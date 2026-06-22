@@ -13,10 +13,10 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .canon import Canon
-from .model import EpistemicState, VERDICT_STATES
+from .canon import Canon, GROUND_AUDIT
+from .model import EpistemicState, GROUNDABLE_STATES, VERDICT_STATES, node_from_markdown
 
-GROUND_AUDIT = ".kg-ground-audit.jsonl"
+__all__ = ["Reconciler", "ReconcileReport", "OrphanReport", "GROUND_AUDIT"]
 
 
 def _sha256(p: Path) -> str:
@@ -87,7 +87,7 @@ class Reconciler:
         audit = self._audit_counts()
         report = ReconcileReport(full_sweep=full_sweep)
 
-        for p in sorted(self.canon.notes_dir.glob("*.md")):
+        for p in self.canon.note_paths():  # excludes .tmp-* atomic-write temporaries (canon-5)
             report.scanned += 1
             rel = p.name
             st = p.stat()
@@ -104,7 +104,10 @@ class Reconciler:
 
             report.changed.append(rel)
             try:
-                node = self.canon.read_node(p.stem)
+                # parse the file ON DISK directly, not via read_node(p.stem) which re-slugs the stem
+                # and could resolve to a different/missing file for a non-slug-canonical filename
+                # (reconciler-4) — leaving that note un-reconciled on every scan.
+                node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
             except Exception:  # noqa: BLE001 — a single malformed note must not crash the sweep
                 continue  # leave its file_state untouched so it's retried next scan
             mutated = False
@@ -134,10 +137,24 @@ class Reconciler:
                 digest = _sha256(p)
             files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest}
 
-        # drop state for files that disappeared (and their epistemic entries, to bound growth)
-        live = {p.name for p in self.canon.notes_dir.glob("*.md")}
-        for rel in [r for r in files_state if r not in live]:
+        # Prune the `epistemic` BASELINE for anything no longer live. Edge ids are deterministic, so a
+        # deleted-then-recreated edge would otherwise inherit the old "already grounded" baseline and
+        # let a forged verdict slip past the `last == current` short-circuit in _forged (reconciler-1).
+        # Dropping dead keys also bounds growth across renames/churn (reconciler-2, whose comment
+        # previously claimed a pruning that did not happen).
+        #
+        # `consumed` is deliberately NOT pruned: it is the running tally of audit records already
+        # spent, and the audit log is append-only (never pruned). Pruning consumed would let an old,
+        # still-present audit record be re-spent by a recreated edge — re-opening the very replay the
+        # count check defeats. Its growth tracks the audit log, which is the permanent record anyway.
+        live_nodes = self.canon.all_nodes()
+        live_files = {p.name for p in self.canon.note_paths()}
+        live_keys = {f"node:{n.id}" for n in live_nodes}
+        live_keys |= {e.id for n in live_nodes for e in n.edges}
+        for rel in [r for r in files_state if r not in live_files]:
             del files_state[rel]
+        for k in [k for k in epistemic if k not in live_keys]:
+            del epistemic[k]
 
         self._save_state({"files": files_state, "epistemic": epistemic, "consumed": consumed})
         return report
@@ -145,11 +162,14 @@ class Reconciler:
     @staticmethod
     def _forged(key: str, current: EpistemicState, epistemic: dict, consumed: dict,
                 audit: dict[str, int]) -> bool:
-        """True if `current` is a verdict state reached out-of-band: it differs from the last validated
+        """True if `current` is a policed state reached out-of-band: it differs from the last validated
         state for this key and there is no UNCONSUMED kg_ground audit record justifying a transition
         into `current`. Each legitimate transition consumes one audit record, so replaying a stale
-        verdict (whose record was already spent) is caught."""
-        if current not in VERDICT_STATES:
+        verdict (whose record was already spent) is caught. The policed set is GROUNDABLE_STATES — the
+        verdicts PLUS `obsolete` — the same set kg_ground stamps and audits; `obsolete` was previously
+        excluded, so an out-of-band edit to `obsolete` (which the write boundary demotes) silently
+        survived the sweep and could erase a grounding verdict / failure memory (reconciler-5/server-1)."""
+        if current not in GROUNDABLE_STATES:
             return False
         last = epistemic.get(key)
         if last == current.value:

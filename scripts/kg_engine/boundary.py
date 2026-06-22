@@ -21,13 +21,18 @@ from .model import (
     Disposition,
     Edge,
     EpistemicState,
+    FAILURE_STATES,
     Node,
     Provenance,
     UNDECLARED_TYPE,
     VERDICT_STATES,
-    edge_id,
     normalize_text,
 )
+
+# A span must be a verbatim anchor, not a degenerate one: a 1-char span ('a') is a substring of
+# almost any prose and meets span-present letter-of-the-law while citing nothing. Require a minimum
+# of real (non-whitespace) characters so the structural guarantee stays meaningful (§1.5).
+MIN_SPAN_CHARS = 4
 
 # Anti-injection-flooding rate limit (§Stage 9): a hostile or oversized source must not be able to
 # stuff the canon with unbounded edges. The budget scales with source size but has a floor so normal
@@ -70,8 +75,9 @@ class WritePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     nodes: list[NodeIn] = Field(default_factory=list)
     edges: list[EdgeIn] = Field(default_factory=list)
-    # extractors that stream set this false on the final chunk; a missing/false value on a payload
-    # that *should* be terminal is treated as a truncated transport failure.
+    # A single-shot payload is complete by default (kg_write delivers one validated JSON object, so an
+    # omitted flag means "this is the whole thing"). A streaming producer must set complete=False on a
+    # non-final / truncated chunk to force a whole-payload rejection with no partial write (§Stage 3).
     complete: bool = True
 
 
@@ -105,6 +111,7 @@ def validate_payload(
     pack: Any = None,
     source_text: str = "",
     existing: Iterable[Edge] | None = None,
+    existing_node_ids: Iterable[str] | None = None,
     restore=None,
     max_edges_per_kb: float | None = DEFAULT_MAX_EDGES_PER_KB,
 ) -> list[ValidationResult]:
@@ -114,6 +121,11 @@ def validate_payload(
     `source_text` is the ORIGINAL (unscrubbed) source used for span verification.
     `restore` optionally maps a scrubbed span back to original text before verifying.
     `existing` is the current set of canonical edges (for dedup / single-canonical-edge).
+    `existing_node_ids` are the ids the canon already holds, so the node flood guard is seeded
+    canon-wide (mirroring the edge baseline) AND charges only NET-NEW node ids — re-emitting an
+    existing node grows the canon by zero, so (like a deduped edge) it must neither consume budget
+    nor be flooded; otherwise an idempotent re-build of a canon already at its node budget would be
+    rejected wholesale (§Stage 9).
     `max_edges_per_kb` caps writable edges at `max(MIN_EDGE_BUDGET, kb*rate)` across the canon
     (existing + this payload), defeating injection flooding (§Stage 9); pass None to disable.
     """
@@ -139,6 +151,8 @@ def validate_payload(
     results: list[ValidationResult] = []
 
     # 2. nodes ---------------------------------------------------------------
+    seen_nodes = set(existing_node_ids or [])      # canon-wide dedup set, like `seen` for edges
+    existing_node_count = len(seen_nodes)
     written_nodes = 0
     for nin in wp.nodes:
         node = _canon_node(nin)
@@ -160,17 +174,28 @@ def validate_payload(
         if node_types is not None and node.node_type not in node_types:
             disp = Disposition.QUARANTINED
             reason = (reason + ";" if reason else "") + "undeclared-node-type"
-        # flood guard: cap net-new writable nodes
+        # flood guard: cap NET-NEW writable nodes. A node id already in the canon (or repeated in this
+        # payload) grows the canon by zero, so it costs no budget and is never flooded — mirroring the
+        # edge "deduped costs zero" rule so an idempotent re-build never trips the limiter.
         if budget is not None and disp in (Disposition.ACCEPTED, Disposition.DEMOTED):
-            if written_nodes >= budget:
+            if node.id in seen_nodes:
+                reason = (reason + ";" if reason else "") + "deduped"
+            elif existing_node_count + written_nodes >= budget:
                 disp, reason = Disposition.REJECTED, "rate-limited-flood"
             else:
                 written_nodes += 1
+                seen_nodes.add(node.id)
         results.append(_ok("node", node, disp, reason, retryable=False, identity=node.id))
 
     # 3. edges ---------------------------------------------------------------
-    seen = {e.identity for e in (existing or [])}
-    existing_count = len(seen)
+    existing_list = list(existing or [])
+    # dedup on the CANONICAL edge id (the slug), the same key the canon merge and disk use — keying
+    # on the raw (source,relation,target) tuple here while the canon keys on the slugged id let the
+    # two disagree, silently dropping an "accepted" edge in the merge (boundary-1 / §1.4).
+    seen = {e.id for e in existing_list}
+    # the flood baseline counts only LIVE growth: never-pruned failure memory (rejected/failed, §1.7)
+    # must not consume the budget and starve legitimate new writes.
+    existing_count = sum(1 for e in existing_list if e.epistemic_state not in FAILURE_STATES)
     written = 0
     norm_source = normalize_text(source_text)  # normalize the source ONCE, not per edge
     for ein in wp.edges:
@@ -211,7 +236,7 @@ def _validate_edge(ein, edge_types, norm_source, restore, seen) -> ValidationRes
         epistemic_state=ein.epistemic_state, span=ein.span, source_file=ein.source_file,
         confidence=ein.confidence, confidence_score=ein.confidence_score, notes=ein.notes,
     )
-    ident = edge.identity
+    ident = edge.id  # the canonical (slugged) identity used by dedup, the canon merge, and disk
     disp, reason = Disposition.ACCEPTED, ""
 
     # clamp the confidence hint into [0,1]; drop NaN/inf so it can't poison downstream calibration
@@ -235,25 +260,26 @@ def _validate_edge(ein, edge_types, norm_source, restore, seen) -> ValidationRes
         disp = Disposition.DEMOTED
         reason = (reason + ";" if reason else "") + tag
 
-    deterministic = edge.authored_by == AuthoredBy.DETERMINISTIC
-
-    # span-present enforcement (§1.5) — non-deterministic edges must cite a verifying span
-    if not deterministic:
-        if not edge.span or not edge.span.strip():
-            return _ok("edge", edge, Disposition.REJECTED, "no-supporting-span", False, ident)
-        check_span = restore(edge.span) if restore else edge.span
-        ns = normalize_text(check_span)
-        if not ns or ns not in norm_source:  # span-present (§1.5), against the pre-normalized source
-            return _ok("edge", edge, Disposition.REJECTED, "span-not-in-source", False, ident)
-        # restore protects the egress, not the local canon (§1.9): the canon stores the ORIGINAL
-        # (unscrubbed) span, recovered from the placeholder form the subagent emitted.
-        if restore and check_span != edge.span:
-            edge.span = check_span
-        # a verifying span justifies span-present provenance; if the agent under-claimed (inferred),
-        # leave it; if it claimed span-present we keep it. hypothesized stays hypothesized.
-    else:
-        # deterministic edges are span-present by construction
-        edge.provenance = Provenance.SPAN_PRESENT
+    # span-present enforcement (§1.5). Every edge reaching this boundary is `agent`: the authorship
+    # demotion above strips any `deterministic`/`human` claim (only the in-process parser is truly
+    # deterministic, and it writes without transiting this boundary). So there is no deterministic
+    # bypass branch here — every edge must cite a verifying span.
+    if not edge.span or not edge.span.strip():
+        return _ok("edge", edge, Disposition.REJECTED, "no-supporting-span", False, ident)
+    check_span = restore(edge.span) if restore else edge.span
+    ns = normalize_text(check_span)
+    if not ns or ns not in norm_source:  # span-present (§1.5), against the pre-normalized source
+        return _ok("edge", edge, Disposition.REJECTED, "span-not-in-source", False, ident)
+    # reject a degenerate anchor (a 1-char span is in almost any prose): require a meaningful floor of
+    # real characters so span-present cites something, not just any substring (boundary-5 / §1.5).
+    if len(ns.replace(" ", "")) < MIN_SPAN_CHARS:
+        return _ok("edge", edge, Disposition.REJECTED, "span-too-short", False, ident)
+    # restore protects the egress, not the local canon (§1.9): the canon stores the ORIGINAL
+    # (unscrubbed) span, recovered from the placeholder form the subagent emitted.
+    if restore and check_span != edge.span:
+        edge.span = check_span
+    # a verifying span justifies span-present provenance; if the agent under-claimed (inferred),
+    # leave it; if it claimed span-present we keep it. hypothesized stays hypothesized.
 
     # undeclared edge type -> quarantine (never silently accepted)
     if edge_types is not None and edge.relation not in edge_types:

@@ -15,7 +15,9 @@ if [ -z "$ROOT" ]; then
   # Dev fallback (`--plugin-dir .` without the var, or run by hand): hooks/ -> repo root.
   ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)" || exit 0
 fi
-export PATH="$HOME/.local/bin:$PATH"   # uv commonly installs here; harmless if absent
+# Prepend uv's usual install dir; ${HOME:-} guards minimal/CI/MSYS shells where HOME is
+# unset (set -u would otherwise abort here). Harmless if the dir is absent.
+[ -n "${HOME:-}" ] && export PATH="$HOME/.local/bin:$PATH"
 
 BOOT="$ROOT/scripts/bootstrap.py"
 [ -f "$BOOT" ] || exit 0

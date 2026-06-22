@@ -9,11 +9,21 @@ on:
 jobs:
   test:
     name: engine tests + smoke
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Linux carries the full Python-version coverage; the cross-platform install promise
+        # (Windows / macOS, see scripts/bootstrap.py) is exercised on a single pinned 3.12 to
+        # bound matrix cost. The install/test commands below are OS-agnostic (`python -m pip`,
+        # `pytest`), so no per-OS shell branching is needed.
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.12"]
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v5
 

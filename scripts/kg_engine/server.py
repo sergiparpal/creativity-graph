@@ -14,13 +14,15 @@ from pathlib import Path
 from . import __version__
 from .boundary import DEFAULT_MAX_EDGES_PER_KB, merge_results_into_nodes, validate_payload
 from .canon import Canon
-from .model import Disposition, EpistemicState, Node, slug, utcnow
+from .model import Disposition, EpistemicState, GROUNDABLE_STATES, Node, slug, utcnow
 from .pack import load_pack
 from .projector import Projector
 from .reconciler import GROUND_AUDIT, Reconciler
 from .scrub import Scrubber
 
-VALID_VERDICTS = {"grounded", "rejected", "failed", "obsolete"}
+# Single source of truth shared with the reconciler's policed set (model.GROUNDABLE_STATES), so the
+# states kg_ground may stamp and the states the reconciler re-quarantines can never drift apart.
+VALID_VERDICTS = {s.value for s in GROUNDABLE_STATES}
 
 
 class KGEngine:
@@ -77,9 +79,12 @@ class KGEngine:
         # if egress scrubbing happened this session, restore placeholder spans to the original before
         # span verification, and store the original in the canon (§1.9).
         restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
+        existing_nodes = self.canon.all_nodes()  # read once; derive edges + node baseline from it
+        existing_edges = [e for n in existing_nodes for e in n.edges]
         results = validate_payload(payload, pack=self.pack, source_text=self.source_text(),
-                                   existing=self.canon.all_edges(), restore=restore,
-                                   max_edges_per_kb=self.max_edges_per_kb)
+                                   existing=existing_edges,
+                                   existing_node_ids={n.id for n in existing_nodes},
+                                   restore=restore, max_edges_per_kb=self.max_edges_per_kb)
         nodes = merge_results_into_nodes(results)
         info = self.canon.write_nodes(list(nodes.values()), message=message) if nodes else None
         summary: dict = {d.value: 0 for d in Disposition}
@@ -90,8 +95,8 @@ class KGEngine:
             "details": [{"kind": r.kind, "id": getattr(r.item, "id", None), "disposition": r.disposition.value,
                          "reason": r.reason, "retryable": r.retryable} for r in results],
             "written_nodes": list(nodes),
-            "rolled_back": bool(info and info.stashed),
-            "stash_ref": info.stash_ref if info else None,
+            "rolled_back": bool(info and info.rolled_back),
+            "error": (info.error if info and info.rolled_back else None),
         }
 
     def kg_ground(self, target_id: str, verdict: str, *, by: str = "agent", kind: str = "edge",
@@ -124,23 +129,70 @@ class KGEngine:
             if note:
                 edge.notes = (edge.notes + " | " if edge.notes else "") + note
             key = edge.id
-        # Append the audit record BEFORE persisting the verdict: a crash between the two would then
-        # leave an audit record with no state change (harmless, unconsumed) rather than a verdict in
-        # the canon with no audit record (which the reconciler would re-quarantine as a forgery).
-        self._audit(key, frm, verdict, by)
-        self.canon.write_one(node)
-        return {"ok": True, "key": key, "from": frm, "to": verdict, "by": by}
+        # Hold the single-writer lease across the WHOLE audit-append + write + compensating-truncate
+        # sequence so it is atomic w.r.t. other writers. Otherwise a concurrent session's legitimate
+        # audit append could land between our offset capture and our truncate, and our whole-tail
+        # truncate would discard it (server-3). write_one re-acquires the lease re-entrantly.
+        if not self.canon.try_acquire_lock():
+            return {"ok": False, "error": "canon vault is locked by another live session"}
+        try:
+            # Append the audit record BEFORE persisting the verdict: a CRASH between the two leaves an
+            # audit record with no state change (harmless, unconsumed) rather than a verdict with no
+            # audit record (which the reconciler would re-quarantine). But a CAUGHT write failure (slug
+            # collision, disk error) must not leave that orphan record — on a later legitimate retry of
+            # the same key->state it would inflate the count and let one genuine forgery slip past
+            # _forged's count check. So we record the pre-append offset and truncate it back on failure.
+            audit_offset = self._audit_size()
+            self._audit(key, frm, verdict, by)
+            try:
+                self.canon.write_one(node)
+            except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
+                self._truncate_audit(audit_offset)  # the transition never happened; drop its record
+                return {"ok": False, "error": f"write failed: {e}"}
+            return {"ok": True, "key": key, "from": frm, "to": verdict, "by": by}
+        finally:
+            self.canon._release_lock()
 
     def _owner_of_edge(self, edge_id: str) -> Node | None:
+        # O(1) lookup via the derived index (id -> source) instead of an O(N) full-canon scan per
+        # kg_ground call, which made draining the grounding queue quadratic (server-2). The index is
+        # read-only here; on a miss (just-written edge not yet projected, or no index) fall back to a
+        # scan so correctness never depends on derived freshness.
+        try:
+            self._ensure_projected()
+            src = self.projector.owner_of_edge(edge_id)
+            if src and self.canon.exists(src):
+                node = self.canon.read_node(src)
+                if any(e.id == edge_id for e in node.edges):
+                    return node
+        except Exception:  # noqa: BLE001 — index trouble must never break grounding; fall back
+            pass
         for n in self.canon.all_nodes():
             if any(e.id == edge_id for e in n.edges):
                 return n
         return None
 
+    def _audit_path(self) -> Path:
+        return self.canon.root / GROUND_AUDIT
+
+    def _audit_size(self) -> int:
+        try:
+            return self._audit_path().stat().st_size
+        except OSError:
+            return 0
+
+    def _truncate_audit(self, offset: int) -> None:
+        try:
+            with open(self._audit_path(), "r+", encoding="utf-8") as f:
+                f.truncate(offset)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+
     def _audit(self, key: str, frm: str, to: str, by: str) -> None:
         rec = {"key": key, "from": frm, "to": to, "by": by, "at": utcnow()}
-        path = self.canon.root / GROUND_AUDIT
-        with open(path, "a", encoding="utf-8") as f:
+        with open(self._audit_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
             f.flush()
             os.fsync(f.fileno())  # the audit log is tamper-evidence; make each record durable
@@ -154,17 +206,29 @@ class KGEngine:
         if self.canon.exists(new):
             return {"ok": False, "error": "target id exists"}
         node = self.canon.read_node(old)
+        # A rename recomputes edge ids (and the node id), but the kg_ground audit record + reconciler
+        # baseline are keyed by those ids. Collect every policed-state (verdict OR obsolete) item whose
+        # id CHANGES so we can write a migrating audit record for the NEW id — otherwise the reconciler
+        # sees a verdict at an id with no audit record and re-quarantines it, silently erasing the
+        # grounding/failure memory (integration-1).
+        migrations: list[tuple[str, str]] = []  # (new_key, state_value)
+        if node.epistemic_state in GROUNDABLE_STATES:
+            migrations.append((f"node:{new}", node.epistemic_state.value))
         node.id = new
         for e in node.edges:
+            old_eid = e.id
             if e.source == old:
                 e.source = new
             e.id = edge_id(e.source, e.relation, e.target)  # keep edge id consistent with endpoints
+            if e.id != old_eid and e.epistemic_state in GROUNDABLE_STATES:
+                migrations.append((e.id, e.epistemic_state.value))
         touched = [node]
         for other in self.canon.all_nodes():
             if other.id == old:
                 continue
             changed = False
             for e in other.edges:
+                old_eid = e.id
                 ec = False
                 if e.target == old:
                     e.target = new; ec = True
@@ -173,21 +237,36 @@ class KGEngine:
                 if ec:
                     e.id = edge_id(e.source, e.relation, e.target)
                     changed = True
+                    if e.id != old_eid and e.epistemic_state in GROUNDABLE_STATES:
+                        migrations.append((e.id, e.epistemic_state.value))
             if changed:
                 touched.append(other)
-        # Write the corrected nodes VERBATIM (merge=False): merging would re-introduce each note's
-        # pre-rename edges (different identity -> not deduped) and leave dangling old-endpoint edges.
-        info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
-        if info.stashed:
-            # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
-            return {"ok": False, "error": "rename rolled back", "stash_ref": info.stash_ref,
+        # Hold the lease across the whole audit + write + unlink + commit sequence so the migrating
+        # audit records and their compensating truncate are atomic w.r.t. other writers (server-3).
+        if not self.canon.try_acquire_lock():
+            return {"ok": False, "error": "canon vault is locked by another live session",
                     "old": old, "new": new}
-        self.canon.node_path(old).unlink(missing_ok=True)
-        from .canon import _git, _git_ok
-        if _git_ok(self.canon.root):
-            _git(self.canon.root, "add", "-A", check=False)
-            _git(self.canon.root, "commit", "-m", message, "--allow-empty", check=False)
-        return {"ok": True, "old": old, "new": new, "touched": [n.id for n in touched]}
+        try:
+            # Emit the migrating audit records (compensated by truncation if the batch rolls back, like
+            # kg_ground), then write the corrected nodes VERBATIM (merge=False): merging would
+            # re-introduce each note's pre-rename edges (different id -> not deduped) and leave dangling
+            # old endpoints.
+            audit_offset = self._audit_size()
+            for new_key, state in migrations:
+                self._audit(new_key, EpistemicState.UNVERIFIED.value, state, "agent")
+            info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
+            if info.rolled_back:
+                # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
+                self._truncate_audit(audit_offset)
+                return {"ok": False, "error": f"rename rolled back: {info.error}", "old": old, "new": new}
+            self.canon.node_path(old).unlink(missing_ok=True)
+            from .canon import _git, _git_ok
+            if _git_ok(self.canon.root):
+                _git(self.canon.root, "add", "-A", check=False)
+                _git(self.canon.root, "commit", "-m", message, "--allow-empty", check=False)
+            return {"ok": True, "old": old, "new": new, "touched": [n.id for n in touched]}
+        finally:
+            self.canon._release_lock()
 
     def kg_metrics(self) -> dict:
         nodes = self.canon.all_nodes()

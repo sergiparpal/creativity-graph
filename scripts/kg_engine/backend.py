@@ -35,7 +35,11 @@ from typing import Any
 from .server import KGEngine, build_engine_from_env
 
 DEFAULT_MODEL = "claude-opus-4-8"
-DEFAULT_MAX_TOKENS = 8192
+# Dense sections + adaptive thinking (which counts toward the budget) can blow past a small cap and
+# truncate mid-JSON at max_tokens. 16000 gives ample headroom while staying under the SDK's
+# non-streaming ~10-minute timeout guard (which raises on much larger non-streamed values). Override
+# with --max-tokens / KG_BACKEND_MAX_TOKENS if a section needs more.
+DEFAULT_MAX_TOKENS = 16000
 
 # Pack vocabulary fallback if no pack is loaded (keeps the schema valid; the boundary still
 # quarantines anything off-vocabulary).
@@ -199,7 +203,16 @@ class BackendExtractor:
         text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), None)
         if text is None:
             raise RuntimeError(f"no text block in model response for section {title!r}")
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            # structured output should always be valid JSON, but surface a diagnosable error (with
+            # the stop_reason and a snippet) rather than a bare JSONDecodeError if the model returns
+            # malformed text.
+            snippet = text[:200] + ("…" if len(text) > 200 else "")
+            raise RuntimeError(
+                f"model returned non-JSON for section {title!r} "
+                f"(stop_reason={stop!r}): {e}; got: {snippet!r}") from e
 
     # ---- stamp the deterministic axes the boundary expects ----------------
     def _stamp(self, raw: dict) -> dict:
@@ -248,22 +261,33 @@ class BackendExtractor:
         totals: Counter = Counter()
         sections = self.split_sections(src)
         n_written = 0
-        for title, body in sections:
-            if not body.strip():
-                continue
-            # §1.9 egress scrub before the text reaches the model; kg_write restores spans for the canon.
-            scrubbed = self.engine.kg_scrub(body)["scrubbed"]
-            raw = self.extract_section(scrubbed, title)
-            result = self.engine.kg_write(self._stamp(raw), message=f"backend:{title or 'preamble'}")
-            for k, v in result["dispositions"].items():
-                totals[k] += v
-            n_written += 1
-
-        self.engine.projector.project()  # build/refresh the derived layer
+        failed_sections: list[dict] = []
+        try:
+            for title, body in sections:
+                if not body.strip():
+                    continue
+                # A transient API error (or a RuntimeError on refusal / max_tokens / non-JSON) for one
+                # section must not abort the whole multi-section run: isolate it, record it, and keep
+                # going so the sections that did land are not lost.
+                try:
+                    # §1.9 egress scrub before the text reaches the model; kg_write restores spans for the canon.
+                    scrubbed = self.engine.kg_scrub(body)["scrubbed"]
+                    raw = self.extract_section(scrubbed, title)
+                    result = self.engine.kg_write(self._stamp(raw), message=f"backend:{title or 'preamble'}")
+                    for k, v in result["dispositions"].items():
+                        totals[k] += v
+                    n_written += 1
+                except Exception as e:  # noqa: BLE001 — isolate any per-section failure
+                    failed_sections.append({"title": title or "preamble", "error": f"{type(e).__name__}: {e}"})
+        finally:
+            # Always reconcile the derived layer with whatever landed, even if a section raised — the
+            # canon may have been partially updated and must not be left with a stale projection.
+            self.engine.projector.project()  # build/refresh the derived layer
         return {
             "model": self.model,
             "sections": n_written,
             "dispositions": dict(totals),
+            "failed_sections": failed_sections,
             "metrics": self.engine.kg_metrics(),
         }
 
@@ -288,14 +312,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pack", help="pack.yaml path (else KG_PACK_PATH / <project>/pack/pack.yaml)")
     ap.add_argument("--model", default=os.environ.get("KG_BACKEND_MODEL", DEFAULT_MODEL),
                     help=f"Claude model id (default {DEFAULT_MODEL})")
-    ap.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    try:
+        _max_tokens_default = int(os.environ.get("KG_BACKEND_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+    except ValueError:  # a non-integer env value must not crash with a raw traceback
+        _max_tokens_default = DEFAULT_MAX_TOKENS
+    ap.add_argument("--max-tokens", type=int, default=_max_tokens_default,
+                    help=f"per-section output cap (default {DEFAULT_MAX_TOKENS})")
     args = ap.parse_args(argv)
 
     engine = _build_engine(args)
     extractor = BackendExtractor(engine, model=args.model, max_tokens=args.max_tokens)
     out = extractor.run()
     print(json.dumps(out, indent=2))
-    return 0
+    # The derived layer is already projected (run() does it in a finally); a non-zero exit only
+    # signals that some sections failed so a CI run doesn't go green on a partial extraction.
+    return 1 if out.get("failed_sections") else 0
 
 
 if __name__ == "__main__":

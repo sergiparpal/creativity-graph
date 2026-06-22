@@ -17,14 +17,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Gated embedding layer (metrics_mode == with_embeddings). sqlite-vss ships as a loadable
-# extension; absence degrades gracefully to structure-only signal.
-embeddings = ["sqlite-vss>=0.1"]
-# Deterministic extraction of structured (code/SQL) inputs. Optional for pure-prose corpora.
-treesitter = ["tree_sitter>=0.21", "tree-sitter-languages>=1.10"]
 # Headless API-driven extraction backend (§2.2): the CI / non-interactive path. The in-session
 # path needs no API keys; this extra is only for `python -m kg_engine.backend`.
-backend = ["anthropic>=0.69"]  # floor for output_config structured outputs + adaptive thinking (Opus 4.x)
+# Floor is 0.77.0 (2026-01-29): the first SDK release that ships `output_config` on
+# `messages.create()` for structured outputs. (0.73.0 only had the beta `output_format`
+# parameter, which `backend.py` does not use — it calls `output_config={"format": ...}`.)
+backend = ["anthropic>=0.77"]
 # Test + dev tooling.
 dev = ["pytest>=8"]
 

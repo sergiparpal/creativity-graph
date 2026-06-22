@@ -53,9 +53,26 @@ class Disposition(str, Enum):
 
 # Verdict states may never be asserted by a write; only kg_ground may set them.
 VERDICT_STATES = {EpistemicState.GROUNDED, EpistemicState.REJECTED, EpistemicState.FAILED}
+# Every state kg_ground may stamp (a verdict OR the `obsolete` lifecycle transition). This is the
+# single source of truth shared by the boundary (which demotes any of these on a write), the server
+# (kg_ground's accepted verdicts), and the reconciler (which re-quarantines any of these reached
+# out-of-band without a matching audit record). Keeping it in one place stops the three from drifting.
+GROUNDABLE_STATES = VERDICT_STATES | {EpistemicState.OBSOLETE}
 # Negative information that the projector must never prune (§1.7).
 FAILURE_STATES = {EpistemicState.REJECTED, EpistemicState.FAILED}
 UNDECLARED_TYPE = "undeclared-type"
+
+
+def coerce_enum(cls, value, default):
+    """Coerce a (possibly hand-edited / typo'd) string to an enum member, falling back to a safe
+    default instead of raising. A malformed enum value in a canon note must not blow up parsing and
+    make the whole node disappear from every read (§1.2)."""
+    if isinstance(value, cls):
+        return value
+    try:
+        return cls(value)
+    except ValueError:
+        return default
 
 
 def utcnow() -> str:
@@ -97,7 +114,14 @@ def span_verifies(span: str, source_text: str) -> bool:
 
 
 def slug(s: str) -> str:
-    s = re.sub(r"[^\w\s-]", "", str(s).strip().lower())
+    # NFC-normalize first so visually-identical strings in different composition forms (NFD from
+    # macOS/HFS+ copy-paste vs NFC) produce the SAME slug — otherwise the same logical node/edge
+    # forks into two ids/filenames and dedup (§1.4) silently fails.
+    s = unicodedata.normalize("NFC", str(s)).strip().lower()
+    # MAP punctuation to a separator rather than DELETING it: deleting collapses distinct inputs
+    # ('a/b' vs 'ab', 'I/O' vs 'IO', 'foo.bar' vs 'foobar') onto one id/filename, conflating two
+    # genuinely different nodes/edges. Mapping to '-' preserves distinctness.
+    s = re.sub(r"[^\w\s-]", "-", s)
     return re.sub(r"[\s_-]+", "-", s).strip("-") or "node"
 
 
@@ -127,10 +151,13 @@ class Edge:
     id: str = ""
 
     def __post_init__(self) -> None:
-        self.provenance = Provenance(self.provenance)
-        self.authored_by = AuthoredBy(self.authored_by)
-        self.epistemic_state = EpistemicState(self.epistemic_state)
-        self.confidence = Confidence(self.confidence)
+        # tolerate a typo'd/unknown enum string in a hand-edited note: coerce to a safe default rather
+        # than raise (a single bad field must not make the whole node vanish from every read, §1.2).
+        # UNVERIFIED is the safe epistemic default — it demotes a malformed verdict, never invents one.
+        self.provenance = coerce_enum(Provenance, self.provenance, Provenance.INFERRED)
+        self.authored_by = coerce_enum(AuthoredBy, self.authored_by, AuthoredBy.AGENT)
+        self.epistemic_state = coerce_enum(EpistemicState, self.epistemic_state, EpistemicState.UNVERIFIED)
+        self.confidence = coerce_enum(Confidence, self.confidence, Confidence.INFERRED)
         # endpoints/relation may arrive as non-str from YAML; the id is a deterministic function of
         # them (single-canonical-edge rule). Always recompute so a stored/forged id can never diverge
         # from (source, relation, target).
@@ -172,9 +199,9 @@ class Node:
     edges: list[Edge] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.provenance = Provenance(self.provenance)
-        self.authored_by = AuthoredBy(self.authored_by)
-        self.epistemic_state = EpistemicState(self.epistemic_state)
+        self.provenance = coerce_enum(Provenance, self.provenance, Provenance.SPAN_PRESENT)
+        self.authored_by = coerce_enum(AuthoredBy, self.authored_by, AuthoredBy.AGENT)
+        self.epistemic_state = coerce_enum(EpistemicState, self.epistemic_state, EpistemicState.UNVERIFIED)
         # YAML may coerce id/label/timestamps to non-str (numbers, booleans, datetime). Coerce to str
         # so frontmatter() stays JSON-serializable (the projector hashes json.dumps(frontmatter)) and a
         # falsy-but-present label (0 / false) is not mistaken for "missing" and overwritten by the id.
@@ -217,7 +244,11 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
         raise ValueError("note has no YAML frontmatter")
     fm = yaml.safe_load(m.group(1)) or {}
     body = m.group(2).strip("\n")
-    edges = [Edge.from_dict(e, source=fm.get("id", fallback_id)) for e in (fm.get("edges") or [])]
+    # Skip a malformed edge entry (e.g. a hand-edited `- just a string` scalar instead of a mapping)
+    # rather than letting it raise and take the whole node — including its failed/rejected counter-
+    # edges (§1.7) — out of every read.
+    edges = [Edge.from_dict(e, source=fm.get("id", fallback_id))
+             for e in (fm.get("edges") or []) if isinstance(e, dict)]
     return Node(
         id=fm.get("id") or fallback_id or slug(fm.get("label", "node")),
         label=fm.get("label", ""),

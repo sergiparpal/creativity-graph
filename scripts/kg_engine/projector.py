@@ -24,6 +24,10 @@ from .model import EpistemicState, FAILURE_STATES, Provenance
 
 GRAPH_JSON = "graph.json"
 INDEX_DB = "index.sqlite"
+# Hard ceiling on the kg_context token budget so a client passing a huge value can't make the engine
+# serialize the entire edge table into one response (server-4). The limit clamp on query_graph is the
+# row-count analogue.
+MAX_CONTEXT_TOKENS = 100_000
 
 
 def _like_escape(term: str) -> str:
@@ -147,6 +151,29 @@ class Projector:
 
     # ---- main
     def project(self, incremental: bool = True) -> ProjectReport:
+        # Serialize the read+write critical section against canon writers AND other projectors: a
+        # reprojection reads the whole canon then writes the derived layer, so without exclusion it
+        # could persist a snapshot matching no single canon state, or two projectors could collide on
+        # the SQLite write lock and crash a read (projector-1). Take the single-writer lease; if
+        # another session holds it, skip and let the caller serve the existing derived layer (a later
+        # read reprojects). Tests and the common single-session path never contend, so this is free.
+        if not self.canon.try_acquire_lock():
+            # another session is writing/projecting; serve the existing derived layer. But on a COLD
+            # first read under contention there is no derived layer yet — create an empty schema'd
+            # index + graph so the read tools return an empty graph instead of crashing on a missing
+            # table (the next uncontended read reprojects for real). Schema creation is idempotent
+            # (CREATE TABLE IF NOT EXISTS) and WAL-safe against a concurrent projector.
+            if not self.db_path.exists():
+                self._connect().close()
+            if not self.graph_path.exists():
+                _atomic_write(self.graph_path, json.dumps(_node_link_data(nx.MultiDiGraph())))
+            return ProjectReport(up_to_date=self.db_path.exists() and self.graph_path.exists())
+        try:
+            return self._project_locked(incremental)
+        finally:
+            self.canon._release_lock()
+
+    def _project_locked(self, incremental: bool) -> ProjectReport:
         nodes = self.canon.all_nodes()
         head = self._head()
         prior = self._read_meta() if self.db_path.exists() else {}
@@ -237,7 +264,7 @@ class Projector:
     def _write_incremental(self, nodes, changed, removed, comm, degree, bridges, head, hashes, report):
         con = self._connect()
         try:
-            by_id = {n.id: n for n in nodes}
+            changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
             # removed nodes: drop node + its outgoing edges
             for nid in removed:
                 con.execute("DELETE FROM nodes WHERE id=?", (nid,))
@@ -261,7 +288,7 @@ class Projector:
                         report.touched_edges.append(eid)
             # refresh ranks for unchanged nodes only when a rank value actually moved
             for n in nodes:
-                if n.id in {c.id for c in changed}:
+                if n.id in changed_ids:
                     continue
                 row = self._node_row(n, comm, degree, bridges)
                 old = con.execute("SELECT degree,community,bridge_communities FROM nodes WHERE id=?",
@@ -274,9 +301,25 @@ class Projector:
         finally:
             con.close()
 
+    def _cheap_sig(self) -> str:
+        """A cheap signature of the canon dir — a digest over each note's (name, size, mtime) —
+        computed with NO YAML parse and NO git fork. The fast staleness pre-gate (projector-2);
+        per-node content hashing is the authoritative confirmation, run only when this signal moves.
+        Digesting EVERY file's (size, mtime), not just the count + newest mtime, catches an in-place
+        edit of a non-newest note (which would not move a max-mtime) and a same-mtime size change."""
+        h = hashlib.sha256()
+        for p in self.canon.note_paths():  # already sorted, so the digest is order-stable
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            h.update(f"{p.name}\x00{st.st_size}\x00{st.st_mtime_ns}\x00".encode())
+        return h.hexdigest()
+
     def _save_meta(self, con, head, hashes):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('built_from_commit', ?)", (head,))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('file_hashes', ?)", (json.dumps(hashes),))
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(self._cheap_sig()),))
 
     def _read_meta(self) -> dict:
         try:
@@ -294,17 +337,24 @@ class Projector:
             out["file_hashes"] = json.loads(rows.get("file_hashes", "{}"))
         except ValueError:
             out["file_hashes"] = {}
+        try:
+            out["cheap_sig"] = json.loads(rows.get("cheap_sig", "null"))
+        except ValueError:
+            out["cheap_sig"] = None
         return out
 
     def is_stale(self) -> bool:
         if not self.db_path.exists() or not self.graph_path.exists():
             return True
         prior = self._read_meta()
-        if prior.get("built_from_commit", "") != self._head():
-            return True
-        # commit equality alone is NOT enough: kg_ground (write_one, no commit) and non-git vaults
-        # (HEAD == "") never move HEAD. Compare per-node content hashes so any uncommitted canon
-        # change — a stamped verdict, a hand edit — still triggers a reprojection on the next read.
+        # cheap pre-gate (projector-2): if the canon dir's (count, newest mtime) is unchanged since the
+        # last projection, nothing on disk changed -> not stale, WITHOUT a git fork or a full YAML
+        # parse. This fronts EVERY read, so it must stay O(dir-listing), not O(N parse).
+        if prior.get("cheap_sig") is not None and prior["cheap_sig"] == self._cheap_sig():
+            return False
+        # the cheap signal moved -> authoritative per-node content-hash comparison. This catches any
+        # uncommitted canon change (a kg_ground verdict, a hand edit) regardless of HEAD; content
+        # equality means the derived layer matches the canon whatever the commit is.
         cur_hashes = {n.id: self._file_hash(n) for n in self.canon.all_nodes()}
         return prior.get("file_hashes", {}) != cur_hashes
 
@@ -314,6 +364,16 @@ class Projector:
         con.execute("PRAGMA busy_timeout=5000")  # tolerate a concurrent reprojection mid-read
         con.row_factory = sqlite3.Row
         return con
+
+    def owner_of_edge(self, edge_id: str) -> str | None:
+        """Source node id for an edge, via the indexed edges table (O(1) lookup); None if absent.
+        Lets kg_ground resolve an edge's owner without an O(N) full-canon scan per call (server-2)."""
+        con = self._ro()
+        try:
+            r = con.execute("SELECT source FROM edges WHERE id=?", (edge_id,)).fetchone()
+            return r[0] if r else None
+        finally:
+            con.close()
 
     def get_node(self, node_id: str) -> dict | None:
         con = self._ro()
@@ -392,7 +452,7 @@ class Projector:
     def kg_context(self, query: str | None = None, *, budget: int = 2000) -> dict:
         """Grounding-aware, provenance-carrying, token-budgeted context. Reads precomputed columns
         only — no centrality is computed here (it is O(1) on the index)."""
-        budget = max(0, int(budget))
+        budget = max(0, min(int(budget), MAX_CONTEXT_TOKENS))  # enforce an upper ceiling (server-4)
         con = self._ro()
         try:
             # falsification counters (memory of failures, §1.7) — surfaced, never pruned

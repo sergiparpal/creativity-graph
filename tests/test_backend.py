@@ -108,8 +108,10 @@ def test_refusal_is_surfaced(engine):
         messages = SimpleNamespace(create=lambda **kw: SimpleNamespace(stop_reason="refusal", content=[]))
 
     extractor = BackendExtractor(engine, client=_Refuser())
+    # extract_section is the unit that turns a refusal into a diagnosable error; run() isolates it
+    # per-section (see test_run_isolates_section_failure_and_still_projects).
     with pytest.raises(RuntimeError, match="refused"):
-        extractor.run()
+        extractor.extract_section("some section text")
 
 
 def test_truncated_output_is_surfaced(engine):
@@ -120,7 +122,122 @@ def test_truncated_output_is_surfaced(engine):
 
     extractor = BackendExtractor(engine, client=_Truncator())
     with pytest.raises(RuntimeError, match="truncated"):
-        extractor.run()
+        extractor.extract_section("some section text")
+
+
+def test_non_json_text_is_surfaced(engine):
+    """backend-2: malformed (non-JSON) model text becomes a clear RuntimeError carrying the
+    stop_reason and a snippet, not a bare JSONDecodeError."""
+    class _Garbler:
+        messages = SimpleNamespace(create=lambda **kw: SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="not json at all")]))
+
+    extractor = BackendExtractor(engine, client=_Garbler())
+    with pytest.raises(RuntimeError, match="non-JSON") as exc:
+        extractor.extract_section("some section text", title="Intro")
+    msg = str(exc.value)
+    assert "end_turn" in msg            # stop_reason is reported
+    assert "not json at all" in msg     # offending snippet is included
+
+
+def test_run_isolates_section_failure_and_still_projects(engine, tmp_path):
+    """backend-1: a per-section failure is isolated (recorded in failed_sections, the run
+    continues) and the derived layer is still projected with whatever landed."""
+    src = tmp_path / "multi.md"
+    src.write_text(
+        "## Good\n"
+        "A compression stands in for many observations and grounds the claims beneath it.\n"
+        "## Bad\n"
+        "Betweenness is confounded by the generality confound.\n",
+        encoding="utf-8",
+    )
+
+    good = {
+        "nodes": [
+            {"id": "compression", "label": "Compression", "node_type": "compression", "body": "stands in"},
+            {"id": "claim", "label": "Claim", "node_type": "claim", "body": "an assertion"},
+        ],
+        "edges": [
+            {"source": "compression", "target": "claim", "relation": "grounds",
+             "span": "A compression stands in for many observations and grounds the claims beneath it",
+             "confidence_score": 0.6},
+        ],
+    }
+
+    class _OneBadSection:
+        """First section returns a valid payload; the second raises a transient API error."""
+        def __init__(self):
+            self._n = 0
+
+        def create(self, **kwargs):
+            self._n += 1
+            if self._n == 2:
+                raise RuntimeError("transient API error on section 2")
+            return SimpleNamespace(
+                stop_reason="end_turn",
+                content=[SimpleNamespace(type="text", text=json.dumps(good))],
+            )
+
+    client = SimpleNamespace(messages=_OneBadSection())
+    extractor = BackendExtractor(engine, client=client)
+    out = extractor.run(source_path=str(src))
+
+    # the good section landed; the bad section was isolated, not propagated
+    assert out["sections"] == 1
+    assert len(out["failed_sections"]) == 1
+    assert out["failed_sections"][0]["title"] == "Bad"
+    assert "transient API error" in out["failed_sections"][0]["error"]
+    # projection still ran despite the failure — derived layer reconciled with what landed
+    assert engine.projector.db_path.exists()
+    assert {e.relation for e in engine.canon.all_edges()} == {"grounds"}
+
+
+def test_main_returns_nonzero_when_a_section_fails(engine, tmp_path, monkeypatch):
+    """backend-1: the CLI exits non-zero when any section failed, so CI doesn't go green on a
+    partial extraction (projection has still run by then)."""
+    import kg_engine.backend as backend
+
+    src = tmp_path / "multi.md"
+    src.write_text(
+        "## Good\nA compression stands in for many observations and grounds the claims beneath it.\n"
+        "## Bad\nBetweenness is confounded by the generality confound.\n",
+        encoding="utf-8",
+    )
+
+    good = {"nodes": [{"id": "compression", "label": "C", "node_type": "compression", "body": "x"},
+                      {"id": "claim", "label": "Cl", "node_type": "claim", "body": "y"}],
+            "edges": [{"source": "compression", "target": "claim", "relation": "grounds",
+                       "span": "A compression stands in for many observations and grounds the claims beneath it",
+                       "confidence_score": 0.6}]}
+
+    class _OneBadSection:
+        def __init__(self):
+            self._n = 0
+
+        def create(self, **kwargs):
+            self._n += 1
+            if self._n == 2:
+                raise RuntimeError("boom")
+            return SimpleNamespace(stop_reason="end_turn",
+                                   content=[SimpleNamespace(type="text", text=json.dumps(good))])
+
+    # the CLI builds its own engine + client; intercept both so no network or env is needed.
+    # point the engine at the multi-section source (the CLI's --source flows through _build_engine,
+    # which we stub out here).
+    engine.source_path = src
+    monkeypatch.setattr(backend, "_build_engine", lambda args: engine)
+    real_init = BackendExtractor.__init__
+
+    def _init(self, eng, **kw):
+        kw["client"] = SimpleNamespace(messages=_OneBadSection())
+        real_init(self, eng, **kw)
+
+    monkeypatch.setattr(BackendExtractor, "__init__", _init)
+
+    rc = backend.main(["extract", "--source", str(src)])
+    assert rc == 1                            # a section failed → non-zero exit
+    assert engine.projector.db_path.exists()  # but projection already ran
 
 
 def test_cli_engine_resolves_project_pack_and_rate(tmp_path, monkeypatch):

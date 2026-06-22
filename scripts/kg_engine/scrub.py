@@ -17,21 +17,70 @@ SENSITIVITY = {
     "high": {"SECRET", "EMAIL", "PHONE", "SSN", "CC", "IP", "CREDURL", "PERSON", "ADDRESS"},
 }
 
+# A small lexicon of common given names. The bare PERSON bigram rule fires only when the first token
+# is a recognized given name (or a courtesy title precedes it / a caller supplies extra_terms), so a
+# Title-Case *concept* bigram ("Creative Destruction", "Knowledge Graph") is NOT mistaken for a name —
+# critical for the conceptual-document input class this engine targets (scrub-4).
+_GIVEN_NAMES = frozenset({
+    "aaron", "adam", "adrian", "alan", "albert", "alex", "alexander", "alexandra", "alice", "alicia",
+    "amanda", "amy", "andrea", "andrew", "angela", "ann", "anna", "anne", "anthony", "arthur", "ava",
+    "barbara", "ben", "benjamin", "beth", "bob", "bobby", "brandon", "brian", "bruce", "carl", "carlos",
+    "carol", "caroline", "catherine", "charles", "charlie", "chris", "christine", "christopher", "claire",
+    "claudia", "daniel", "dave", "david", "dennis", "diana", "donald", "donna", "dorothy", "douglas",
+    "edward", "elaine", "eleanor", "elizabeth", "emily", "emma", "eric", "ethan", "eugene", "evelyn",
+    "frances", "frank", "fred", "gary", "george", "gerald", "grace", "greg", "gregory", "hannah",
+    "harold", "harry", "heather", "helen", "henry", "isabella", "jack", "jacob", "james", "jane", "janet",
+    "jason", "jean", "jeff", "jeffrey", "jennifer", "jeremy", "jerry", "jessica", "joan", "joe", "john",
+    "johnny", "jonathan", "jordan", "jose", "joseph", "joshua", "joyce", "juan", "judith", "judy", "julia",
+    "julie", "justin", "karen", "katherine", "kathleen", "kathryn", "keith", "kelly", "ken", "kenneth",
+    "kevin", "kim", "kimberly", "larry", "laura", "lawrence", "lewis", "linda", "lisa", "liz", "logan",
+    "louis", "lucas", "lucy", "luke", "margaret", "maria", "marie", "marilyn", "mark", "martha", "martin",
+    "mary", "matthew", "megan", "melissa", "michael", "michelle", "mike", "mildred", "nancy", "natalie",
+    "nathan", "nicholas", "nicole", "noah", "norma", "oliver", "olivia", "pamela", "patricia", "patrick",
+    "paul", "peter", "philip", "phillip", "rachel", "ralph", "randy", "raymond", "rebecca", "richard",
+    "rick", "robert", "robin", "roger", "ronald", "rose", "roy", "russell", "ruth", "ryan", "samuel",
+    "sandra", "sara", "sarah", "scott", "sean", "sharon", "shirley", "simon", "sophia", "stephanie",
+    "stephen", "steve", "steven", "susan", "teresa", "terry", "theresa", "thomas", "tim", "timothy",
+    "todd", "tom", "tony", "tyler", "victoria", "vincent", "virginia", "walter", "wayne", "william", "zoe",
+})
+
+
+def _is_personal_name(match: str) -> bool:
+    """Bare-bigram PERSON gate (scrub-4): redact only if the first token is a known given name."""
+    first = match.split()[0].lower()
+    return first in _GIVEN_NAMES
+
+
 # Order matters: most specific / highest-risk first so a secret isn't partially eaten by a weaker rule.
+# Every SECRET-class rule precedes EMAIL/PHONE/CC so a structured secret is consumed WHOLE — never left
+# with only a digit fragment redacted by the phone/CC rule while the rest leaks verbatim (scrub-3).
 _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("SECRET", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)),
     ("SECRET", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),                      # AWS access key id
     ("SECRET", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),                     # GitHub tokens
+    ("SECRET", re.compile(r"\bglpat-[0-9A-Za-z_-]{20,}\b")),                       # GitLab PAT
     ("SECRET", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),                   # Slack tokens
-    ("SECRET", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),                            # generic sk- api keys
+    ("SECRET", re.compile(r"\bsk_(?:live|test)_[0-9A-Za-z]{20,}\b")),             # Stripe secret keys
+    # Anthropic sk-ant-… / OpenAI sk-… / other sk- keys: allow `_`/`-` inside so the hyphenated
+    # Anthropic form is consumed whole (the old [A-Za-z0-9]{20,} stopped at the first `-`).
+    ("SECRET", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),                          # sk- api keys (incl. sk-ant-)
+    ("SECRET", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),                          # Google API key
     ("SECRET", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),  # JWT
     ("SECRET", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*")),                # bare Bearer token
-    # keyword=value secrets. The key name may be embedded ([\w.-]* on both sides) so `aws_secret_access_key`
-    # matches even though `_` is a word char; the value may be quoted (multi-word, kept whole) or a bare
-    # run (excludes placeholder brackets so an already-redacted secret is never re-wrapped).
+    # keyword=value secrets. The key fragment is BOUNDED and the leading word-char run is ANCHORED
+    # (no floating greedy [\w.-]* prefix) so a long base64/hex/word run can't drive O(N^2) backtracking
+    # at every position (scrub-1). The value may be quoted (multi-word, kept whole) or a bare run
+    # (excludes placeholder brackets so an already-redacted secret is never re-wrapped).
     ("SECRET", re.compile(
-        r"(?i)[\w.-]*(?:api[_-]?key|secret|token|password|passwd|pwd)[\w.-]*\s*[:=]\s*"
+        r"(?i)(?<![\w.-])[\w.-]{0,40}?(?:api[_-]?key|secret|token|password|passwd|pwd)[\w.-]{0,40}?\s*[:=]\s*"
         r"(?:\"[^\"]{4,}\"|'[^']{4,}'|[^\s'\"⟦⟧]{6,})")),
+    # Generic high-entropy fallback: a long unbroken (>=32 char) token the named rules above didn't
+    # catch, so a bespoke key never falls through to a weaker PII rule that would redact only a digit
+    # fragment of it (scrub-3). REQUIRES a digit AND a letter (an actual high-entropy mix) and excludes
+    # hyphens, so ordinary long prose — hyphenated compounds, all-letter CamelCase / snake_case
+    # identifiers — is NOT mass-redacted (that over-redaction degraded extraction; the digit+letter
+    # requirement keeps key/base64/hex tokens while sparing words).
+    ("SECRET", re.compile(r"\b(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{32,}\b")),
     ("CREDURL", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@[^\s]+", re.I)),  # creds in URL
     ("EMAIL", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
     ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
@@ -42,11 +91,19 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("IP", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
     ("IP", re.compile(r"\b(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}\b")),
     ("PHONE", re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)[\s.-]?)?\d{3}[\s.-]?\d{3,4}(?!\d)")),
-    # Person heuristic (high only): Title-Case bigrams, optionally preceded by a courtesy title.
+    # Person heuristic (high only): a courtesy title is sufficient; a bare Title-Case bigram is gated
+    # behind the given-name lexicon (_is_personal_name) so concept bigrams survive (scrub-4).
     ("PERSON", re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b")),
-    ("PERSON", re.compile(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b")),
+    ("PERSON", re.compile(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b")),  # gated by _is_personal_name in scrub()
     ("ADDRESS", re.compile(r"\b\d{1,5}\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Dr|Drive)\b")),
 ]
+
+# The bare PERSON bigram pattern is the second-from-last rule; it (and only it) is gated by the
+# lexicon. Bound by position but asserted by pattern so a future reorder/insertion fails LOUDLY here
+# instead of silently gating the wrong rule (e.g. turning off PERSON or mis-gating ADDRESS).
+_BARE_PERSON_RE = _PATTERNS[-2][1]
+assert _BARE_PERSON_RE.pattern == r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", \
+    "PERSON rule order changed — re-bind _BARE_PERSON_RE to the bare Title-Case bigram pattern"
 
 _PLACEHOLDER_RE = re.compile(r"⟦([A-Z]+):(\d+)⟧")
 
@@ -80,12 +137,25 @@ class Scrubber:
         active = self._active()
         new_mapping: dict[str, str] = {}
 
+        # scrub-2: a ⟦CAT:N⟧-shaped substring already present in the SOURCE prose must round-trip
+        # unchanged. Reserve every pre-existing placeholder string as identity-mapped so (a) restore()
+        # never rewrites a literal placeholder in the prose into a redacted value (canon corruption),
+        # and (b) placeholder() below never hands a freshly-allocated ⟦CAT:N⟧ that already occurs in
+        # the input (which restore() would then over-expand).
+        preexisting = {m.group(0) for m in _PLACEHOLDER_RE.finditer(text)}
+        for ph in preexisting:
+            self._mapping.setdefault(ph, ph)
+
         def placeholder(cat: str, value: str) -> str:
             key = (cat, value)
             if key in self._value_to_ph:
                 return self._value_to_ph[key]
-            self._counters[cat] = self._counters.get(cat, 0) + 1
-            ph = f"⟦{cat}:{self._counters[cat]}⟧"
+            # Skip any number already taken by a literal placeholder in the source (scrub-2).
+            while True:
+                self._counters[cat] = self._counters.get(cat, 0) + 1
+                ph = f"⟦{cat}:{self._counters[cat]}⟧"
+                if ph not in preexisting:
+                    break
             self._value_to_ph[key] = ph
             self._mapping[ph] = value
             new_mapping[ph] = value
@@ -104,7 +174,15 @@ class Scrubber:
         for cat, pat in _PATTERNS:
             if cat not in active:
                 continue
-            out = pat.sub(lambda m, c=cat: placeholder(c, m.group(0)), out)
+            if pat is _BARE_PERSON_RE:
+                # scrub-4: only redact a bare Title-Case bigram that looks like an actual personal
+                # name (first token in the given-name lexicon); leave concept bigrams untouched.
+                out = pat.sub(
+                    lambda m: placeholder("PERSON", m.group(0)) if _is_personal_name(m.group(0)) else m.group(0),
+                    out,
+                )
+            else:
+                out = pat.sub(lambda m, c=cat: placeholder(c, m.group(0)), out)
         return out, new_mapping
 
     @staticmethod

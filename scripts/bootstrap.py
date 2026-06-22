@@ -58,6 +58,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import venv
 from pathlib import Path
@@ -159,16 +160,50 @@ def _lock_dir(venv_dir: Path) -> Path:
     return venv_dir.parent / LOCK_NAME
 
 
+def _heartbeat_file(venv_dir: Path) -> Path:
+    return _lock_dir(venv_dir) / "heartbeat"
+
+
+def _lock_age(venv_dir: Path) -> float:
+    """Seconds since the holder last proved it is alive.
+
+    Liveness is judged by the heartbeat file (refreshed by the install loop, see
+    ``heartbeat``), NOT by the lock-dir mtime: a long cold source-build (igraph/leidenalg
+    from sdist) can outlast STALE_LOCK_SECS without ever touching the dir, and stealing a
+    *live* holder's lock lets two installs clobber the same venv. Fall back to the dir
+    mtime when no heartbeat has landed yet (the brief window right after mkdir).
+    """
+    hb = _heartbeat_file(venv_dir)
+    lock = _lock_dir(venv_dir)
+    try:
+        return time.time() - hb.stat().st_mtime
+    except OSError:
+        try:
+            return time.time() - lock.stat().st_mtime
+        except OSError:
+            return 0.0
+
+
+def heartbeat(venv_dir: Path) -> None:
+    """Stamp the lock as alive. Called periodically by the install loop so a slow but
+    healthy build is never mistaken for an abandoned lock and stolen."""
+    hb = _heartbeat_file(venv_dir)
+    try:
+        if hb.exists():
+            os.utime(hb, None)
+        else:
+            hb.write_text(f"pid={os.getpid()} t={time.time():.0f}\n", "utf-8")
+    except OSError:
+        pass
+
+
 def try_acquire(venv_dir: Path) -> bool:
     lock = _lock_dir(venv_dir)
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
         lock.mkdir()
     except FileExistsError:
-        try:
-            age = time.time() - lock.stat().st_mtime
-        except OSError:
-            age = 0.0
+        age = _lock_age(venv_dir)
         if age > STALE_LOCK_SECS:
             # Steal atomically: renaming a directory is atomic, so exactly one racer
             # can move the stale lock aside (the loser finds it already gone and backs
@@ -190,6 +225,7 @@ def try_acquire(venv_dir: Path) -> bool:
         (lock / "info").write_text(f"pid={os.getpid()} t={time.time():.0f}\n", "utf-8")
     except OSError:
         pass
+    heartbeat(venv_dir)  # seed liveness immediately so a just-acquired lock is never stale
     return True
 
 
@@ -272,6 +308,17 @@ def _atomic_write_text(path: Path, text: str) -> None:
             os.unlink(tmp)
 
 
+def _looks_like_our_venv(venv_dir: Path) -> bool:
+    """True when the dir is a venv this provisioner owns/built (so deleting it on failure
+    is safe). We refuse to rmtree an arbitrary pre-existing user dir that --venv /
+    KG_ENGINE_VENV merely points at: a populated, non-venv path must never be clobbered."""
+    return (
+        (venv_dir / "pyvenv.cfg").exists()
+        or (venv_dir / PTR_NAME).exists()
+        or (venv_dir / STAMP_NAME).exists()
+    )
+
+
 def do_install(venv_dir: Path, stamp: str) -> Path:
     if not PYPROJECT.exists():
         raise SystemExit(f"[bootstrap] pyproject.toml not found at {PYPROJECT}")
@@ -279,6 +326,28 @@ def do_install(venv_dir: Path, stamp: str) -> Path:
     if uv:
         print(f"[bootstrap] Found uv at {uv} — using it for a faster install", flush=True)
     venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    # Did this dir already exist (and look like an unrelated user path) before we touched
+    # it? If so, never rmtree it on failure (bootstrap-4: --venv may point at user data).
+    preexisting_foreign = venv_dir.exists() and not _looks_like_our_venv(venv_dir)
+    # Refuse to SCAFFOLD a venv into a populated dir we don't own, BEFORE writing anything — so we
+    # neither delete (handled below) nor pollute user data with pyvenv.cfg/bin/lib. An empty foreign
+    # dir is fine to build into.
+    if preexisting_foreign and any(venv_dir.iterdir()):
+        raise SystemExit(
+            f"[bootstrap] refusing to provision into {venv_dir}: it already exists and is not an "
+            f"engine venv (no pyvenv.cfg / {PTR_NAME} / {STAMP_NAME}). Point --venv / KG_ENGINE_VENV "
+            f"at a dedicated path.")
+
+    # Keep the lock alive across a slow source-build so a concurrent provisioner does not
+    # mistake a healthy long install for an abandoned lock and steal it (bootstrap-1).
+    stop_hb = threading.Event()
+
+    def _pulse() -> None:
+        while not stop_hb.wait(STALE_LOCK_SECS / 4):
+            heartbeat(venv_dir)
+
+    hb_thread = threading.Thread(target=_pulse, daemon=True)
+    hb_thread.start()
     try:
         if uv:
             install_with_uv(venv_dir, uv)
@@ -291,15 +360,22 @@ def do_install(venv_dir: Path, stamp: str) -> Path:
     except BaseException:
         # A failed/interrupted install leaves a venv with an interpreter but a partial
         # dependency graph that the next run would silently "reuse". Remove it so the
-        # next provision rebuilds clean. The lock lives BESIDE the venv (_lock_dir), so
-        # this never deletes the lock this process still holds.
-        shutil.rmtree(venv_dir, ignore_errors=True)
+        # next provision rebuilds clean — but ONLY when it is a venv we own; a --venv /
+        # KG_ENGINE_VENV pointed at a pre-existing populated user dir is left untouched.
+        # The lock lives BESIDE the venv (_lock_dir), so this never deletes the lock this
+        # process still holds.
+        if not preexisting_foreign and _looks_like_our_venv(venv_dir):
+            shutil.rmtree(venv_dir, ignore_errors=True)
         raise
+    finally:
+        stop_hb.set()
+        hb_thread.join(timeout=1.0)
 
     # Single source of truth for the launchers, on every OS. Forward slashes work in
     # Git Bash, PowerShell, and cmd alike, so the recorded path is shell-agnostic.
-    # Pointer first, then stamp (both atomic): a crash between them never leaves a
-    # matching stamp without a usable interpreter pointer.
+    # Pointer first, then stamp (both atomic): the stamp is written STRICTLY LAST, after
+    # verify_imports has succeeded, so the presence of a matching stamp implies a verified
+    # venv (bootstrap-2) and a crash between pointer and stamp never fakes "ready".
     _atomic_write_text(venv_dir / PTR_NAME, py.as_posix())
     _atomic_write_text(venv_dir / STAMP_NAME, stamp)
     print(f"[bootstrap] Engine interpreter: {py.as_posix()}", flush=True)
@@ -455,6 +531,13 @@ def main(argv: list[str] | None = None) -> int:
         help="internal: the detached worker entrypoint",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 0 iff the venv is provisioned and current (matches the stamp), "
+        "non-zero otherwise; prints nothing to stdout. Used by the MCP launcher to "
+        "detect a STALE venv (old interpreter present but deps changed).",
+    )
+    parser.add_argument(
         "--reconcile",
         action="store_true",
         help="run the canon reconcile (§1.8) once the venv is ready",
@@ -468,6 +551,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     venv_dir = resolve_venv_dir(args.venv)
+
+    if args.check:
+        # Freshness probe for the launcher: silent on stdout (it shares stdout with the
+        # JSON-RPC channel), exit code carries the answer. 0 == ready & current.
+        return 0 if is_ready(venv_dir, compute_stamp()) else 1
+
     print(
         f"[bootstrap] System Python: {sys.version.split()[0]} ({sys.executable})",
         flush=True,

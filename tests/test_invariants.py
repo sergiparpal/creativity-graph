@@ -167,3 +167,38 @@ def test_consistent_placeholders_preserve_relation():
 def test_write_payload_pydantic_roundtrip():
     wp = WritePayload.model_validate({"nodes": [], "edges": []})
     assert wp.complete is True
+
+
+def test_paraphrase_is_fabrication(pack):
+    # §1.5: paraphrasing IS fabrication. The source says "A compression grounds the claims beneath
+    # it"; a same-meaning paraphrase in different words must NOT verify (tests-3 — the prior test only
+    # used unrelated text, never an actual paraphrase).
+    res = validate_payload(
+        {"edges": [{"source": "compression", "target": "claim", "relation": "grounds",
+                    "span": "a summary underpins the assertions below it", "authored_by": "agent"}]},
+        pack=pack, source_text=SRC)
+    e = _by_target(res)["claim"]
+    assert e.disposition == Disposition.REJECTED and e.reason == "span-not-in-source"
+
+
+def test_quarantined_and_rejected_never_reach_canon(engine):
+    """End-to-end through the REAL engine boundary: an undeclared-type (QUARANTINED) edge and a
+    fabricated-span (REJECTED) edge must produce NO canon edge, while a legitimately accepted edge in
+    the same payload IS written (tests-2 — the highest-value bypass class, previously only checked at
+    the validate_payload level, never through kg_write + canon)."""
+    from kg_engine.model import edge_id
+    legit = edge_id("degree", "approximates", "importance")
+    undeclared = edge_id("a", "smells_like", "b")
+    fabricated = edge_id("x", "grounds", "y")
+    out = engine.kg_write({"edges": [
+        {"source": "degree", "target": "importance", "relation": "approximates",
+         "span": "Degree approximates importance", "authored_by": "agent"},
+        {"source": "a", "target": "b", "relation": "smells_like",
+         "span": "Heat flows from hot to cold", "authored_by": "agent"},
+        {"source": "x", "target": "y", "relation": "grounds",
+         "span": "unicorns cause gravity", "authored_by": "agent"},
+    ]})
+    assert out["dispositions"]["QUARANTINED"] >= 1 and out["dispositions"]["REJECTED"] >= 1
+    canon_ids = {e.id for e in engine.canon.all_edges()}
+    assert legit in canon_ids                                      # the accepted edge landed
+    assert undeclared not in canon_ids and fabricated not in canon_ids  # the others never reached canon

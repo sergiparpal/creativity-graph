@@ -36,9 +36,35 @@ def test_crash_mid_write_recovers_via_git(canon: Canon, monkeypatch):
     monkeypatch.setattr(canon_mod, "_atomic_write", boom)
     info = canon.write_nodes([Node(id="b", label="B"), Node(id="c", label="C")], message="batch b,c")
 
-    assert info.stashed is True and info.stash_ref  # partial work preserved in a stash
-    assert canon.exists("a") and not canon.exists("b") and not canon.exists("c")  # reset to HEAD
+    assert info.rolled_back is True  # the batch was rolled back (scoped to its own files; no stash)
+    assert canon.exists("a") and not canon.exists("b") and not canon.exists("c")  # batch undone
     assert _git_clean(canon.root)  # vault consistent
+
+
+def test_rollback_preserves_unrelated_uncommitted_work(canon: Canon, monkeypatch):
+    """A failed batch must roll back ONLY its own files — never a repo-wide `git reset --hard HEAD`
+    that would also discard the uncommitted grounding verdicts kg_ground writes via write_one (no
+    commit), or in-progress hand edits (canon-2 / integration-2)."""
+    canon.write_nodes([Node(id="keep", label="Keep", body="original")], message="seed keep")
+    # an UNCOMMITTED change to an unrelated node — exactly what kg_ground does (write_one, no commit)
+    node = canon.read_node("keep")
+    node.body = "grounded-verdict-uncommitted"
+    canon.write_one(node)
+
+    real_write = canon_mod._atomic_write
+
+    def boom(path, text):
+        if path.name == "c.md":
+            raise OSError("simulated crash mid-write")
+        return real_write(path, text)
+
+    monkeypatch.setattr(canon_mod, "_atomic_write", boom)
+    info = canon.write_nodes([Node(id="b", label="B"), Node(id="c", label="C")], message="batch b,c")
+
+    assert info.rolled_back is True
+    assert not canon.exists("b") and not canon.exists("c")  # the failed batch is undone
+    # the unrelated uncommitted work SURVIVES (the old reset --hard HEAD would have reverted it)
+    assert canon.read_node("keep").body == "grounded-verdict-uncommitted"
 
 
 # ---- lease lock ----------------------------------------------------------
