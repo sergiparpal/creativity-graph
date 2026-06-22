@@ -332,7 +332,7 @@ class KGEngine:
         (`bridge|seed|compression|regroup|transplant|ensemble`, or `all`/`default`), and returns ranked
         candidates. **READ-ONLY** — it never writes the canon; `/kg-generate` routes the candidates
         through the propose lane (`kg_propose`). Generate offensively; grounding judges later."""
-        from .generate import load_second_graph, run_generators
+        from .generate import run_generators
         self._ensure_projected()
         G = self.projector.load_graph()
         corpus = self.projector._corpus()
@@ -341,7 +341,7 @@ class KGEngine:
         G2, note = None, ""
         if second_graph:
             try:
-                G2 = load_second_graph(second_graph)
+                G2 = self._second_graph(second_graph)
             except Exception as e:  # noqa: BLE001 — a bad second graph degrades, never crashes
                 note = f"second_graph could not be loaded ({e}); ensemble degraded to regroup"
         if not note and G2 is None and mechanism in ("ensemble", "all"):
@@ -350,6 +350,22 @@ class KGEngine:
                                k=k, second_graph=G2)
         return {"mechanism": mechanism, "k": int(k), "gate_on": gate_on, "count": len(cands),
                 "candidates": [c.to_dict() for c in cands], "note": note}
+
+    def _second_graph(self, path: str):
+        """Load a SECOND construction's graph.json into a NetworkX graph (raises on failure)."""
+        from .generate import load_second_graph
+        return load_second_graph(path)
+
+    def kg_ensemble_graph(self, path: str) -> dict:
+        """Load and summarise a SECOND construction's graph.json (PLAN Stage 7 — the §9/§15 ensemble /
+        perturb path). Confirms a second construction projected before cross-generating against it via
+        kg_generate(mechanism="ensemble", second_graph=<path>). Returns {ok, nodes, edges, path} or
+        {ok: False, error}."""
+        try:
+            G2 = self._second_graph(path)
+        except Exception as e:  # noqa: BLE001 — a missing/bad second graph is a structured error
+            return {"ok": False, "error": str(e), "path": path}
+        return {"ok": True, "path": path, "nodes": G2.number_of_nodes(), "edges": G2.number_of_edges()}
 
     def kg_absorption(self) -> dict:
         """Score the absorption window of grounded-from-hypothesized nodes (§14, PLAN Stage 5): how long

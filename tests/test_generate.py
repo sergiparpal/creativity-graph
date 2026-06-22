@@ -151,6 +151,48 @@ def test_ensemble_degrades_to_regroup_without_second_graph(canon: Canon):
         assert "degraded to regroup" in c.rationale
 
 
+def test_ensemble_with_second_graph_surfaces_cross_construction_bridge(canon: Canon, tmp_path):
+    import json
+
+    import networkx as nx
+
+    from kg_engine.generate import load_second_graph
+    from kg_engine.projector import _node_link_data
+    # our construction: a-b, b-c (so a and c are NON-adjacent here)
+    G = _ranked(canon, [("a", "b"), ("b", "c")])
+    # a SECOND construction where a-c IS adjacent — external structure our dynamics resisted
+    g2 = nx.MultiDiGraph()
+    for n in ("a", "b", "c"):
+        g2.add_node(n, label=n)
+    g2.add_edge("a", "b", key="e1")
+    g2.add_edge("a", "c", key="e2")
+    p = tmp_path / "graph2.json"
+    p.write_text(json.dumps(_node_link_data(g2)))
+    G2 = load_second_graph(str(p))
+    cands = gen.ensemble(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10, second_graph=G2)
+    assert cands
+    _well_formed(cands, "ensemble")
+    assert any({c.source, c.target} == {"a", "c"} for c in cands)   # the cross-construction bridge
+    for c in cands:
+        assert c.section == "§9" and "exo bridge" in c.rationale
+
+
+def test_kg_ensemble_graph_summary_and_missing(engine, tmp_path):
+    import json
+
+    import networkx as nx
+
+    from kg_engine.projector import _node_link_data
+    g = nx.MultiDiGraph()
+    g.add_edge("x", "y", key="e1")
+    p = tmp_path / "g.json"
+    p.write_text(json.dumps(_node_link_data(g)))
+    out = engine.kg_ensemble_graph(str(p))
+    assert out["ok"] and out["nodes"] == 2 and out["edges"] == 1
+    miss = engine.kg_ensemble_graph(str(tmp_path / "nope.json"))
+    assert miss["ok"] is False and "error" in miss
+
+
 # --------------------------------------------------------------------------- invariant 5: failure memory
 
 
