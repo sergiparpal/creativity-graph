@@ -84,3 +84,61 @@ def test_ci_matrix_covers_windows_and_macos():
     matrix = ci["jobs"]["test"]["strategy"]["matrix"]
     declared = set(matrix.get("os", [])) | {row["os"] for row in matrix.get("include", [])}
     assert {"windows-latest", "macos-latest"} <= declared, f"CI is not cross-OS: {declared}"
+
+
+# ---- generative-layer manifests: the new command/agent are discovered and declare only real tools ----
+
+_NS = "mcp__plugin_creativity-graph_creativity-graph__"
+
+
+def _registered_mcp_tools() -> set:
+    """The set of MCP tool basenames the server actually registers (every @mcp.tool() in _register)."""
+    src = (ROOT / "scripts" / "kg_engine" / "server.py").read_text(encoding="utf-8")
+    return set(re.findall(r"@mcp\.tool\(\)\s*\n\s*def\s+(\w+)\s*\(", src))
+
+
+def _frontmatter(path):
+    import yaml
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n", path.read_text(encoding="utf-8"), re.DOTALL)
+    assert m, f"{path} has no YAML frontmatter"
+    return yaml.safe_load(m.group(1))
+
+
+def _declared_mcp_tools(fm) -> set:
+    raw = fm.get("allowed-tools") or fm.get("tools") or ""
+    if isinstance(raw, list):
+        raw = ",".join(raw)
+    return {t.strip()[len(_NS):] for t in raw.split(",") if _NS in t}
+
+
+def test_kg_generate_command_discovered_and_valid():
+    pytest.importorskip("yaml")
+    fm = _frontmatter(ROOT / "commands" / "kg-generate.md")
+    assert fm.get("description")
+    declared = _declared_mcp_tools(fm)
+    assert {"kg_generate", "kg_propose"} <= declared      # the command's core surface
+    assert declared <= _registered_mcp_tools(), f"unknown tools: {declared - _registered_mcp_tools()}"
+
+
+def test_kg_generator_agent_discovered_and_valid():
+    pytest.importorskip("yaml")
+    fm = _frontmatter(ROOT / "agents" / "generator.md")
+    assert fm.get("name") == "kg-generator" and fm.get("description")
+    declared = _declared_mcp_tools(fm)
+    assert {"kg_generate", "kg_propose"} <= declared
+    # the language layer must NOT hold a verdict tool — generation never grounds
+    assert "kg_ground" not in declared
+    assert declared <= _registered_mcp_tools()
+
+
+def test_all_commands_and_agents_declare_only_existing_tools():
+    pytest.importorskip("yaml")
+    valid = _registered_mcp_tools()
+    for path in sorted((ROOT / "commands").glob("*.md")) + sorted((ROOT / "agents").glob("*.md")):
+        declared = _declared_mcp_tools(_frontmatter(path))
+        assert declared <= valid, f"{path.name} declares unknown MCP tools: {declared - valid}"
+
+
+def test_generative_layer_tools_are_registered():
+    valid = _registered_mcp_tools()
+    assert {"kg_propose", "kg_generate", "kg_operate", "kg_absorption"} <= valid

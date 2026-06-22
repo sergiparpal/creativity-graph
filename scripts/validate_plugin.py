@@ -25,8 +25,9 @@ def _grep_version(rel: str, pattern: str, errors: list[str]) -> str | None:
     m = re.search(pattern, p.read_text(encoding="utf-8"), re.M)
     return m.group(1) if m else None
 
-REQUIRED_AGENTS = ["extractor", "grounder", "annotator", "adversarial-grounder", "evaluator"]
-REQUIRED_COMMANDS = ["kg-build", "kg-ground", "kg-query", "kg-eval", "kg-experiment"]
+REQUIRED_AGENTS = ["extractor", "grounder", "annotator", "adversarial-grounder", "evaluator",
+                   "generator"]
+REQUIRED_COMMANDS = ["kg-build", "kg-ground", "kg-query", "kg-eval", "kg-experiment", "kg-generate"]
 
 
 def _load_json(rel: str, errors: list[str]) -> dict | None:
