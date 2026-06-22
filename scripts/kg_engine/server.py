@@ -351,6 +351,34 @@ class KGEngine:
         return {"mechanism": mechanism, "k": int(k), "gate_on": gate_on, "count": len(cands),
                 "candidates": [c.to_dict() for c in cands], "note": note}
 
+    def kg_operate(self, op: str, *, target: str | None = None, label: str = "", body: str = "",
+                   members=None, k: int | None = None) -> dict:
+        """Run one of the four endo operations (§8, PLAN Stage 4), persisting the result through the
+        propose lane. collapse → compression node + collapses_into edges; explode → latent facet
+        children; regroup → §8 re-partition bridges; open → a new primitive + attachment points. The
+        write goes through kg_propose, so it lands hypothesized/unverified with no span — never a
+        verdict, never a forged text anchor."""
+        from . import operations as ops
+        op = (op or "").lower()
+        fn = ops.DISPATCH.get(op)
+        if fn is None:
+            return {"ok": False, "error": f"unknown op {op!r}; expected collapse|explode|regroup|open"}
+        self._ensure_projected()
+        G = self.projector.load_graph()
+        if op == "collapse":
+            payload, info = fn(G, target=target, members=members, label=label, body=body)
+        elif op == "explode":
+            payload, info = fn(G, target=target, k=k, label=label, body=body)
+        elif op == "regroup":
+            payload, info = fn(G, failures=self._failure_ids(), k=k or 10)
+        else:  # open
+            payload, info = fn(G, label=label, body=body, k=k or 2)
+        if not payload or not (payload.get("nodes") or payload.get("edges")):
+            return {"ok": False, "op": op, "error": "no structure to operate on", "info": info}
+        result = self.kg_propose(payload, message=f"kg_operate:{op}")
+        result.update({"ok": True, "op": op, "info": info})
+        return result
+
     # ---- read surface (projects if stale, then reads precomputed ranks)
     def _ensure_projected(self) -> None:
         if not self.projector.db_path.exists() or self.projector.is_stale():
@@ -453,6 +481,14 @@ def _register(mcp, engine: KGEngine) -> None:
         ensemble (§9) — or "all"/"default". READ-ONLY: candidates are proposals (provenance=hypothesized,
         no span); route them through kg_propose. Generate offensively; kg_ground judges later."""
         return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph)
+
+    @mcp.tool()
+    def kg_operate(op: str, target: str = None, label: str = "", body: str = "", k: int = None) -> dict:
+        """The four endo operations (§8) that WRITE hypothesized structure via the propose lane:
+        collapse (cluster→compression node + collapses_into), explode (node→latent facet children),
+        regroup (persist §8 re-partition bridges), open (new primitive + attachment points). Everything
+        lands hypothesized/unverified with no span — never a verdict, never a forged anchor."""
+        return engine.kg_operate(op, target=target, label=label, body=body, k=k)
 
     @mcp.tool()
     def query_graph(node_type: str = None, relation: str = None, epistemic_state: str = None,
