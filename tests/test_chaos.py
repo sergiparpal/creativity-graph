@@ -70,17 +70,20 @@ def test_rollback_preserves_unrelated_uncommitted_work(canon: Canon, monkeypatch
 # ---- lease lock ----------------------------------------------------------
 
 def test_stale_lock_always_reclaimed(tmp_path):
+    import os
     p = tmp_path / ".kg-session-lock"
 
-    # (a) dead pid, fresh heartbeat -> stale (pid not alive)
-    p.write_text(json.dumps({"pid": 2 ** 30, "host": LeaseLock(p).host,
-                             "acquired_at": time.time(), "ttl": 120, "heartbeat_at": time.time()}))
-    lock = LeaseLock(p, ttl=120)
-    assert lock.is_stale() and lock.acquire()
+    # (a) dead pid, fresh heartbeat -> stale (pid not alive). POSIX-only: Windows cannot probe pid
+    # liveness without os.kill(pid, 0) sending a console CTRL_C event, so it relies on the TTL (case b)
+    # rather than pid-death detection.
+    if os.name != "nt":
+        p.write_text(json.dumps({"pid": 2 ** 30, "host": LeaseLock(p).host,
+                                 "acquired_at": time.time(), "ttl": 120, "heartbeat_at": time.time()}))
+        lock = LeaseLock(p, ttl=120)
+        assert lock.is_stale() and lock.acquire()
 
-    # (b) live pid (ours), but expired heartbeat -> stale (ttl exceeded)
-    import os
-    p.write_text(json.dumps({"pid": os.getpid(), "host": lock.host,
+    # (b) expired heartbeat -> stale (ttl exceeded) — the cross-platform staleness signal
+    p.write_text(json.dumps({"pid": os.getpid(), "host": LeaseLock(p).host,
                              "acquired_at": 0, "ttl": 1, "heartbeat_at": time.time() - 999}))
     assert LeaseLock(p, ttl=1).is_stale() and LeaseLock(p, ttl=1).acquire()
 

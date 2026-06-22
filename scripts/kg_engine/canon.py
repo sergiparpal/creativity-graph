@@ -173,6 +173,12 @@ def _pid_probe(pid: int, host: str, my_host: str) -> bool:
         return False
     if host and host != my_host:
         return True
+    if os.name == "nt":
+        # On Windows, os.kill(pid, 0) does NOT probe liveness: signal 0 is CTRL_C_EVENT, which delivers
+        # a console-control event (KeyboardInterrupt) to the target's process group rather than a
+        # no-op existence check — it would interrupt us. Skip the probe and rely on the heartbeat/TTL
+        # for staleness on Windows (a crashed holder's lock is reclaimed once its TTL lapses).
+        return True
     try:
         os.kill(pid, 0)
         return True
