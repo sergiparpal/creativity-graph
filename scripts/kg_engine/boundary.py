@@ -26,6 +26,7 @@ from .model import (
     Provenance,
     UNDECLARED_TYPE,
     VERDICT_STATES,
+    edge_id,
     normalize_text,
 )
 
@@ -163,9 +164,13 @@ def validate_payload(
             node.epistemic_state = EpistemicState.UNVERIFIED
             disp, reason = Disposition.DEMOTED, "forged-verdict-stripped"
         # never-forge-authorship: only the in-process parser is `deterministic` and only a real person
-        # is `human`; a write payload claiming either is an untrusted forge -> demote to `agent`.
+        # is `human`; a write payload claiming either is an untrusted forge -> demote to `agent`. On the
+        # HYPOTHESIZED lane (PLAN Stage 1) there is no span-present check to bypass, so a deterministic
+        # DISCOVERY mechanism may legitimately author a candidate node — preserve `deterministic` and
+        # demote only the (still-forgeable) `human` claim.
         claimed = AuthoredBy(nin.authored_by)
-        if claimed != AuthoredBy.AGENT:
+        is_hypothesized = node.provenance == Provenance.HYPOTHESIZED
+        if claimed == AuthoredBy.HUMAN or (claimed != AuthoredBy.AGENT and not is_hypothesized):
             node.authored_by = AuthoredBy.AGENT
             tag = "human-claim-stripped" if claimed == AuthoredBy.HUMAN else "deterministic-claim-stripped"
             disp = Disposition.DEMOTED
@@ -196,10 +201,15 @@ def validate_payload(
     # the flood baseline counts only LIVE growth: never-pruned failure memory (rejected/failed, §1.7)
     # must not consume the budget and starve legitimate new writes.
     existing_count = sum(1 for e in existing_list if e.epistemic_state not in FAILURE_STATES)
+    # failure-memory ids (PLAN invariant 5 / §13): canonical edge ids that have been refuted
+    # (rejected/failed). A HYPOTHESIZED candidate whose own id — OR its reverse — collides with one is a
+    # claim that collapses into a known failure, and is quarantined on sight so generation can't re-propose
+    # what was already refuted. Failure memory binds generation.
+    failure_ids = {e.id for e in existing_list if e.epistemic_state in FAILURE_STATES}
     written = 0
     norm_source = normalize_text(source_text)  # normalize the source ONCE, not per edge
     for ein in wp.edges:
-        r = _validate_edge(ein, edge_types, norm_source, restore, seen)
+        r = _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids)
         # rate limit: once the canon-wide writable-edge budget is exhausted, reject the overflow as a
         # flood rather than letting it grow the graph unbounded (§Stage 9). Only NET-NEW edges are
         # charged: a deduped edge (already in the canon or repeated in this payload) grows the canon by
@@ -229,7 +239,7 @@ def _slug_label(label: str) -> str:
     return slug(label)
 
 
-def _validate_edge(ein, edge_types, norm_source, restore, seen) -> ValidationResult:
+def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids) -> ValidationResult:
     edge = Edge(
         source=ein.source, target=ein.target, relation=ein.relation,
         provenance=ein.provenance, authored_by=ein.authored_by,
@@ -238,6 +248,7 @@ def _validate_edge(ein, edge_types, norm_source, restore, seen) -> ValidationRes
     )
     ident = edge.id  # the canonical (slugged) identity used by dedup, the canon merge, and disk
     disp, reason = Disposition.ACCEPTED, ""
+    is_hypothesized = edge.provenance == Provenance.HYPOTHESIZED
 
     # clamp the confidence hint into [0,1]; drop NaN/inf so it can't poison downstream calibration
     if edge.confidence_score is not None:
@@ -245,43 +256,58 @@ def _validate_edge(ein, edge_types, norm_source, restore, seen) -> ValidationRes
                                  if math.isfinite(edge.confidence_score) else None)
 
     # never-forge-a-state (semantic, not retryable): only `unverified` may be asserted by a write;
-    # grounded/rejected/failed/obsolete flow ONLY through kg_ground.
+    # grounded/rejected/failed/obsolete flow ONLY through kg_ground. This binds EVERY lane — a
+    # hypothesized candidate that arrives with a verdict is demoted exactly like a text claim (PLAN
+    # Stage 1, never-forge-a-verdict), so promotion still flows only through kg_ground.
     if EpistemicState(ein.epistemic_state) != EpistemicState.UNVERIFIED:
         edge.epistemic_state = EpistemicState.UNVERIFIED
         disp, reason = Disposition.DEMOTED, "forged-verdict-stripped"
-    # never-forge-authorship (§1.5 anti-bypass): an extractor that self-declares `deterministic` would
-    # otherwise skip span-present entirely. Only the in-process parser is deterministic; a payload
-    # claiming `deterministic` (or `human`) is an untrusted forge -> demote to `agent`, which then
-    # requires a verifying span like any other agent edge.
+    # never-forge-authorship. On the span-present/inferred lane an extractor that self-declares
+    # `deterministic` would otherwise skip span-present (§1.5 anti-bypass) — only the in-process parser
+    # is deterministic, so demote `deterministic`/`human` -> `agent`. On the HYPOTHESIZED lane there is
+    # no span-present check to bypass, so a deterministic DISCOVERY mechanism may legitimately author a
+    # candidate — preserve `deterministic` and demote only the (still-forgeable) `human` claim.
     claimed = AuthoredBy(ein.authored_by)
-    if claimed != AuthoredBy.AGENT:
+    if claimed == AuthoredBy.HUMAN or (claimed != AuthoredBy.AGENT and not is_hypothesized):
         edge.authored_by = AuthoredBy.AGENT
         tag = "human-claim-stripped" if claimed == AuthoredBy.HUMAN else "deterministic-claim-stripped"
         disp = Disposition.DEMOTED
         reason = (reason + ";" if reason else "") + tag
 
-    # span-present enforcement (§1.5). Every edge reaching this boundary is `agent`: the authorship
-    # demotion above strips any `deterministic`/`human` claim (only the in-process parser is truly
-    # deterministic, and it writes without transiting this boundary). So there is no deterministic
-    # bypass branch here — every edge must cite a verifying span.
-    if not edge.span or not edge.span.strip():
-        return _ok("edge", edge, Disposition.REJECTED, "no-supporting-span", False, ident)
-    check_span = restore(edge.span) if restore else edge.span
-    ns = normalize_text(check_span)
-    if not ns or ns not in norm_source:  # span-present (§1.5), against the pre-normalized source
-        return _ok("edge", edge, Disposition.REJECTED, "span-not-in-source", False, ident)
-    # reject a degenerate anchor (a 1-char span is in almost any prose): require a meaningful floor of
-    # real characters so span-present cites something, not just any substring (boundary-5 / §1.5).
-    if len(ns.replace(" ", "")) < MIN_SPAN_CHARS:
-        return _ok("edge", edge, Disposition.REJECTED, "span-too-short", False, ident)
-    # restore protects the egress, not the local canon (§1.9): the canon stores the ORIGINAL
-    # (unscrubbed) span, recovered from the placeholder form the subagent emitted.
-    if restore and check_span != edge.span:
-        edge.span = check_span
-    # a verifying span justifies span-present provenance; if the agent under-claimed (inferred),
-    # leave it; if it claimed span-present we keep it. hypothesized stays hypothesized.
+    if is_hypothesized:
+        # the hypothesized lane (PLAN Stage 1): a discovery-mechanism PROPOSAL, never a text claim, so
+        # it carries NO span. Ignore any span the caller supplied and store it empty (the simpler of the
+        # two documented paths — contract.md §"the propose lane"); the span-present invariant (§1.5)
+        # does not apply here, and there is no fabrication risk because nothing claims textual support.
+        edge.span = ""
+        # invariant 5 (PLAN §13): a candidate that collapses into a known failure — its own identity OR
+        # its reverse already lives in FAILURE_STATES — is rejected on sight. Quarantine it (never merged
+        # into trusted canon) so failure memory binds generation.
+        rev = edge_id(edge.target, edge.relation, edge.source)
+        if ident in failure_ids or rev in failure_ids:
+            return _ok("edge", edge, Disposition.QUARANTINED, "collapses-into-known-failure", False, ident)
+    else:
+        # span-present enforcement (§1.5). Every non-hypothesized edge reaching this boundary is `agent`
+        # (the authorship demotion above strips any `deterministic`/`human` claim), so there is no
+        # deterministic bypass branch — every such edge must cite a verifying span.
+        if not edge.span or not edge.span.strip():
+            return _ok("edge", edge, Disposition.REJECTED, "no-supporting-span", False, ident)
+        check_span = restore(edge.span) if restore else edge.span
+        ns = normalize_text(check_span)
+        if not ns or ns not in norm_source:  # span-present (§1.5), against the pre-normalized source
+            return _ok("edge", edge, Disposition.REJECTED, "span-not-in-source", False, ident)
+        # reject a degenerate anchor (a 1-char span is in almost any prose): require a meaningful floor
+        # of real characters so span-present cites something, not just any substring (boundary-5 / §1.5).
+        if len(ns.replace(" ", "")) < MIN_SPAN_CHARS:
+            return _ok("edge", edge, Disposition.REJECTED, "span-too-short", False, ident)
+        # restore protects the egress, not the local canon (§1.9): the canon stores the ORIGINAL
+        # (unscrubbed) span, recovered from the placeholder form the subagent emitted.
+        if restore and check_span != edge.span:
+            edge.span = check_span
+        # a verifying span justifies span-present provenance; if the agent under-claimed (inferred),
+        # leave it; if it claimed span-present we keep it.
 
-    # undeclared edge type -> quarantine (never silently accepted)
+    # undeclared edge type -> quarantine (never silently accepted) — applies to every lane
     if edge_types is not None and edge.relation not in edge_types:
         disp = Disposition.QUARANTINED
         reason = (reason + ";" if reason else "") + "undeclared-edge-type"

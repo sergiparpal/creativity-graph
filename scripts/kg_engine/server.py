@@ -14,7 +14,7 @@ from pathlib import Path
 from . import __version__
 from .boundary import DEFAULT_MAX_EDGES_PER_KB, merge_results_into_nodes, validate_payload
 from .canon import Canon
-from .model import Disposition, EpistemicState, GROUNDABLE_STATES, Node, slug, utcnow
+from .model import Disposition, EpistemicState, GROUNDABLE_STATES, Node, Provenance, slug, utcnow
 from .pack import load_pack
 from .projector import Projector
 from .reconciler import GROUND_AUDIT, Reconciler
@@ -98,6 +98,47 @@ class KGEngine:
             "rolled_back": bool(info and info.rolled_back),
             "error": (info.error if info and info.rolled_back else None),
         }
+
+    def kg_propose(self, payload: dict, *, message: str = "kg_propose") -> dict:
+        """Write hypothesized candidates through the boundary (PLAN Stage 1: the propose lane).
+
+        A thin, explicit alias over `kg_write` that keeps the two write lanes legible at the call site:
+        every item is forced to `provenance=hypothesized`, and any item that arrives explicitly claiming
+        a text-claim provenance (`span-present`/`inferred`) is REFUSED with reason `propose-lane-text-claim`
+        rather than silently re-lanned — text claims belong on `kg_write`, proposals belong here. The
+        accepted items then transit the SAME boundary (`validate_payload`), so the hypothesized-lane rules
+        (no span required, forged verdicts demoted, failure-collapse quarantined, pack vocabulary enforced)
+        apply uniformly."""
+        payload = dict(payload or {})
+        refused: list[dict] = []
+
+        def _lane(items, kind):
+            kept = []
+            for it in (items or []):
+                it = dict(it or {})
+                prov = it.get("provenance")
+                if prov in (Provenance.SPAN_PRESENT.value, Provenance.INFERRED.value):
+                    refused.append({"kind": kind,
+                                    "id": it.get("id") or it.get("source") or it.get("label"),
+                                    "disposition": Disposition.REJECTED.value,
+                                    "reason": "propose-lane-text-claim", "retryable": False})
+                else:
+                    it["provenance"] = Provenance.HYPOTHESIZED.value  # force the lane
+                    kept.append(it)
+            return kept
+
+        clean = {"nodes": _lane(payload.get("nodes"), "node"),
+                 "edges": _lane(payload.get("edges"), "edge")}
+        if "complete" in payload:
+            clean["complete"] = payload["complete"]
+        out = self.kg_write(clean, message=message)
+        # fold the call-site refusals into the same response shape kg_write returns
+        out["details"] = refused + out["details"]
+        out["dispositions"][Disposition.REJECTED.value] = (
+            out["dispositions"].get(Disposition.REJECTED.value, 0) + len(refused))
+        out["propose_lane"] = True
+        out["refused_text_claims"] = len(refused)
+        return out
 
     def kg_ground(self, target_id: str, verdict: str, *, by: str = "agent", kind: str = "edge",
                   note: str = "") -> dict:
@@ -345,6 +386,14 @@ def _register(mcp, engine: KGEngine) -> None:
     def kg_write(payload: dict) -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted nodes & edges."""
         return engine.kg_write(payload)
+
+    @mcp.tool()
+    def kg_propose(payload: dict) -> dict:
+        """Propose hypothesized candidates (PLAN Stage 1: the propose lane). Forces every item to
+        provenance=hypothesized (a discovery-mechanism proposal, no span needed) and REFUSES any
+        span-present/inferred text claim with reason `propose-lane-text-claim` — text claims belong on
+        kg_write. Candidates land `unverified`; only kg_ground (with support) can ever promote them."""
+        return engine.kg_propose(payload)
 
     @mcp.tool()
     def kg_ground(target_id: str, verdict: str, kind: str = "edge", note: str = "") -> dict:

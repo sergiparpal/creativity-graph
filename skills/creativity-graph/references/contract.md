@@ -13,9 +13,10 @@ Before extraction, the §1.9 **egress scrub** `mcp__plugin_creativity-graph_crea
 **consistent** placeholders (`⟦SECRET:1⟧` etc.) so relational structure survives, then hands the scrubbed
 text to the subagent. `kg_write` **restores** the placeholder spans to the ORIGINAL text before writing, so
 the boundary stores the restored original span in the canon (the span still verifies against the unscrubbed
-source, §5). For a no-PII source the scrub is a no-op (`redactions=0`). The full tool surface is eleven
-tools: `kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`, `query_graph`, `get_node`,
-`get_neighbors`, `shortest_path`, `kg_context`.
+source, §5). For a no-PII source the scrub is a no-op (`redactions=0`). The full tool surface adds the
+generative layer's tools on top of the original eleven: `kg_ping`, `kg_scrub`, `kg_write`, **`kg_propose`**
+(§5a), `kg_ground`, `kg_rename`, `kg_metrics`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`,
+`kg_context` (plus `kg_generate`, `kg_operate`, `kg_absorption` — see the generative-layer references).
 
 ---
 
@@ -183,6 +184,42 @@ but is "true" only because it is generic/unfalsifiable (the **generality confoun
 rejected via `kg_ground(verdict="rejected")` with reason `vague`. The adversarial grounder records refuted
 claims with `attacked_by` edges + `kg_ground(verdict="failed")`; failed/rejected edges are **negative
 information** (§1.7), never pruned, surfaced by `kg_context` as `falsification_counters`.
+
+---
+
+## 5a. The three provenance lanes & the propose lane (PLAN Stage 1)
+
+`provenance` selects which lane an item travels through the boundary:
+
+| lane | provenance | span | who writes it | boundary behaviour |
+|------|-----------|------|---------------|--------------------|
+| **text claim** | `span-present` | **required**, verbatim | extractor / grounder via `kg_write` | full §5 span-present enforcement |
+| **text claim** | `inferred` | **required**, verbatim | extractor via `kg_write` | full §5 span-present enforcement |
+| **proposal** | `hypothesized` | **none** (ignored, stored empty) | a discovery mechanism via `kg_propose` | no span check; failure-collapse quarantine |
+
+A `hypothesized` item is a **proposal from a discovery mechanism** (a structural/embedding adjacency), never
+a text claim. The boundary accepts it **without a span**: any `span` supplied is ignored and stored empty (the
+simpler of the two documented paths — there is no `hypothesized-with-span` rejection). Every other guarantee
+still binds the lane:
+
+- **never-forge-a-verdict** — a hypothesized item arriving with any non-`unverified` `epistemic_state` is
+  `DEMOTED` (`forged-verdict-stripped`), exactly like a text claim. Promotion flows ONLY through `kg_ground`.
+- **authorship** — the hypothesized lane has no span-present check to bypass, so a deterministic *discovery
+  mechanism* may legitimately author a candidate: `authored_by=deterministic` is **preserved** here (it is
+  demoted on the text-claim lanes). `authored_by=human` is still forgeable and is demoted to `agent`.
+- **pack vocabulary** — an off-pack `relation`/`node_type` still `QUARANTINED/undeclared-*-type`.
+- **failure memory binds generation (invariant 5, §13)** — a hypothesized edge whose canonical identity
+  **or its reverse** already lives in `FAILURE_STATES` (`rejected`/`failed`) is `QUARANTINED` with reason
+  `collapses-into-known-failure`: a claim that collapses into a known failure is rejected on sight, never
+  merged into trusted canon.
+
+`mcp__plugin_creativity-graph_creativity-graph__kg_propose(payload)` is a thin, explicit alias over `kg_write`
+that keeps the lanes legible at the call site: it forces every item to `provenance=hypothesized`, and any item
+that arrives **explicitly** claiming `span-present`/`inferred` is REFUSED with reason `propose-lane-text-claim`
+(text claims belong on `kg_write`). The accepted items then transit the SAME `validate_payload`, so the rules
+above apply uniformly. The return adds `{propose_lane: true, refused_text_claims: N}` to the `kg_write` shape.
+**Generate offensively; judge defensively (PLAN §1.2):** `kg_propose` never gates on a quality metric — every
+candidate is written `hypothesized/unverified`; the grounding loop is the post-hoc filter.
 
 ---
 
