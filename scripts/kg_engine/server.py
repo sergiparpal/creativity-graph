@@ -351,6 +351,37 @@ class KGEngine:
         return {"mechanism": mechanism, "k": int(k), "gate_on": gate_on, "count": len(cands),
                 "candidates": [c.to_dict() for c in cands], "note": note}
 
+    def kg_absorption(self) -> dict:
+        """Score the absorption window of grounded-from-hypothesized nodes (§14, PLAN Stage 5): how long
+        each stayed perturbing before the graph renormalised. Reads the current derived graph plus the
+        generation timeline at `derived/generations.json` — a `{generation: int, tracked: {id:
+        {introduced_at, introduced_degree, mechanism}}}` ledger the /kg-generate command appends to.
+        Returns per-node {half_life, status ∈ fertile|absorbed|isolated} so the slate can prefer the
+        fertile middle. With no ledger yet, returns an empty result with a note (never an error)."""
+        from .harness import absorption
+        self._ensure_projected()
+        try:
+            data = json.loads(self.projector.graph_path.read_text()) if self.projector.graph_path.exists() \
+                else {"nodes": [], "links": []}
+        except (ValueError, OSError):
+            data = {"nodes": [], "links": []}
+        hist_path = self.projector.derived / "generations.json"
+        history, now = {}, None
+        if hist_path.exists():
+            try:
+                blob = json.loads(hist_path.read_text())
+                if isinstance(blob, dict):
+                    history = blob.get("tracked", {}) if "tracked" in blob else blob
+                    now = blob.get("generation")
+            except (ValueError, OSError):
+                history = {}
+        result = absorption(data, history, now=now)
+        summary = {s: sum(1 for v in result.values() if v["status"] == s)
+                   for s in ("fertile", "absorbed", "isolated")}
+        return {"tracked": len(result), "summary": summary, "nodes": result,
+                "note": ("" if history else
+                         "no generations.json yet — run /kg-generate to start tracking the absorption window")}
+
     def kg_operate(self, op: str, *, target: str | None = None, label: str = "", body: str = "",
                    members=None, k: int | None = None) -> dict:
         """Run one of the four endo operations (§8, PLAN Stage 4), persisting the result through the
@@ -481,6 +512,13 @@ def _register(mcp, engine: KGEngine) -> None:
         ensemble (§9) — or "all"/"default". READ-ONLY: candidates are proposals (provenance=hypothesized,
         no span); route them through kg_propose. Generate offensively; kg_ground judges later."""
         return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph)
+
+    @mcp.tool()
+    def kg_absorption() -> dict:
+        """Absorption window (§14): for each grounded-from-hypothesized node, how long it stayed
+        perturbing before the graph renormalised — {half_life, status ∈ fertile|absorbed|isolated}.
+        Reads derived/generations.json (written by /kg-generate). Prefer the fertile middle."""
+        return engine.kg_absorption()
 
     @mcp.tool()
     def kg_operate(op: str, target: str = None, label: str = "", body: str = "", k: int = None) -> dict:

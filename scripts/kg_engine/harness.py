@@ -135,6 +135,47 @@ def specificity(graph_data: dict, corpus: list[str]) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- absorption window (§14)
+
+
+def absorption(graph_data: dict, history: dict, *, now=None, absorb_growth: int = 3) -> dict:
+    """Score how long each grounded-from-hypothesized node stays *perturbing* before the graph
+    renormalises around it (§14 — novelty has a half-life). PLAN Stage 5.
+
+    `history` maps a tracked node id -> {introduced_at, introduced_degree}; `graph_data` is the CURRENT
+    derived graph (node-link). For each tracked node we read two signals:
+      - **decay**: how fast its neighbourhood densified after introduction. Fast densification ⇒ the
+        graph absorbed it quickly ⇒ low remaining novelty (short half-life).
+      - **isolation**: whether it stayed disconnected ⇒ infertile.
+    Returns per-node {half_life, status ∈ fertile|absorbed|isolated, ...}. The fertile middle is the
+    productive zone: neither trivially absorbed nor isolated.
+    """
+    from .projector import node_link_graph
+
+    G = node_link_graph(graph_data).to_undirected()
+    deg = dict(G.degree())
+    if now is None:
+        ats = [int(r.get("introduced_at", 0)) for r in history.values()]
+        now = (max(ats) + 1) if ats else 1
+    out: dict = {}
+    for nid, rec in history.items():
+        d0 = int(rec.get("introduced_degree", 0))
+        d1 = int(deg.get(nid, 0))
+        t = max(1, int(now) - int(rec.get("introduced_at", 0)))
+        growth = max(0, d1 - d0)
+        rate = growth / t
+        if d1 <= 0:
+            status, half_life = "isolated", float("inf")        # stayed disconnected — infertile
+        elif growth >= absorb_growth:
+            status, half_life = "absorbed", round(t / growth, 3)  # densified fast — renormalised, trivial now
+        else:
+            status = "fertile"                                  # the productive middle
+            half_life = round(t / growth, 3) if growth > 0 else float("inf")
+        out[nid] = {"half_life": half_life, "status": status, "introduced_degree": d0,
+                    "current_degree": d1, "densification": growth, "densification_rate": round(rate, 3)}
+    return out
+
+
 # --------------------------------------------------------------------------- ideation scoring
 
 _SENT = re.compile(r"[.!?]+\s+")

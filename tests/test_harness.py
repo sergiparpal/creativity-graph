@@ -11,6 +11,7 @@ from kg_engine.harness import (
     _key_terms,
     _node_specificity,
     _score_condition,
+    absorption,
     agreement,
     idf_seeds,
     ideation,
@@ -121,6 +122,36 @@ def test_short_alpha_labels_reflect_rarity():
     # a short-label node reflects its term's specificity, not the undifferentiated default
     assert _node_specificity("ML", seeds, default) == seeds["ml"]
     assert _node_specificity("AI", seeds, default) != _node_specificity("ML", seeds, default)
+
+
+# --------------------------------------------------------------------------- absorption window (§14)
+
+
+def test_absorption_flags_absorbed_isolated_and_fertile():
+    # current graph: A rapidly densified (degree 8), B stayed disconnected (0), C modest (degree 2)
+    gdata = {"directed": True,
+             "nodes": [{"id": x} for x in ["A", "B", "C", "c1", "c2"] + [f"x{i}" for i in range(8)]],
+             "links": ([{"source": "A", "target": f"x{i}"} for i in range(8)]
+                       + [{"source": "C", "target": "c1"}, {"source": "C", "target": "c2"}])}
+    history = {"A": {"introduced_at": 0, "introduced_degree": 1},
+               "B": {"introduced_at": 0, "introduced_degree": 0},
+               "C": {"introduced_at": 0, "introduced_degree": 1}}
+    res = absorption(gdata, history, now=5)
+    assert res["A"]["status"] == "absorbed"   # densified fast -> renormalised, trivial now
+    assert res["B"]["status"] == "isolated"   # never connected -> infertile
+    assert res["C"]["status"] == "fertile"    # the productive middle
+    # novelty half-life: the rapidly-absorbed node decays faster than the fertile one
+    assert res["A"]["half_life"] < res["C"]["half_life"]
+
+
+def test_absorption_empty_history_is_safe():
+    assert absorption({"nodes": [], "links": []}, {}) == {}
+
+
+def test_kg_absorption_tool_no_history(engine):
+    out = engine.kg_absorption()
+    assert out["tracked"] == 0 and "generations.json" in out["note"]
+    assert set(out["summary"]) == {"fertile", "absorbed", "isolated"}
 
 
 # --------------------------------------------------------------------------- harness-f4-2
