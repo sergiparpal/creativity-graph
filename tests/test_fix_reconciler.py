@@ -6,11 +6,10 @@ non-canonical-filename on-disk neutralization (F3) at the Reconciler level.
 from __future__ import annotations
 
 import json
-import os
 
 from kg_engine.canon import _atomic_write
 from kg_engine.model import Edge, EpistemicState, Node, edge_id, node_to_markdown
-from kg_engine.reconciler import Reconciler, _same_file
+from kg_engine.reconciler import Reconciler
 
 
 def _state_path(recon: Reconciler):
@@ -88,40 +87,32 @@ def test_non_canonical_filename_correction_lands_canonically(canon):
     assert len(edges2) == 1 and edges2[0].epistemic_state == EpistemicState.UNVERIFIED
 
 
-def test_same_file_helper_detects_inode_collision(tmp_path):
-    """Cross-platform crux of the non-canonical correction: `_same_file` must report two path strings
-    that share one inode (a case-insensitive-FS collision, e.g. foo.md vs Foo.md on macOS/Windows) as
-    the SAME file, distinct files as different, and a missing path as not-same (never raising)."""
-    a = tmp_path / "foo.md"
-    a.write_text("x", encoding="utf-8")
-    link = tmp_path / "alias.md"
-    os.link(a, link)                                      # same inode, two names — the collision case
-    assert _same_file(a, link) is True
-    other = tmp_path / "bar.md"
-    other.write_text("y", encoding="utf-8")
-    assert _same_file(a, other) is False                 # genuinely distinct files
-    assert _same_file(a, tmp_path / "missing.md") is False  # one side absent -> not same, no raise
-
-
-def test_noncanonical_collision_preserves_canonical_note(canon, monkeypatch):
-    """Regression (macOS/Windows, CI-red on case-insensitive filesystems): when the non-canonical read
-    path (Foo.md) and the canonical slug path (foo.md) are the SAME physical file, the reconciler wrote
-    the correction in place and must NOT then unlink the 'original' — doing so deletes the just-written
-    canonical note, and the next stat raises FileNotFoundError. We force `_same_file` True to drive the
-    collision branch on a case-sensitive CI host too."""
-    import kg_engine.reconciler as kgrec
-    monkeypatch.setattr(kgrec, "_same_file", lambda a, b: True)
-
+def test_noncanonical_correction_unlinks_original_before_writing(canon, monkeypatch):
+    """Regression for the macOS/Windows CI failure (case-insensitive filesystems): a non-canonically
+    named note (Foo.md for id 'Foo', slug foo.md) must have its original UNLINKED BEFORE the canonical
+    write. There Foo.md and foo.md are one file, so the old write-then-unlink deleted the just-written
+    note (FileNotFoundError) and a case-preserving replace kept the stale 'Foo.md' name; unlink-first
+    lets write_one create a fresh, correctly-cased foo.md. We assert the ordering directly so a
+    case-sensitive CI host (Linux) guards it too."""
     forged = Edge(source="Foo", target="bar", relation="grounds", span="x",
                   epistemic_state=EpistemicState.GROUNDED)
     node = Node(id="Foo", label="Foo", edges=[forged])
-    (canon.notes_dir / "Foo.md").write_text(node_to_markdown(node), encoding="utf-8")
+    original = canon.notes_dir / "Foo.md"
+    original.write_text(node_to_markdown(node), encoding="utf-8")
 
-    report = Reconciler(canon).scan(full_sweep=True)      # must NOT raise on the canonical stat
+    seen = {}
+    real_write_one = canon.write_one
+    def spy_write_one(n, *a, **k):
+        seen["original_present_at_write"] = original.exists()
+        return real_write_one(n, *a, **k)
+    monkeypatch.setattr(canon, "write_one", spy_write_one)
+
+    report = Reconciler(canon).scan(full_sweep=True)
     assert forged.id in report.requarantined
-
-    # the canonical note survived (was not unlinked) and carries the edge reset to UNVERIFIED
-    assert canon.node_path("Foo").exists()
-    corrected = [e for e in canon.all_edges()
-                 if e.id == forged.id and e.epistemic_state == EpistemicState.UNVERIFIED]
-    assert corrected, "canonical note must hold the edge reset to UNVERIFIED, not be deleted"
+    # the non-canonical original was removed BEFORE the canonical write (the ordering that is correct on
+    # a case-insensitive filesystem) — the old write-first code would have it still present here.
+    assert seen.get("original_present_at_write") is False
+    # and the end state is the canonical single note with the edge reset to UNVERIFIED
+    assert [p.name for p in canon.note_paths()] == [canon.node_path("Foo").name]
+    edges = [e for e in canon.all_edges() if e.id == forged.id]
+    assert len(edges) == 1 and edges[0].epistemic_state == EpistemicState.UNVERIFIED

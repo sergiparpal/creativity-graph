@@ -25,17 +25,6 @@ def _sha256(p: Path) -> str:
     return h.hexdigest()
 
 
-def _same_file(a: Path, b: Path) -> bool:
-    """True iff `a` and `b` name the SAME physical file (one inode). On a case-insensitive filesystem
-    (macOS/Windows) a canonical slug path (``foo.md``) and a non-canonical hand-named note (``Foo.md``)
-    are the same file, so a path-string comparison wrongly reports them as distinct. Used so the
-    reconciler never unlinks the canonical note it just rewrote."""
-    try:
-        return a.samefile(b)
-    except OSError:  # one of the two does not exist -> not the same file
-        return False
-
-
 @dataclass
 class ReconcileReport:
     scanned: int = 0
@@ -196,25 +185,26 @@ class Reconciler:
             if mutated:
                 # write_one persists to the CANONICAL slug path (node_path(node.id)). When the note we
                 # actually read lives at a NON-canonical filename (e.g. hand-created Foo.md for id 'Foo',
-                # slug -> foo.md), the correction would otherwise land in a NEW canonical file while the
-                # stale original keeps its forged state — a duplicate edge in two states, and re-statting
-                # the untouched original would re-skip it forever (reconciler-3, self-concealing). So:
-                # write the corrected node canonically, then delete the stale non-canonical original, and
-                # record the canonical file in files_state instead of re-statting the now-deleted `p`.
-                self.canon.write_one(node)
+                # slug -> foo.md), the correction must land canonically with the stale original gone —
+                # else a duplicate edge in two states, and re-statting the untouched original would
+                # re-skip it forever (reconciler-3, self-concealing).
+                #
+                # Detect "non-canonical" by the directory-entry NAME (a case-sensitive string compare),
+                # NOT by resolved path: on a case-insensitive filesystem (macOS/Windows) path resolution
+                # casing is unreliable, but note_paths() yields the real stored name ('Foo.md' vs the slug
+                # 'foo.md'). And remove the original BEFORE writing: there Foo.md and foo.md are the SAME
+                # file, so a write-then-unlink would delete the just-written note, and a case-preserving
+                # replace would keep the stale 'Foo.md' name anyway. Deleting first lets write_one create a
+                # fresh, correctly-cased foo.md; on a case-sensitive FS it just drops the distinct duplicate.
+                # The corrected node is in memory, so a crash in the tiny unlink->write window at worst drops
+                # an already-forged note (re-corrected next sweep), never a grounded one.
                 canonical = self.canon.node_path(node.id)
-                if canonical != p.resolve():
-                    # The note we read sits at a NON-canonical filename; write_one wrote the correction
-                    # to the canonical slug path. Drop the stale original so only the corrected canonical
-                    # note remains — UNLESS, on a case-insensitive filesystem (macOS/Windows), the
-                    # non-canonical path and the canonical path are the SAME physical file: write_one
-                    # overwrote it in place, so unlinking the "original" would delete the just-written
-                    # canonical note (the FileNotFoundError this guard prevents).
-                    if not _same_file(canonical, p):
-                        p.unlink(missing_ok=True)  # genuinely distinct file: drop the duplicate
+                if p.name != canonical.name:
+                    p.unlink(missing_ok=True)  # drop the non-canonical original before the canonical write
                     files_state.pop(rel, None)
                     rel = canonical.name
                     p = canonical
+                self.canon.write_one(node)
                 st = p.stat()
                 digest = _sha256(p)
             keys = [f"node:{node.id}", *(e.id for e in node.edges)]

@@ -15,14 +15,16 @@ JSON back across the MCP boundary.
 ## [Unreleased]
 
 ### Fixed
-- **Cross-platform: reconciler no longer deletes a just-corrected note on case-insensitive filesystems
-  (macOS/Windows).** When a hand-created note used a non-canonical filename (`Foo.md` for id `Foo`, slug
-  `foo.md`), the reconciler wrote the un-forgery correction to the canonical path and then unlinked the
-  "stale original" — but on a case-insensitive filesystem `Foo.md` and `foo.md` are the **same** file, so
-  the unlink removed the file `write_one` had just rewritten and the next `stat` raised `FileNotFoundError`
-  (CI red on the macOS/Windows matrix; Linux unaffected). The unlink is now guarded by an inode-level
-  `_same_file` check, so it fires only for a genuinely distinct file. Regression tests added
-  (`tests/test_fix_reconciler.py`).
+- **Cross-platform: reconciler correction of a non-canonically named note now works on case-insensitive
+  filesystems (macOS/Windows).** When a hand-created note used a non-canonical filename (`Foo.md` for id
+  `Foo`, slug `foo.md`), the reconciler wrote the un-forgery correction to the canonical path and *then*
+  unlinked the "stale original" — but on a case-insensitive filesystem `Foo.md` and `foo.md` are the
+  **same** file, so the unlink removed the file `write_one` had just rewritten (next `stat` →
+  `FileNotFoundError`), and a case-preserving replace kept the stale `Foo.md` name regardless (CI red on the
+  macOS/Windows matrix; Linux, being case-sensitive, unaffected). The reconciler now detects a non-canonical
+  note by directory-entry **name** (not by resolved path, whose casing is unreliable there) and **unlinks the
+  original before** the canonical write, so `write_one` creates a fresh, correctly-cased `foo.md`. Regression
+  test added (`tests/test_fix_reconciler.py`) asserting the unlink-before-write ordering.
 
 ## [0.3.1] — 2026-06-23
 
