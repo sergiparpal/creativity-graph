@@ -65,8 +65,9 @@ same identity updates the existing one, never creates a duplicate. `edge.id` is 
 - `REJECTED`  — hard fail, not written. Cases: no supporting span (`no-supporting-span`); span not found in
   source (`span-not-in-source`, fabrication); degenerate/too-short span (`span-too-short`); truncated/partial payload; schema-invalid.
 
-`retryable=false` for **semantic** rejections (no-span, span-not-in-source, vague); `retryable=true` for
-**transport** failures (truncation, schema). Reason string always set.
+`retryable=false` for **semantic** rejections (no-span, span-not-in-source, span-too-short); `retryable=true` for
+**transport** failures (truncation, schema). Reason string always set. (`vague` is *not* a boundary reason —
+it is a grounding verdict reason emitted via `kg_ground`, §1.6.)
 
 ## span-present enforcement (§1.5, the anti-nonsense invariant)
 
@@ -102,7 +103,7 @@ surfaced in `kg_context` as falsification counters.
 leidenalg, with a label-propagation fallback if unavailable). Precomputed ranks: local **degree** (cheap
 advisory) and a labelled **structural-bridge** signal (node whose neighbors span ≥2 Leiden communities,
 §1.4/§1.6). Incremental reproject keyed by a **per-node content hash** of (frontmatter + body): a node
-whose hash changed is re-emitted; staleness (`is_stale`) uses a cheap (file-count + newest-mtime) pre-gate and, when that moves, an
+whose hash changed is re-emitted; staleness (`is_stale`) uses a cheap per-note `(name, size, mtime)` signature pre-gate (digesting *every* note, so an in-place edit of a non-newest note still trips it) and, when that moves, an
 authoritative per-node content-hash comparison, so an uncommitted change — a `kg_ground` verdict, a hand
 edit, or a non-git vault — still reprojects.
 
@@ -112,7 +113,8 @@ edit, or a non-git vault — still reprojects.
   `Edge`; `edge_id(src,rel,tgt)`; `normalize_text(s)`; `span_verifies(span, source_text) -> bool`;
   frontmatter (de)serialization `node_to_markdown`/`node_from_markdown` (+ `Node.frontmatter()`).
 - `boundary`: pydantic `EdgeIn, NodeIn, WritePayload`; `Disposition` result `ValidationResult(disposition, kind, item, reason, retryable, identity)`; `validate_payload(payload, *, pack, source_text, existing) -> list[result]`.
-- `canon`: `Canon(vault_dir)` with `read_node`, `write_nodes(nodes, *, message)` (atomic + git rollback),
+- `canon`: `Canon(vault_dir)` with `read_node`, `write_nodes(nodes, *, message)` (atomic write + scoped
+  in-memory byte-snapshot rollback; the git commit is best-effort, outside the rollback scope),
   `all_nodes`, `all_edges`; `LeaseLock(path, ttl)` with `acquire/heartbeat/release/is_stale`.
 - `reconciler`: `Reconciler(canon, state_path)` with `scan(full_sweep=False) -> ReconcileReport`;
   `reattach_after_reproject(graph_json) -> OrphanReport`.
@@ -121,7 +123,14 @@ edit, or a non-git vault — still reprojects.
 - `projector`: `Projector(canon, derived_dir)` with `project(incremental=True) -> ProjectReport`;
   `kg_context(query=None, budget=2000) -> dict`.
 - `harness`: `agreement(label_sets) -> alpha`; `specificity(graph, corpus) -> verdict`;
-  `ideation(outputs_by_condition) -> table`.
+  `ideation(outputs_by_condition) -> table`; `absorption(graph, history, *, now) -> dict` (§14 window).
+- `generate`: `run_generators(G, mechanism, *, pack, corpus, failures, k, second_graph) -> list[Candidate]`
+  — the six discovery mechanisms `bridge/seed/compression/regroup/transplant/ensemble` (read-only, hypothesized
+  candidates); `load_second_graph(path)` for the §9 ensemble.
+- `operations`: the four §8 endo operations `collapse_payload/explode_payload/regroup_payload/open_payload`
+  (+ `DISPATCH`), each returning a propose-lane payload (`provenance=hypothesized`, no span, no verdict).
+- `backend`: `BackendExtractor` + `main(argv)` — the headless `python -m kg_engine.backend extract` driver
+  (extract → boundary → canon → project) used for an unattended, session-less rebuild.
 - `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 15 tools: `kg_ping`,
   `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_write`,
   `kg_ground`, `kg_rename`, `kg_metrics`, plus the four generative-layer tools `kg_propose`,

@@ -15,7 +15,7 @@ A conceptual document does not verify itself the way code verifies against a par
 (`examples/source.md` §intro). A naive extractor turns such prose into convincing nonsense.
 This plugin extracts a graph, then forces every non-trivial edge to earn its place against the
 *original text* and against adversarial attack. A deterministic Python engine (`scripts/kg_engine`,
-140 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
+264 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
 hand structured JSON back across the MCP boundary. Your job is to orchestrate, not to forge.
 
 ## The model: canon vs derived (§1.2)
@@ -118,7 +118,8 @@ for TRANSPORT failures (truncation, schema). A `kg_write` payload may set `"comp
 
 ## Domain pack
 
-`pack/pack.yaml` declares the vocabulary. Types outside it → `QUARANTINED/undeclared-type`.
+`pack/pack.yaml` declares the vocabulary. Types outside it → `QUARANTINED/undeclared-node-type` (nodes) or
+`QUARANTINED/undeclared-edge-type` (edges).
 - node types: `compression`, `primitive`, `claim`, `metric`, `operation`, `failure`
 - edge types: `grounds`, `attacked_by`, `reconciles_with`, `bridges`, `collapses_into`,
   `confounded_by`, `approximates`, `defends_against`, `projects`, `survives`

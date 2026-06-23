@@ -149,10 +149,14 @@ A `kg_write` payload may **not** assert `grounded`/`rejected`/`failed` (in `epis
 `authored_by=human`. The boundary does not error — it **silently demotes** (DEMOTED, §3), so a forged
 verdict is wasted, not honored.
 
-Verdicts come **only** from `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind, note)` with
-`verdict ∈ {grounded, rejected, failed, obsolete}`, which stamps `verdict_by`/`verdict_at` and appends an
+Verdicts come **only** from
+`mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind, note, support_span, support_note)`
+with `verdict ∈ {grounded, rejected, failed, obsolete}`, which stamps `verdict_by`/`verdict_at` and appends an
 audit record. The reconciler re-quarantines any verdict that appears in canon without a matching audit
-record. **Extractors emit `unverified` only.**
+record. **Extractors emit `unverified` only.** Promoting a **hypothesized** edge to `grounded` *requires*
+support, which upgrades its provenance: `support_span` (a verbatim source substring → `span-present`) or
+`support_note` (an external citation → `inferred`); without either the promotion is refused with
+`hypothesis-needs-support` (§5a).
 
 ---
 
@@ -176,8 +180,12 @@ Verification is always against the ORIGINAL (unscrubbed) source. When the subage
 `kg_scrub`), it emits the placeholder span; `kg_write` restores it to the original via the scrub mapping
 before the substring check, and the canon stores the restored original span.
 
-`authored_by=deterministic` edges are span-present by construction (parser-exact); the boundary forces
-their `provenance=span-present` and skips the substring check. Agents never emit `deterministic`.
+A `kg_write` payload claiming `authored_by=deterministic` does **not** skip span-present: on the text-claim
+lane the boundary **DEMOTES** it to `agent` (`deterministic-claim-stripped`, §3), so the edge then needs a
+verifying span like any agent edge — only the *in-process parser* is truly deterministic, and a parser-exact
+edge never travels through a write payload to begin with. (On the `hypothesized` lane there is no span check
+to bypass, so a deterministic *discovery mechanism* keeps `deterministic`, §5a.) Agents never emit
+`deterministic`.
 
 The grounders apply a further semantic test the boundary cannot: an edge whose span is technically present
 but is "true" only because it is generic/unfalsifiable (the **generality confound**, §1.6) should be

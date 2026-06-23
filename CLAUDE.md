@@ -95,8 +95,10 @@ dispositions — `ACCEPTED` / `DEMOTED` / `QUARANTINED` / `REJECTED` — enforci
 - **rate limit:** net-new writable edges (and nodes) are capped (`max(64, kb·20)`); deduped edges cost zero, so
   idempotent re-runs never trip it.
 
-`canon.py` makes writes crash-safe (atomic temp+replace for single files; git-stash-as-rollback for
-multi-file mutations) and guards the vault with a reclaimable `LeaseLock`.
+`canon.py` makes writes crash-safe (atomic temp+replace for single files; in-memory per-file byte-snapshot
+rollback for multi-file mutations — scoped to only the touched files, identical on git and non-git vaults, so
+an uncommitted grounding verdict is never reverted; the git commit is best-effort and outside the rollback
+scope) and guards the vault with a reclaimable `LeaseLock`.
 
 ### Grounding loop with memory of failures
 Non-deterministic edges start `unverified`. The grounder re-verifies each span and stamps

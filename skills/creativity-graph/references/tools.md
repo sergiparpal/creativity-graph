@@ -11,15 +11,20 @@ field is missing, grep the engine source, don't guess.
 
 A plugin-bundled MCP server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>` — here both the
 plugin and the server are named `creativity-graph`, so every tool is `mcp__plugin_creativity-graph_creativity-graph__<tool>`
-(use this exact form in agent `tools:` / command `allowed-tools:` grants). These eleven are the **only**
-graph tools. There is no `kg_build` / `kg_query` / `kg_project` MCP tool — those are slash
-commands (`/kg-build`, …) that *orchestrate* these tools.
+(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **fifteen** are the **only**
+graph tools — the eleven verify/read tools (§1.1–§1.11) plus the four generative-layer tools (§1.12–§1.15).
+There is no `kg_build` / `kg_query` / `kg_project` MCP tool — those are slash commands (`/kg-build`, …) that
+*orchestrate* these tools.
 
-Mutation tools (`kg_write`, `kg_ground`, `kg_rename`) write the **canon** (human-editable Markdown, the single
-source of truth). Read tools (`get_node`, `get_neighbors`, `shortest_path`, `query_graph`, `kg_context`) read
-the **derived** layer; they call `_ensure_projected()` first, which reprojects only if `index.sqlite` is
-missing or stale (`built_from_commit != HEAD`). The derived layer contains nothing the canon does not (§1.2)
-and never prunes failure memory (§1.7).
+Mutation tools (`kg_write`, `kg_propose`, `kg_ground`, `kg_rename`) write the **canon** (human-editable Markdown,
+the single source of truth) — `kg_propose` (§1.12) is the hypothesized write lane and `kg_operate` (§1.14) writes
+through it. Read tools (`get_node`, `get_neighbors`, `shortest_path`, `query_graph`, `kg_context`) and the
+generative reads (`kg_generate` §1.13, `kg_absorption` §1.15) read the **derived** layer; they call
+`_ensure_projected()` first, which reprojects only if `index.sqlite`/`graph.json` is missing or
+`projector.is_stale()` — a content-driven check (a cheap per-note `(name, size, mtime)` signature pre-gate,
+then an authoritative per-node content-hash comparison), regardless of git HEAD, so an uncommitted edit
+still reprojects. The derived layer contains nothing the canon does not (§1.2) and never prunes failure
+memory (§1.7).
 
 ### 1.1 `mcp__plugin_creativity-graph_creativity-graph__kg_ping()`
 
@@ -92,7 +97,7 @@ A write may never set a non-`unverified` state or claim parser/human authorship:
 `agent` (`human-claim-stripped`); `deterministic` → `agent` (`deterministic-claim-stripped`, so an
 extractor can't dodge span-present by self-declaring parser authorship). None are accepted as-is.
 
-### 1.4 `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind="edge", note="")`
+### 1.4 `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind="edge", note="", support_span="", support_note="")`
 
 **The ONLY path that may set a verdict** (§1.4/§1.8). Stamps the epistemic_state and appends a `ground.audit`
 record so the reconciler treats the transition as legitimate.
@@ -102,13 +107,20 @@ record so the reconciler treats the transition as legitimate.
 - `kind: str = "edge"` — `edge` or `node`.
 - `note: str = ""` — appended to the edge's `notes` (e.g. the rejection reason `vague` for a generality-confound
   edge that is "true" only because it is generic/unfalsifiable, §1.6).
+- `support_span: str = ""` / `support_note: str = ""` — **promotion support** (Stage 8). To move a
+  `hypothesized` edge to `grounded` you MUST supply one, and it **upgrades the edge's provenance**:
+  `support_span` (a verbatim source substring, span-verified) → `span-present`; `support_note` (an external
+  citation, no span) → `inferred`. Ignored for non-hypothesized edges and for any verdict other than `grounded`.
 
 ```json
 {"ok": true, "key": "e_generality-confound__attacked-by__specificity",
  "from": "unverified", "to": "grounded", "by": "agent"}
 ```
 
+A promoted hypothesis adds `"provenance_upgraded_to": "span-present" | "inferred"` to the success return.
 On failure: `{"ok": false, "error": "invalid verdict 'maybe'"}` / `"node not found"` / `"edge not found"`.
+Promotion-specific refusals: `hypothesis-needs-support` (grounding a `hypothesized` edge with neither
+`support_span` nor `support_note`), `support-span-not-in-source`, `support-span-too-short`.
 For an edge, also sets `verdict_by` (always `agent` via this tool — a human verdict cannot be forged
 through the tool surface) and `verdict_at`. Note: the return `key` for a node verdict is `node:<id>`;
 for an edge it is the edge id.
@@ -165,7 +177,10 @@ capped at `limit`. All filters optional.
 
 Node rows carry precomputed rank columns: `degree`, `community` (Leiden membership, `-1` if none),
 `bridge_communities` (count of distinct communities among neighbours), `structural_bridge` (`1` iff
-`bridge_communities >= 2`). Valid `node_type` filters are the pack's declared types
+`bridge_communities >= 2`). Because the read does `SELECT *`, rows also carry the Stage-2 generative
+columns — `betweenness`, the confound-corrected `spec_betweenness`, per-node `specificity`, and `gate_on`
+— trusted as a ranking signal only when the specificity gate is ON (§1.6); until then they are advisory.
+Valid `node_type` filters are the pack's declared types
 (`compression|primitive|claim|metric|operation|failure`); `relation` filters the declared edge types
 (`grounds|attacked_by|reconciles_with|bridges|collapses_into|confounded_by|approximates|defends_against|projects|survives`).
 
@@ -212,7 +227,9 @@ precomputed off the hot path by the projector). `query` (optional) does a `LIKE`
 `source|target|relation|span`. `budget` (default `2000`) caps approximate tokens (`len(json)//4` per item).
 
 Priority fill order (best context first, until the budget is spent): **grounded edges first**, then
-`span-present` provenance, then `inferred`, then by `confidence_score` DESC.
+`span-present` provenance, then `inferred`, then by `confidence_score` DESC. The grounded `items[]` and the
+hypothesized `hypotheses[]` lanes share **one** running budget (§1.11): hypotheses fill only what the items
+lane left, and `approx_tokens` reports the true total across both.
 
 ```json
 {
@@ -220,6 +237,11 @@ Priority fill order (best context first, until the budget is spent): **grounded 
     {"id": "e_compression__grounds__claim", "source": "compression", "target": "claim",
      "relation": "grounds", "provenance": "span-present", "authored_by": "agent",
      "epistemic_state": "grounded", "span": "...", "confidence": "INFERRED", "confidence_score": 0.82}
+  ],
+  "hypotheses": [
+    {"id": "e_entropy__bridges__time", "source": "entropy", "target": "time", "relation": "bridges",
+     "provenance": "hypothesized", "authored_by": "deterministic", "epistemic_state": "unverified",
+     "span": "", "confidence": "AMBIGUOUS", "confidence_score": 0.5}
   ],
   "approx_tokens": 1840,
   "budget": 2000,
@@ -229,14 +251,26 @@ Priority fill order (best context first, until the budget is spent): **grounded 
     "note": "advisory heuristic, not a guarantee",
     "nodes": [
       {"id": "compression", "label": "Compression", "degree": 6, "bridge_communities": 2}
-    ]
+    ],
+    "bridge_metric": {
+      "gate_on": 0,
+      "ranked_by": "structural_bridge",
+      "note": "gated: spec_betweenness stays advisory; ranking by structural-bridge/degree (§1.6)",
+      "nodes": [
+        {"id": "compression", "label": "Compression", "degree": 6, "betweenness": 0.21,
+         "spec_betweenness": 0.46, "specificity": 2.0}
+      ]
+    }
   }
 }
 ```
 
-- `items[]` — budget-trimmed edge records (note: `source_file` is omitted from context items, unlike
-  `query_graph`/`get_node` edge rows).
-- `approx_tokens` — tokens actually used (`<= budget`).
+- `items[]` — budget-trimmed **grounded/text-claim** edge records (note: `source_file` is omitted from context
+  items, unlike `query_graph`/`get_node` edge rows).
+- `hypotheses[]` — the **SEPARATE** hypothesized lane (Stage 8 query segregation): machine proposals from
+  `/kg-generate`, `provenance=hypothesized`, never mixed into the grounded `items[]`. A hypothesis becomes a
+  fact only after `kg_ground` promotes it with support (§1.4).
+- `approx_tokens` — tokens actually used across **both** lanes (`<= budget`).
 - `falsification_counters.failed_or_rejected_edges` — count of edges in `FAILURE_STATES`
   (`rejected` + `failed`). **Memory of failures (§1.7): surfaced here, never pruned.** A non-zero counter is a
   signal that the graph already knows what was refuted; don't re-propose it.
@@ -245,6 +279,94 @@ Priority fill order (best context first, until the budget is spent): **grounded 
   `degree` DESC. Treat as a hint, not a metric — the specificity-weighted bridge metric is GATED until the
   harness validates it (§1.4/§1.6). A structural bridge that is vague is the generality confound, not a real
   bridge.
+- `advisory.bridge_metric` — the completed bridge metric (Stage 2): `gate_on` (`0`/`1`), `ranked_by`
+  (`spec_betweenness` when the gate is ON, else `structural_bridge`), a `note`, and up to 10 `nodes` carrying
+  **both** `betweenness` and the confound-corrected `spec_betweenness` so a reader sees the correction. Until
+  the harness turns the gate on (`gate_on:1`), the trusted ranking stays the structural-bridge/degree advisory.
+
+---
+
+## 1A · The generative layer (§2–§14)
+
+The four tools below are the *offensive* half (the inversion: **generate offensively, judge defensively**).
+`kg_generate`/`kg_absorption` are read-only structural reads; `kg_propose`/`kg_operate` write through the
+**hypothesized** lane only — they can never set a verdict or forge a text anchor. A candidate becomes grounded
+knowledge solely when `kg_ground` (§1.4) promotes it with support.
+
+### 1.12 `mcp__plugin_creativity-graph_creativity-graph__kg_propose(payload)`
+
+The **hypothesized write lane** (PLAN Stage 1). A thin, explicit alias over `kg_write` that forces every item
+to `provenance=hypothesized` and **REFUSES** any item arriving with a text-claim provenance
+(`span-present`/`inferred`) with reason `propose-lane-text-claim` — text claims belong on `kg_write`. Accepted
+items transit the SAME `validate_payload`, so the hypothesized-lane rules apply (no span required; forged
+verdicts demoted; failure-collapse `QUARANTINED/collapses-into-known-failure`; pack vocabulary enforced;
+`authored_by=deterministic` **preserved** here, `human` demoted to `agent`).
+
+Returns the `kg_write` shape plus two fields:
+
+```json
+{"dispositions": {"ACCEPTED": 2, "DEMOTED": 0, "QUARANTINED": 1, "REJECTED": 1},
+ "details": [ … ], "written_nodes": [ … ], "rolled_back": false, "error": null,
+ "propose_lane": true, "refused_text_claims": 1}
+```
+
+`refused_text_claims` counts the call-site `propose-lane-text-claim` refusals (folded into `details[]` and the
+`REJECTED` count).
+
+### 1.13 `mcp__plugin_creativity-graph_creativity-graph__kg_generate(mechanism="bridge", k=10, second_graph=None)`
+
+The **discovery engine** (PLAN Stage 3). **READ-ONLY** — projects if stale, reads precomputed ranks O(1),
+dispatches to the chosen mechanism, and returns ranked candidates. It never writes; `/kg-generate` routes the
+candidates through `kg_propose`.
+
+- `mechanism` — `bridge` (§2/§4) | `seed` (§3 residual `c − E[c|d]`) | `compression` (§7 dense-cluster MDL) |
+  `regroup` (§8 re-partition bridges) | `transplant` (§5 hub pattern) | `ensemble` (§9 cross two
+  constructions), or `all`/`default`.
+- `k: int = 10` — max candidates returned (ranked).
+- `second_graph: str | None` — path to a second construction's `graph.json` for `ensemble`; without one,
+  `ensemble`/`all` **degrades to `regroup`** and says so in `note` (run `/kg-perturb` to supply one).
+
+```json
+{"mechanism": "bridge", "k": 10, "gate_on": 0, "count": 2, "note": "",
+ "candidates": [
+   {"kind": "edge", "mechanism": "bridge", "source": "entropy", "target": "time", "relation": "bridges",
+    "label": "", "node_type": "", "score": 0.81, "specificity": 2.1,
+    "rationale": "cross-community pair, generality-controlled", "section": "§4"}
+ ]}
+```
+
+Each candidate is a `Candidate` dict: `{kind, mechanism, source, target, relation, label, node_type, score,
+specificity, rationale, section}` (`provenance` is always `hypothesized`, never carried — the propose lane
+forces it).
+
+### 1.14 `mcp__plugin_creativity-graph_creativity-graph__kg_operate(op, target=None, label="", body="", members=None, k=None)`
+
+The **four §8 endo operations** (PLAN Stage 4), each persisting its result **through the propose lane**
+(`kg_propose`), so everything lands `hypothesized`/`unverified` with no span.
+
+- `op` — `collapse` (cluster → a new compression node + `collapses_into` edges; `members` names an explicit
+  member set, else the cluster is inferred from `target`) | `explode` (a node → latent facet children) |
+  `regroup` (persist §8 re-partition bridges) | `open` (a new primitive + attachment points).
+- `target`, `label`, `body`, `members`, `k` — operation-specific (see the docstrings); unused ones are ignored.
+
+Returns the `kg_propose` shape with `{ok: true, op, info}` merged in. On a bad op or nothing to operate on:
+`{"ok": false, "op": "collapse", "error": "no structure to operate on", "info": …}` or
+`{"ok": false, "error": "unknown op 'foo'; expected collapse|explode|regroup|open"}`.
+
+### 1.15 `mcp__plugin_creativity-graph_creativity-graph__kg_absorption()`
+
+The **§14 absorption window** (PLAN Stage 5). For each node grounded *from* a hypothesis, scores how long it
+stayed perturbing before the graph renormalised, so the slate can prefer the fertile middle. Reads the derived
+graph plus the `derived/generations.json` ledger that `/kg-generate` appends to. No args.
+
+```json
+{"tracked": 3, "summary": {"fertile": 1, "absorbed": 1, "isolated": 1},
+ "nodes": {"compression": {"half_life": 2.0, "status": "fertile"}},
+ "note": ""}
+```
+
+`status ∈ fertile | absorbed | isolated`. With no ledger yet, `tracked` is `0` and `note` explains that
+`/kg-generate` has not started tracking the window (never an error).
 
 ---
 
@@ -299,11 +421,11 @@ non-empty + unique). On success prints `PACK OK: domain=… node_types=N edge_ty
 
 ```
 PACK OK: domain='conceptual theory' node_types=6 edge_types=10 glossary=12
-  source_defined_terms: 18
+  source_defined_terms: 10
   glossary_terms: 12
-  source_terms_in_glossary: 9
-  source_coverage: 0.5
-  glossary_grounded_in_source: 0.833
+  source_terms_in_glossary: 10
+  source_coverage: 1.0
+  glossary_grounded_in_source: 1.0
 ```
 
 - `source_coverage` — fraction of the source's *defined terms* (bold/`code`/quoted phrases) present in the
@@ -406,6 +528,10 @@ The `graph` condition "wins" only if it is `>=` control on diversity AND novelty
 | a node's edges (list) | `get_neighbors(id, relation=?)` |
 | connect two nodes | `shortest_path(a, b)` |
 | budgeted, grounding-aware context (+ failures + bridges) | `kg_context(query=?, budget=?)` |
+| propose hypothesized candidates (the offensive lane) | `kg_propose(payload)` |
+| generate structural idea candidates (read-only) | `kg_generate(mechanism=?, k=?, second_graph=?)` |
+| run a §8 endo operation (collapse/explode/regroup/open) | `kg_operate(op, …)` |
+| score the §14 absorption window | `kg_absorption()` |
 | score extraction precision | `f4_probe.py summary|sheet|score` |
 | validate the pack / glossary coverage | `kg_engine.pack validate|coverage` |
 | inter-annotator agreement | `kg_engine.harness agreement` |

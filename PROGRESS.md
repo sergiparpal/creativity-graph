@@ -39,7 +39,7 @@ test (§1.1) — measured, labelled, not shipped as a guarantee.
 - annotation Krippendorff α: **0.000** (degenerate under 11/12 prevalence; signal stays advisory)
 - specificity-metric verdict: **gate OFF** (degree is the honest advisory; specificity-weighted betweenness stays gated)
 - ideation comparison: table above — graph arm most grounded/useful, not most "novel" by the diversity metric
-- test suite: **140 passing** (`pytest tests/ -q`)
+- test suite: **264 passing** (`pytest tests/ -q`)
 
 ## Live validation (installed plugin, fresh vault)
 

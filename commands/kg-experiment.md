@@ -1,13 +1,13 @@
 ---
-description: Stage 8 — blind ideation experiment (control|graph|rag); score with the harness and append the verdict to PROGRESS.md
+description: Stage 8/9 — blind ideation experiment (control|graph|graph+generate|rag); score with the harness and append the verdict to PROGRESS.md
 argument-hint: "[prompts_path]"
 allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_context
 ---
 
 # /kg-experiment — does the graph actually help ideation? (§Stage 8, §4)
 
-This command runs the one experiment that justifies the whole pipeline: a **blind A/B/C** over a fixed
-set of ideation prompts, in three conditions that differ ONLY in what context the idea-generator is given.
+This command runs the one experiment that justifies the whole pipeline: a **blind A/B/C/D** over a fixed
+set of ideation prompts, in four conditions that differ ONLY in what context the idea-generator is given.
 
 - **control** — the prompt alone, no source, no graph.
 - **graph** — the prompt + a `kg_context` pack drawn from the **grounded** knowledge graph (`items[]` only).
@@ -86,14 +86,14 @@ memory-of-failures, canon/projection; see `examples/source.md`):
 
 ---
 
-## Step 2 — generate outputs in three blind conditions (Task → kg-evaluator)
+## Step 2 — generate outputs in four blind conditions (Task → kg-evaluator)
 
 Launch the **kg-evaluator** subagent via the **Task** tool. It owns blinding, context assembly, and idea
 generation; this command never sees which arm is which until the JSON comes back keyed by condition.
 
-`Task(subagent_type: "kg-evaluator", description: "blind ideation A/B/C", prompt: …)` — instruct it to:
+`Task(subagent_type: "kg-evaluator", description: "blind ideation A/B/C/D", prompt: …)` — instruct it to:
 
-1. For **each** of the N prompts, build three context blocks:
+1. For **each** of the N prompts, build four context blocks:
    - **control** → no context.
    - **graph** → the result of `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=<prompt>, budget=2000)`, rendered as
      opaque text — the **grounded** `items[]` only. Carry through the pack's `advisory` (e.g.
@@ -105,7 +105,7 @@ generation; this command never sees which arm is which until the JSON comes back
      AND the generative proposals; it still must not fabricate verdicts or spans.
    - **rag** → a naive flat slice of `examples/source.md`: the top text chunks by keyword overlap with the
      prompt, no graph structure. This is the honest strawman.
-2. Present the three blocks to the generator **without labels** (shuffle; refer to them only as context A/B/C),
+2. Present the four blocks to the generator **without labels** (shuffle; refer to them only as context A/B/C/D),
    generate one idea per (prompt × condition), then **de-shuffle** when emitting JSON.
 3. Emit a single JSON object in EXACTLY the shape `harness ideation` consumes — write it to
    `${CLAUDE_PLUGIN_DATA:-/tmp}/derived/ideation_outputs.json`:
@@ -146,11 +146,13 @@ PYTHONPATH="$SCRIPTS" "$PY" -m kg_engine.harness ideation "$OUT"
 ```json
 {
   "table": {
-    "control": {"n": 12, "diversity": 0.71, "novelty": 0.34, "utility": 0.20, "unsupported_rate": 0.41},
-    "graph":   {"n": 12, "diversity": 0.83, "novelty": 0.52, "utility": 0.60, "unsupported_rate": 0.38},
-    "rag":     {"n": 12, "diversity": 0.69, "novelty": 0.40, "utility": 0.30, "unsupported_rate": 0.55}
+    "control":        {"n": 12, "diversity": 0.71, "novelty": 0.34, "utility": 0.20, "unsupported_rate": 0.41},
+    "graph":          {"n": 12, "diversity": 0.83, "novelty": 0.52, "utility": 0.60, "unsupported_rate": 0.38},
+    "graph+generate": {"n": 12, "diversity": 0.88, "novelty": 0.61, "utility": 0.64, "unsupported_rate": 0.40},
+    "rag":            {"n": 12, "diversity": 0.69, "novelty": 0.40, "utility": 0.30, "unsupported_rate": 0.55}
   },
-  "verdict": "graph condition produced more diverse/novel ideas without more unsupported claims"
+  "verdict": "graph condition produced more diverse/novel ideas without more unsupported claims",
+  "generate_verdict": "graph+generate beat control on diversity/novelty without more unsupported claims"
 }
 ```
 
@@ -162,9 +164,13 @@ What each column means (all in `_score_condition`):
 - **unsupported_rate** — fraction of ≥4-word sentences whose key terms never appear in the source; the
   hallucination guard. **Higher is worse.**
 
-The two **verdict** strings (from `harness.ideation`) are:
+The headline **verdict** strings (from `harness.ideation`, graph-vs-control) are:
 - `"graph condition produced more diverse/novel ideas without more unsupported claims"` → graph wins.
 - `"graph condition did NOT clearly beat control"` → it did not. (Or `"insufficient data"` if a list is empty.)
+
+When the `graph+generate` arm is present, a second **`generate_verdict`** (graph+generate-vs-control) is one of:
+- `"graph+generate beat control on diversity/novelty without more unsupported claims"` → generating helped.
+- `"graph+generate did NOT clearly beat control"` → it did not.
 
 ---
 
@@ -183,10 +189,12 @@ PROGRESS="${CLAUDE_PROJECT_DIR:-.}/PROGRESS.md"
   printf '| condition | n | diversity | novelty | utility | unsupported_rate |\n'
   printf '|-----------|---|-----------|---------|---------|------------------|\n'
   # one row per condition, values pulled from the harness JSON above
-  printf '| control | %s | %s | %s | %s | %s |\n' "$c_n" "$c_div" "$c_nov" "$c_util" "$c_unsup"
-  printf '| graph   | %s | %s | %s | %s | %s |\n' "$g_n" "$g_div" "$g_nov" "$g_util" "$g_unsup"
-  printf '| rag     | %s | %s | %s | %s | %s |\n' "$r_n" "$r_div" "$r_nov" "$r_util" "$r_unsup"
+  printf '| control        | %s | %s | %s | %s | %s |\n' "$c_n"  "$c_div"  "$c_nov"  "$c_util"  "$c_unsup"
+  printf '| graph          | %s | %s | %s | %s | %s |\n' "$g_n"  "$g_div"  "$g_nov"  "$g_util"  "$g_unsup"
+  printf '| graph+generate | %s | %s | %s | %s | %s |\n' "$gg_n" "$gg_div" "$gg_nov" "$gg_util" "$gg_unsup"
+  printf '| rag            | %s | %s | %s | %s | %s |\n' "$r_n"  "$r_div"  "$r_nov"  "$r_util"  "$r_unsup"
   printf '\n**Verdict:** %s\n' "$VERDICT"
+  printf '\n**Generate verdict:** %s\n' "$GEN_VERDICT"
 } >> "$PROGRESS"
 ```
 

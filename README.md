@@ -25,7 +25,7 @@ A prose theory does not verify itself the way code verifies against a parse tree
 everything, edges no one ever checked, confident verdicts no one ever earned. This plugin
 exists to make that failure mode *structurally impossible*.
 
-A deterministic Python engine (`scripts/kg_engine`, 140 tests green) does the work that must be
+A deterministic Python engine (`scripts/kg_engine`, 264 tests green) does the work that must be
 exact — schema validation, span verification, verdict stamping, projection, scrubbing. The
 Claude Code session and its subagents do the **language** work — reading prose, proposing typed
 edges, copying spans, arguing the adversarial case — and hand structured JSON back across an
@@ -177,7 +177,7 @@ creativity-graph/
 │   ├── adversarial-grounder.md    # kg-adversarial-grounder → attacked_by + kg_ground(failed)
 │   ├── generator.md               # kg-generator          → phrase/name candidates → kg_propose
 │   ├── annotator.md               # kg-annotator          → f4_probe labels / α label passes
-│   └── evaluator.md               # kg-evaluator          → blind ideation experiment (control|graph|rag)
+│   └── evaluator.md               # kg-evaluator          → blind ideation experiment (control|graph|graph+generate|rag)
 ├── skills/creativity-graph/       # SKILL.md operating guide + references/
 ├── pack/{pack.yaml,glossary.md}   # the declared vocabulary
 ├── hooks/                         # SessionStart provisioning + PreToolUse context (cross-platform)
@@ -189,7 +189,9 @@ creativity-graph/
 ├── scripts/
 │   ├── kg_engine/                 # the deterministic engine
 │   │   ├── model.py boundary.py canon.py reconciler.py
-│   │   └── projector.py scrub.py pack.py harness.py server.py
+│   │   ├── projector.py scrub.py pack.py harness.py
+│   │   ├── generate.py operations.py   # the generative layer (discovery mechanisms + §8 endo ops)
+│   │   └── backend.py server.py        # headless extract CLI + FastMCP server
 │   ├── bootstrap.py               # cross-platform self-provisioning installer (uv | venv+pip)
 │   ├── launch_server.mjs          # Node MCP launcher (pointer + foreground catch-up)
 │   └── f4_probe.py                # extraction-precision scorer CLI
@@ -261,9 +263,11 @@ precision against the ≥ 0.70 gate. For reliability it produces an *independent
 pass and `kg_engine.harness agreement` returns Krippendorff α against the ≥ 0.67 bar. The
 numbers are recorded, not hand-waved.
 
-### `/kg-experiment [prompts_path]` — is the graph actually useful? (Stage 8)
-A **blind** ideation experiment across three conditions — `control | graph | rag` — scored by
-`kg_engine.harness ideation`. This is where "idea value is a hypothesis under test" becomes a
+### `/kg-experiment [prompts_path]` — is the graph actually useful? (Stage 8/9)
+A **blind** ideation experiment across four conditions — `control | graph | graph+generate | rag` — scored by
+`kg_engine.harness ideation`. The `graph+generate` arm (grounded context **plus** the hypothesized slate from
+`/kg-generate`) tests whether the generative layer lifts ideation beyond grounded context alone; the harness
+emits a second `generate_verdict` for it. This is where "idea value is a hypothesis under test" becomes a
 measurement rather than a slogan.
 
 ---
@@ -290,7 +294,11 @@ commands).
 | `get_node(node_id)` | a node dict with its incident edges. |
 | `get_neighbors(node_id, relation)` | `[edge dicts]`. |
 | `shortest_path(source, target)` | `{path: [node_ids] | null}`. |
-| `kg_context(query, budget)` | budgeted context pack: `{items[], approx_tokens, budget, falsification_counters:{failed_or_rejected_edges}, advisory:{signal:"structural-bridge", note, nodes[]}}`. |
+| `kg_context(query, budget)` | budgeted context pack: `{items[]` (grounded), `hypotheses[]` (the separate hypothesized lane), `approx_tokens, budget, falsification_counters:{failed_or_rejected_edges}, advisory:{signal:"structural-bridge", note, nodes[], bridge_metric}}`. |
+| `kg_propose(payload)` | the **hypothesized** write lane → the `kg_write` shape `+ {propose_lane, refused_text_claims}`; forces `provenance=hypothesized`, refuses text claims. |
+| `kg_generate(mechanism, k, second_graph)` | **read-only** discovery → `{mechanism, k, gate_on, count, candidates[], note}`; `bridge\|seed\|compression\|regroup\|transplant\|ensemble`. |
+| `kg_operate(op, …)` | the four §8 endo ops (`collapse\|explode\|regroup\|open`) — write via the propose lane → the `kg_propose` shape `+ {ok, op, info}`. |
+| `kg_absorption()` | the §14 absorption window → `{tracked, summary, nodes:{id:{half_life, status}}, note}`. |
 
 ### The write payload (Pydantic; extra fields forbidden)
 
@@ -348,7 +356,7 @@ Run from the repo with the engine venv (`/home/sergi/creativity-graph/.venv/bin/
 
 ```bash
 uv sync                                  # provision the engine venv (dev; the plugin runtime uses scripts/bootstrap.py)
-uv run pytest tests/ -q                  # → 140 passed
+uv run pytest tests/ -q                  # → 264 passed
 claude plugin validate --strict          # validate the plugin manifest + components
 ```
 
@@ -363,7 +371,7 @@ python scripts/f4_probe.py score   labels.csv          # PRECISION (gate ≥ 0.7
 # Harness (ground-time / experiment gates) — all emit JSON
 python -m kg_engine.harness agreement   label_sets.json    # Krippendorff α (≥ 0.67 reliable)
 python -m kg_engine.harness specificity derived/graph.json examples/source.md   # bridge-metric gate verdict
-python -m kg_engine.harness ideation    outputs.json       # control|graph|rag scoring
+python -m kg_engine.harness ideation    outputs.json       # control|graph|graph+generate|rag scoring
 ```
 
 `f4_probe` verdict vocabulary (the only labels an annotator may emit):
@@ -374,7 +382,9 @@ python -m kg_engine.harness ideation    outputs.json       # control|graph|rag s
 `model` (enums + `Node`/`Edge` + `span_verifies`) · `boundary` (`validate_payload`) ·
 `canon` (`Canon`, atomic git-backed writes) · `reconciler` (re-attach verdicts, re-quarantine
 forgeries) · `projector` (`project`, `kg_context`) · `scrub` (`Scrubber`) · `pack`
-(`PackContract`, `coverage`) · `harness` (`agreement`/`specificity`/`ideation`) · `server`
+(`PackContract`, `coverage`) · `harness` (`agreement`/`specificity`/`ideation`) ·
+`generate` (`run_generators` — the six discovery mechanisms) · `operations` (the four §8 endo ops) ·
+`backend` (`BackendExtractor` — headless extract) · `server`
 (`KGEngine` + FastMCP tool registration).
 
 ---
