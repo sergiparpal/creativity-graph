@@ -6,10 +6,11 @@ non-canonical-filename on-disk neutralization (F3) at the Reconciler level.
 from __future__ import annotations
 
 import json
+import os
 
 from kg_engine.canon import _atomic_write
 from kg_engine.model import Edge, EpistemicState, Node, edge_id, node_to_markdown
-from kg_engine.reconciler import Reconciler
+from kg_engine.reconciler import Reconciler, _same_file
 
 
 def _state_path(recon: Reconciler):
@@ -85,3 +86,42 @@ def test_non_canonical_filename_correction_lands_canonically(canon):
     assert len(canon.note_paths()) == 1
     edges2 = [e for e in canon.all_edges() if e.id == eid]
     assert len(edges2) == 1 and edges2[0].epistemic_state == EpistemicState.UNVERIFIED
+
+
+def test_same_file_helper_detects_inode_collision(tmp_path):
+    """Cross-platform crux of the non-canonical correction: `_same_file` must report two path strings
+    that share one inode (a case-insensitive-FS collision, e.g. foo.md vs Foo.md on macOS/Windows) as
+    the SAME file, distinct files as different, and a missing path as not-same (never raising)."""
+    a = tmp_path / "foo.md"
+    a.write_text("x", encoding="utf-8")
+    link = tmp_path / "alias.md"
+    os.link(a, link)                                      # same inode, two names — the collision case
+    assert _same_file(a, link) is True
+    other = tmp_path / "bar.md"
+    other.write_text("y", encoding="utf-8")
+    assert _same_file(a, other) is False                 # genuinely distinct files
+    assert _same_file(a, tmp_path / "missing.md") is False  # one side absent -> not same, no raise
+
+
+def test_noncanonical_collision_preserves_canonical_note(canon, monkeypatch):
+    """Regression (macOS/Windows, CI-red on case-insensitive filesystems): when the non-canonical read
+    path (Foo.md) and the canonical slug path (foo.md) are the SAME physical file, the reconciler wrote
+    the correction in place and must NOT then unlink the 'original' — doing so deletes the just-written
+    canonical note, and the next stat raises FileNotFoundError. We force `_same_file` True to drive the
+    collision branch on a case-sensitive CI host too."""
+    import kg_engine.reconciler as kgrec
+    monkeypatch.setattr(kgrec, "_same_file", lambda a, b: True)
+
+    forged = Edge(source="Foo", target="bar", relation="grounds", span="x",
+                  epistemic_state=EpistemicState.GROUNDED)
+    node = Node(id="Foo", label="Foo", edges=[forged])
+    (canon.notes_dir / "Foo.md").write_text(node_to_markdown(node), encoding="utf-8")
+
+    report = Reconciler(canon).scan(full_sweep=True)      # must NOT raise on the canonical stat
+    assert forged.id in report.requarantined
+
+    # the canonical note survived (was not unlinked) and carries the edge reset to UNVERIFIED
+    assert canon.node_path("Foo").exists()
+    corrected = [e for e in canon.all_edges()
+                 if e.id == forged.id and e.epistemic_state == EpistemicState.UNVERIFIED]
+    assert corrected, "canonical note must hold the edge reset to UNVERIFIED, not be deleted"

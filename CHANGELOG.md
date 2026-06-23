@@ -14,6 +14,16 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+### Fixed
+- **Cross-platform: reconciler no longer deletes a just-corrected note on case-insensitive filesystems
+  (macOS/Windows).** When a hand-created note used a non-canonical filename (`Foo.md` for id `Foo`, slug
+  `foo.md`), the reconciler wrote the un-forgery correction to the canonical path and then unlinked the
+  "stale original" — but on a case-insensitive filesystem `Foo.md` and `foo.md` are the **same** file, so
+  the unlink removed the file `write_one` had just rewritten and the next `stat` raised `FileNotFoundError`
+  (CI red on the macOS/Windows matrix; Linux unaffected). The unlink is now guarded by an inode-level
+  `_same_file` check, so it fires only for a genuinely distinct file. Regression tests added
+  (`tests/test_fix_reconciler.py`).
+
 ## [0.3.1] — 2026-06-23
 
 ### Fixed — exhaustive review hardening

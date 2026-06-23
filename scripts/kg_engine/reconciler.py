@@ -25,6 +25,17 @@ def _sha256(p: Path) -> str:
     return h.hexdigest()
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """True iff `a` and `b` name the SAME physical file (one inode). On a case-insensitive filesystem
+    (macOS/Windows) a canonical slug path (``foo.md``) and a non-canonical hand-named note (``Foo.md``)
+    are the same file, so a path-string comparison wrongly reports them as distinct. Used so the
+    reconciler never unlinks the canonical note it just rewrote."""
+    try:
+        return a.samefile(b)
+    except OSError:  # one of the two does not exist -> not the same file
+        return False
+
+
 @dataclass
 class ReconcileReport:
     scanned: int = 0
@@ -193,7 +204,14 @@ class Reconciler:
                 self.canon.write_one(node)
                 canonical = self.canon.node_path(node.id)
                 if canonical != p.resolve():
-                    p.unlink(missing_ok=True)  # drop the duplicate; only the corrected canonical remains
+                    # The note we read sits at a NON-canonical filename; write_one wrote the correction
+                    # to the canonical slug path. Drop the stale original so only the corrected canonical
+                    # note remains — UNLESS, on a case-insensitive filesystem (macOS/Windows), the
+                    # non-canonical path and the canonical path are the SAME physical file: write_one
+                    # overwrote it in place, so unlinking the "original" would delete the just-written
+                    # canonical note (the FileNotFoundError this guard prevents).
+                    if not _same_file(canonical, p):
+                        p.unlink(missing_ok=True)  # genuinely distinct file: drop the duplicate
                     files_state.pop(rel, None)
                     rel = canonical.name
                     p = canonical

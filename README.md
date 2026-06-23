@@ -25,7 +25,7 @@ A prose theory does not verify itself the way code verifies against a parse tree
 everything, edges no one ever checked, confident verdicts no one ever earned. This plugin
 exists to make that failure mode *structurally impossible*.
 
-A deterministic Python engine (`scripts/kg_engine`, 264 tests green) does the work that must be
+A deterministic Python engine (`scripts/kg_engine`, 266 tests green) does the work that must be
 exact — schema validation, span verification, verdict stamping, projection, scrubbing. The
 Claude Code session and its subagents do the **language** work — reading prose, proposing typed
 edges, copying spans, arguing the adversarial case — and hand structured JSON back across an
@@ -356,7 +356,7 @@ Run from the repo with the engine venv (`/home/sergi/creativity-graph/.venv/bin/
 
 ```bash
 uv sync                                  # provision the engine venv (dev; the plugin runtime uses scripts/bootstrap.py)
-uv run pytest tests/ -q                  # → 264 passed
+uv run pytest tests/ -q                  # → 266 passed
 claude plugin validate --strict          # validate the plugin manifest + components
 ```
 
