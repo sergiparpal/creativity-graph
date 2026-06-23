@@ -169,7 +169,7 @@ def seed(G, *, pack, corpus, failures, k=10) -> list:
     for i, u in enumerate(nodes):
         try:
             dist = nx.single_source_shortest_path_length(und, u)
-        except nx.NetworkXError:
+        except (nx.NetworkXError, nx.NodeNotFound):
             continue
         nbu = adj[u]
         for v in nodes[i + 1:]:
@@ -277,6 +277,7 @@ def transplant(G, *, pack, corpus, failures, k=10) -> list:
     to audit (the language layer expands them in Stage 6)."""
     if G.number_of_nodes() < 4:
         return []
+    und = G.to_undirected()  # hoisted once: absorption() reads its neighbours m times per call (perf)
     by_comm: dict = defaultdict(list)
     for n in G.nodes():
         by_comm[_attr(G, n, "community", -1)].append(n)
@@ -301,7 +302,7 @@ def transplant(G, *, pack, corpus, failures, k=10) -> list:
         if m < 1:
             return 0.0
         ms = set(members)
-        internal = {frozenset((u, v)) for u in members for v in G.to_undirected().neighbors(u)
+        internal = {frozenset((u, v)) for u in members for v in und.neighbors(u)
                     if v in ms and u != v}
         density = (len(internal) / (m * (m - 1) / 2)) if m > 1 else 1.0
         mean_spec = sum(float(_attr(G, u, "specificity", 1.0)) for u in members) / m
@@ -310,6 +311,7 @@ def transplant(G, *, pack, corpus, failures, k=10) -> list:
     if not targets:
         return []
     best_c, best_members = max(targets, key=lambda cm: (absorption(cm[1]), cm[0]))
+    best_absorption = absorption(best_members)  # loop-invariant: compute once, reuse per candidate (perf)
     adj = _undirected_adjacency(G)
     cands: list = []
     for b in sorted(best_members, key=lambda n: (-float(_attr(G, n, "degree", 0)), n)):
@@ -318,7 +320,7 @@ def transplant(G, *, pack, corpus, failures, k=10) -> list:
         if _is_failure(failures, hub, rstar, b):
             continue
         spec = min(float(_attr(G, hub, "specificity", 1.0)), float(_attr(G, b, "specificity", 1.0)))
-        score = float(_attr(G, hub, "degree", 0)) * absorption(best_members)
+        score = float(_attr(G, hub, "degree", 0)) * best_absorption
         cands.append(_edge_cand(
             "transplant", hub, b, rstar, score=score, specificity=spec, section="§5",
             rationale=(f"macro-bridge: transplant hub '{_attr(G, hub, 'label', hub)}' (c{hub_comm}, "

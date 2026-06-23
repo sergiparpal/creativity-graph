@@ -73,8 +73,10 @@ def explode_payload(G, *, target=None, k=None, label="", body=""):
         return None, "no node to explode"
     rels = sorted({d.get("relation") for _, _, d in G.out_edges(t, data=True) if d.get("relation")})
     facets = rels or ["aspect-1", "aspect-2"]
-    if k:
-        facets = facets[: int(k)]
+    # k is unvalidated LLM-supplied MCP input: honour k=0 (zero facets, not "no limit") and guard
+    # negatives (which would slice from the end), matching open_payload's max(1, int(k)) clamp discipline.
+    if k is not None:
+        facets = facets[: max(0, int(k))]
     nodes, edges = [], []
     for i, r in enumerate(facets, 1):
         cid = f"{slug(t)}-facet-{i}"

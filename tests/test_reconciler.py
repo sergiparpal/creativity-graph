@@ -82,8 +82,9 @@ def test_rename_migrates_verdict_so_it_survives_reconcile(engine):
 
 
 def test_non_canonical_filename_is_reconciled_not_skipped(canon):
-    """reconciler-4: a hand-created note whose filename is not slug-canonical must still be read (by
-    path) and reconciled, not silently skipped forever via a read_node(p.stem) re-slug miss."""
+    """reconciler-4 / reconciler-3: a hand-created note whose filename is not slug-canonical must still
+    be read (by path) AND have its un-forgery correction land on disk — not in a NEW slug file while the
+    original keeps the forged state (a duplicate edge in two states, self-concealing on every scan)."""
     forged = Edge(source="Foo", target="bar", relation="grounds", span="x",
                   epistemic_state=EpistemicState.GROUNDED)
     node = Node(id="Foo", label="Foo", edges=[forged])
@@ -93,3 +94,13 @@ def test_non_canonical_filename_is_reconciled_not_skipped(canon):
     report = Reconciler(canon).scan(full_sweep=True)
     # the file was actually parsed (not skipped), so the unaudited grounded edge is caught as forged
     assert forged.id in report.requarantined
+
+    # the forgery must be neutralized ON DISK: exactly one instance of the edge, reset to UNVERIFIED.
+    edges = [e for e in canon.all_edges() if e.id == forged.id]
+    assert len(edges) == 1, f"expected a single (deduped) edge, got {len(edges)}"
+    assert edges[0].epistemic_state == EpistemicState.UNVERIFIED
+    # and no orphan duplicate note: the stale non-canonical Foo.md is gone, only canonical foo.md remains.
+    names = {p.name for p in canon.note_paths()}
+    assert "Foo.md" not in names
+    assert canon.node_path("Foo").name in names  # the corrected canonical file
+    assert len(canon.note_paths()) == 1

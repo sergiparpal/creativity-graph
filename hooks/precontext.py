@@ -17,22 +17,29 @@ def emit(ctx: str) -> None:
 
 def main() -> int:
     try:
-        payload = json.load(sys.stdin)
+        # Decode stdin as UTF-8 explicitly — json.load(sys.stdin) would use the locale text
+        # encoding, so a non-ASCII payload mojibakes (empty kg_context match) or raises
+        # UnicodeDecodeError on a non-UTF-8 locale (e.g. Windows cp1252), silently disabling
+        # precontext for unicode payloads. Reading bytes makes the decode deterministic.
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     except Exception:
         return 0
     project = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
     if not project:
         return 0
     data = os.environ.get("CLAUDE_PLUGIN_DATA") or str(pathlib.Path(project) / ".kg-data")
-    # Check the index exists BEFORE constructing the engine — Canon()/Projector() mkdir their dirs,
-    # and this hook runs on every Grep/Glob/Read; don't create the canon/derived tree as a side effect
-    # when nothing has been projected yet.
+    # Check the index exists BEFORE constructing the engine — this hook runs on every Grep/Glob/Read;
+    # don't build context (or touch the derived tree) when nothing has been projected yet.
     if not (pathlib.Path(data) / "derived" / "index.sqlite").exists():
         return 0
     try:
         from kg_engine.canon import Canon
         from kg_engine.projector import Projector
-        proj = Projector(Canon(project), pathlib.Path(data) / "derived")
+        # ensure_layout=False: this is a pure read path, so don't let Canon() mkdir the canon dir or
+        # rewrite .git/info/exclude on every single Grep/Glob/Read (the writer-side server already
+        # maintains those). The derived dir is guaranteed to exist (index.sqlite checked above), so
+        # Projector's own derived mkdir is a no-op here too.
+        proj = Projector(Canon(project, ensure_layout=False), pathlib.Path(data) / "derived")
         if not proj.db_path.exists():
             return 0  # nothing projected yet
         # Mirror the server's lazy-reproject gate (server._ensure_projected): a raw

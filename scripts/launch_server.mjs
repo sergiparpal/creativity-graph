@@ -15,7 +15,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url)); // <repo>/scripts
@@ -138,9 +138,13 @@ if (!py) {
 
 // Ensure kg_engine resolves off PYTHONPATH (.mcp.json already sets this; belt-and-braces
 // for a direct/dev launch). The KG_* env vars come through from .mcp.json untouched.
+// Compare on a canonical forward-slash form: SCRIPTS uses the native separator (backslash
+// on Windows) but .mcp.json injects `${CLAUDE_PLUGIN_ROOT}/scripts` with forward slashes,
+// so a raw includes() would never match on Windows and prepend a redundant entry each launch.
 const env = { ...process.env };
+const canon = (p) => p.split(sep).join("/");
 const parts = env.PYTHONPATH ? env.PYTHONPATH.split(delimiter) : [];
-if (!parts.includes(SCRIPTS)) env.PYTHONPATH = [SCRIPTS, ...parts].join(delimiter);
+if (!parts.map(canon).includes(canon(SCRIPTS))) env.PYTHONPATH = [SCRIPTS, ...parts].join(delimiter);
 
 // Spawn the real server. `retried` is the belt-and-braces fallback (node-launchers-2): if
 // the server exits non-zero almost immediately (an import error against a half-built /

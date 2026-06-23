@@ -35,10 +35,12 @@ Where the venv lives (first match wins):
 
 Idempotency & robustness:
 
-* A content stamp (hash of ``pyproject.toml`` — the dependency source of truth) lets a
-  fast path skip work when the venv is current, and forces a rebuild when a plugin
-  update changes dependencies. (Engine *source* edits need no rebuild: ``kg_engine`` is
-  read live off ``PYTHONPATH``, never installed.)
+* A content stamp (hash of ``pyproject.toml`` — the dependency source of truth — plus the
+  backing interpreter's minor version + platform + arch) lets a fast path skip work when the
+  venv is current, and forces a rebuild when a plugin update changes dependencies OR a
+  same-path interpreter swap would leave its compiled wheels ABI-mismatched. (Engine
+  *source* edits need no rebuild: ``kg_engine`` is read live off ``PYTHONPATH``, never
+  installed.)
 * An atomic lock dir serializes concurrent provisions (the SessionStart worker, extra
   terminals, the launcher racing the hook) so two builds never clobber a venv.
 * ``--background`` re-spawns a fully detached worker and returns in milliseconds, so
@@ -54,6 +56,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -75,10 +78,12 @@ STALE_LOCK_SECS = 30 * 60           # treat a lock older than this as abandoned
 LOG_NAME = "provision.log"          # where the detached worker logs
 SCHEMA = "1"                        # bump to force every venv to rebuild
 
-# Modules the engine must be able to import for the MCP server to come up. GitPython
-# imports as ``git``; python-igraph as ``igraph``. ``kg_engine`` resolves off PYTHONPATH.
+# Modules the engine must be able to import for the MCP server to come up. python-igraph
+# imports as ``igraph``; pyyaml as ``yaml``. ``kg_engine`` resolves off PYTHONPATH. (Git is
+# used only via the ``git`` CLI through subprocess in canon.py — no ``import git`` — so the
+# ``git`` module is intentionally absent here and from [project.dependencies].)
 _VERIFY_IMPORTS = (
-    "import mcp, pydantic, networkx, igraph, leidenalg, yaml, git, kg_engine; "
+    "import mcp, pydantic, networkx, igraph, leidenalg, yaml, kg_engine; "
     "print('[bootstrap] core imports OK')"
 )
 
@@ -126,13 +131,25 @@ def venv_python(venv_dir: Path) -> Path:
 def compute_stamp() -> str:
     """Hash the inputs whose change should trigger a rebuild.
 
-    Only ``pyproject.toml`` matters: it is the single declared source of the engine's
-    dependencies (``uv.lock`` is gitignored and so never ships in the plugin payload,
-    and ``kg_engine`` is read off PYTHONPATH rather than installed, so engine source
-    edits do not require a rebuild).
+    ``pyproject.toml`` is the declared source of the engine's dependencies (``uv.lock`` is
+    gitignored and so never ships in the plugin payload, and ``kg_engine`` is read off
+    PYTHONPATH rather than installed, so engine source edits do not require a rebuild).
+
+    The backing interpreter's identity (minor version + platform + arch) is folded in too:
+    the venv's compiled wheels (pydantic-core, igraph, leidenalg) are ABI-bound to the
+    interpreter that built them, so a same-path interpreter swap that leaves pyproject
+    untouched — an unversioned stdlib-venv symlink re-pointed, a pyenv re-point, a moved
+    arch — would otherwise keep the stamp matching while ``import`` crashes on a wheel
+    ABI mismatch. Hashing the interpreter identity forces a clean rebuild instead.
     """
     h = hashlib.sha256()
     h.update(SCHEMA.encode())
+    h.update(f"{sys.version_info[0]}.{sys.version_info[1]}".encode())
+    h.update(b"\0")
+    h.update(sys.platform.encode())
+    h.update(b"\0")
+    h.update(platform.machine().encode())
+    h.update(b"\0")
     h.update(PYPROJECT.name.encode())
     h.update(b"\0")
     h.update(PYPROJECT.read_bytes() if PYPROJECT.exists() else b"")
@@ -209,7 +226,15 @@ def try_acquire(venv_dir: Path) -> bool:
             # can move the stale lock aside (the loser finds it already gone and backs
             # off). rmtree+mkdir alone is not atomic together — two simultaneous
             # stealers could both proceed.
-            sidelined = lock.parent / f"{LOCK_NAME}.stale-{os.getpid()}"
+            #
+            # The sideline name must be collision-proof: a crash between os.replace() and
+            # rmtree() orphans a non-empty ``.stale-<...>`` dir, and a stealer that reused a
+            # bare PID-only name would then hit ENOTEMPTY on os.replace (masked as a lost
+            # race) and never reclaim. ``time_ns()`` makes every steal target unique, and we
+            # sweep any pre-existing ``*.stale-*`` orphans first so they can't accumulate.
+            for orphan in lock.parent.glob(f"{LOCK_NAME}.stale-*"):
+                shutil.rmtree(orphan, ignore_errors=True)
+            sidelined = lock.parent / f"{LOCK_NAME}.stale-{os.getpid()}-{time.time_ns()}"
             try:
                 os.replace(lock, sidelined)
             except OSError:
@@ -507,7 +532,7 @@ def spawn_background(venv_dir: Path) -> int:
 
     subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()),
-         "--run", "--reconcile", "--venv", str(venv_dir)],
+         "--reconcile", "--venv", str(venv_dir)],
         stdout=log,
         stderr=log,
         stdin=subprocess.DEVNULL,
@@ -526,11 +551,6 @@ def main(argv: list[str] | None = None) -> int:
         help="spawn a detached worker and return immediately (used by the hook)",
     )
     parser.add_argument(
-        "--run",
-        action="store_true",
-        help="internal: the detached worker entrypoint",
-    )
-    parser.add_argument(
         "--check",
         action="store_true",
         help="exit 0 iff the venv is provisioned and current (matches the stamp), "
@@ -545,7 +565,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--wait",
         type=float,
-        default=20.0 * 60,
+        # Default >= STALE_LOCK_SECS (+margin) so ONE foreground run can both wait out a
+        # live build AND reclaim a dead one: a hard-killed holder's heartbeat freezes, so
+        # try_acquire() can only steal the lock once its age passes STALE_LOCK_SECS (1800s).
+        # A shorter deadline (the old 1200s) would fire BEFORE the lock became stealable and
+        # return 0 without building — silently dropping every kg_* tool for that session.
+        default=STALE_LOCK_SECS + 60.0,
         help="seconds a foreground run waits for an in-flight provision",
     )
     args = parser.parse_args(argv)
@@ -565,7 +590,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.background:
         return spawn_background(venv_dir)
-    # --run (detached worker) and the default/manual path are both foreground here.
+    # The detached worker (spawned by --background) and the default/manual path are both
+    # foreground here — the worker is just this same foreground provision, re-invoked
+    # detached with --reconcile, so there is no separate worker-only entrypoint flag.
     return provision(venv_dir, wait_secs=args.wait, reconcile=args.reconcile)
 
 

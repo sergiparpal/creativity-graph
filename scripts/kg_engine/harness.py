@@ -165,12 +165,15 @@ def absorption(graph_data: dict, history: dict, *, now=None, absorb_growth: int 
         growth = max(0, d1 - d0)
         rate = growth / t
         if d1 <= 0:
-            status, half_life = "isolated", float("inf")        # stayed disconnected — infertile
+            status, half_life = "isolated", None                # stayed disconnected — infertile
         elif growth >= absorb_growth:
             status, half_life = "absorbed", round(t / growth, 3)  # densified fast — renormalised, trivial now
         else:
             status = "fertile"                                  # the productive middle
-            half_life = round(t / growth, 3) if growth > 0 else float("inf")
+            # an unbounded half-life is None, NOT float('inf'): this dict is returned verbatim by the
+            # kg_absorption MCP tool and inf serializes to the bareword `Infinity` (invalid per RFC 8259,
+            # breaks a strict client JSON.parse). `status` already distinguishes isolated/fertile.
+            half_life = round(t / growth, 3) if growth > 0 else None
         out[nid] = {"half_life": half_life, "status": status, "introduced_degree": d0,
                     "current_degree": d1, "densification": growth, "densification_rate": round(rate, 3)}
     return out

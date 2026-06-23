@@ -176,7 +176,18 @@ class Projector:
 
     # ---- ranks (off the hot path)
     def _ranks(self, G: nx.DiGraph) -> Ranks:
-        und = G.to_undirected()
+        # The advisory ranks (degree/communities/betweenness/spec_betweenness) are computed over the
+        # NON-FAILED subgraph (§1.7). graph.json and the edges table stay COMPLETE — failure memory is
+        # never pruned — but a `failed`/`rejected` edge must not inflate centrality: the adversarial
+        # grounder stamps its attacked_by/confounded_by counter-edges `failed`, so counting them would
+        # make "more refutation -> higher apparent centrality". Excluding only the edges keeps every
+        # node present (an attacked hub whose edges are all refuted still ranks honestly at degree 0).
+        _fail = {s.value for s in FAILURE_STATES}
+        live = nx.MultiDiGraph()
+        live.add_nodes_from(G.nodes(data=True))
+        live.add_edges_from((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)
+                            if d.get("epistemic_state") not in _fail)
+        und = live.to_undirected()
         comm = _leiden(und)
         degree = dict(und.degree())
         bridges = {}
@@ -287,6 +298,10 @@ class Projector:
             f"""
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             {self._NODES_DDL};
+            -- verdict_by/verdict_at are intentionally NOT columns here: verdict attribution lives
+            -- authoritatively in the canon frontmatter + audit log (reconciler reads them from there).
+            -- "derived contains nothing the canon does not" is one-directional — the derived layer MAY
+            -- omit canon fields, so this is contractually allowed, not a gap.
             CREATE TABLE IF NOT EXISTS edges(
                 id TEXT PRIMARY KEY, source TEXT, target TEXT, relation TEXT,
                 provenance TEXT, authored_by TEXT, epistemic_state TEXT, span TEXT,
@@ -626,11 +641,15 @@ class Projector:
                 iwhere += " AND " + term_clause
             items, used = _fill(iwhere, iargs, order, budget)
             # HYPOTHESIS LANE — a SEPARATE block of hypothesized, unverified proposals, clearly distinct.
+            # Both lanes share ONE running budget (§1.11): the hypotheses cap is what the items lane left
+            # unspent (budget - used), so the total serialized payload never exceeds `budget` and the
+            # reported approx_tokens (used + hused) is honest. Filling items first preserves grounded
+            # priority; the items/hypotheses segregation in the output is unchanged.
             hwhere = "provenance = 'hypothesized' AND epistemic_state = 'unverified'"
             hargs = list(term_args)
             if term_clause:
                 hwhere += " AND " + term_clause
-            hypotheses, _hused = _fill(hwhere, hargs, "confidence_score DESC", budget)
+            hypotheses, hused = _fill(hwhere, hargs, "confidence_score DESC", budget - used)
             bridges = [dict(r) for r in con.execute(
                 "SELECT id,label,degree,bridge_communities FROM nodes WHERE structural_bridge=1 "
                 "ORDER BY degree DESC LIMIT 10")]
@@ -659,7 +678,7 @@ class Projector:
             return {
                 "items": items,
                 "hypotheses": hypotheses,   # the SEPARATE hypothesized lane — proposals, NOT grounded content
-                "approx_tokens": used,
+                "approx_tokens": used + hused,  # both lanes counted against the shared budget (§1.11)
                 "budget": budget,
                 "falsification_counters": counters,
                 "advisory": {"signal": "structural-bridge", "note": "advisory heuristic, not a guarantee",

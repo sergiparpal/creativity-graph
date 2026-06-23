@@ -13,7 +13,6 @@ dependencies = [
     "pyyaml>=6",           # pack.yaml / glossary loader
     "python-igraph>=0.11", # graph backend for Leiden
     "leidenalg>=0.10",     # Leiden community detection
-    "GitPython>=3.1",      # canon atomicity, audit, union-merge
 ]
 
 [project.optional-dependencies]

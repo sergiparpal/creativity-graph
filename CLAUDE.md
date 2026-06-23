@@ -202,10 +202,13 @@ generic runner — `scripts/validate_plugin.py` is the hard gate).
 
 ### 2. Bump the version
 
-Set the **same** version string in both manifests (the structural validator enforces they agree):
+Set the **same** version string in **all four** version-bearing files — `validate_plugin.py` (the CI
+hard gate) cross-checks every one against the plugin manifest, so missing any of them trips CI:
 
 - `.claude-plugin/plugin.json` → `version`
 - `.claude-plugin/marketplace.json` → the `creativity-graph` entry's `version`
+- `pyproject.toml` → `[project]` `version`
+- `scripts/kg_engine/__init__.py` → `__version__`
 
 Follow SemVer. Update `CHANGELOG.md`: move items out of `[Unreleased]` under the new version.
 

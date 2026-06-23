@@ -105,6 +105,46 @@ def test_compute_stamp_reacts_to_pyproject(tmp_path, monkeypatch):
     assert bootstrap.compute_stamp() != s1
 
 
+def test_compute_stamp_reacts_to_interpreter_identity(tmp_path, monkeypatch):
+    # F22: the venv's compiled wheels (pydantic-core, igraph, leidenalg) are ABI-bound to
+    # the interpreter that built them. A same-path interpreter swap that leaves pyproject
+    # UNTOUCHED (unversioned stdlib-venv symlink re-pointed, pyenv re-point, moved arch)
+    # must still move the stamp so the venv rebuilds clean instead of importing an
+    # ABI-mismatched wheel and crashing. So minor version, sys.platform and the machine
+    # arch are all folded into the stamp.
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\ndependencies = ['a']\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+    base = bootstrap.compute_stamp()
+
+    # A python minor bump (3.11 -> 3.12) with the same pyproject must change the stamp.
+    class _VI(tuple):
+        @property
+        def major(self):  # not used by compute_stamp, kept for realism
+            return self[0]
+
+        @property
+        def minor(self):
+            return self[1]
+
+    monkeypatch.setattr(bootstrap.sys, "version_info", _VI((3, 99, 0, "final", 0)))
+    bumped_minor = bootstrap.compute_stamp()
+    assert bumped_minor != base
+
+    # An arch move (platform.machine) with the same pyproject + interpreter must too.
+    monkeypatch.setattr(bootstrap.sys, "version_info", _VI((3, 99, 0, "final", 0)))
+    monkeypatch.setattr(bootstrap.platform, "machine", lambda: "definitely-not-this-arch")
+    bumped_arch = bootstrap.compute_stamp()
+    assert bumped_arch != bumped_minor
+
+    # A platform change (sys.platform: linux -> win32) must too.
+    monkeypatch.setattr(bootstrap.sys, "version_info", _VI((3, 99, 0, "final", 0)))
+    monkeypatch.setattr(bootstrap.platform, "machine", lambda: "definitely-not-this-arch")
+    monkeypatch.setattr(bootstrap.sys, "platform", "some-other-os")
+    bumped_platform = bootstrap.compute_stamp()
+    assert bumped_platform != bumped_arch
+
+
 # --------------------------------------------------------------------------- #
 # is_ready
 # --------------------------------------------------------------------------- #
@@ -249,6 +289,36 @@ def test_fresh_but_long_lock_is_not_stolen(tmp_path):
     bootstrap.release(venv_dir)
 
 
+def test_orphan_sideline_does_not_block_steal(tmp_path):
+    # F24: a crash between os.replace() and rmtree() in the steal path orphans a non-empty
+    # ``.kg-provision.lock.stale-<...>`` dir. A later stealer must not be wedged by it: the
+    # steal target is now collision-proof (PID + time_ns) and pre-existing ``*.stale-*``
+    # orphans are swept first, so the steal still succeeds.
+    venv_dir = tmp_path / "venv"
+    assert bootstrap.try_acquire(venv_dir) is True
+    lock = bootstrap._lock_dir(venv_dir)
+    hb = bootstrap._heartbeat_file(venv_dir)
+
+    # Plant a NON-EMPTY orphan sideline that an earlier crashed stealer left behind, named
+    # exactly as the old (PID-only) scheme would have — the case that used to ENOTEMPTY.
+    orphan = lock.parent / f"{bootstrap.LOCK_NAME}.stale-{os.getpid()}"
+    orphan.mkdir()
+    (orphan / "leftover").write_text("crashed mid-steal\n", encoding="utf-8")
+
+    # Age the live lock + heartbeat past the stale threshold so it is genuinely stealable.
+    old = time.time() - bootstrap.STALE_LOCK_SECS - 60
+    os.utime(lock, (old, old))
+    if hb.exists():
+        os.utime(hb, (old, old))
+
+    # The steal must succeed despite the orphan, and the orphan must be swept away.
+    assert bootstrap.try_acquire(venv_dir) is True
+    assert not orphan.exists()
+    bootstrap.release(venv_dir)
+    # No stale sidelines leaked after a clean steal.
+    assert not list(lock.parent.glob(f"{bootstrap.LOCK_NAME}.stale-*"))
+
+
 # --------------------------------------------------------------------------- #
 # --check (launcher freshness probe; node-launchers-2)
 # --------------------------------------------------------------------------- #
@@ -276,3 +346,30 @@ def test_check_exit_code_tracks_readiness(tmp_path, monkeypatch, capsys):
     pp.write_text("[project]\ndependencies = ['a', 'b']\n", encoding="utf-8")
     assert bootstrap.main(argv) != 0
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------- #
+# foreground --wait default (F23)
+# --------------------------------------------------------------------------- #
+def test_default_wait_outlasts_stale_lock(tmp_path, monkeypatch):
+    # F23: try_acquire() can only STEAL a lock once its heartbeat age passes
+    # STALE_LOCK_SECS. A hard-killed holder freezes its heartbeat, so the lock is not
+    # stealable until STALE_LOCK_SECS elapses. If the foreground --wait deadline fired
+    # FIRST (the old 1200s vs the 1800s stale window), provision() would return 0 without
+    # building — silently dropping every kg_* tool for that session. So the default --wait
+    # must be >= STALE_LOCK_SECS: one run can both wait out a live build and reclaim a dead
+    # one. Capture the wait_secs main() forwards to provision() when no --wait is given.
+    seen = {}
+
+    def fake_provision(venv_dir, *, wait_secs, reconcile=False):
+        seen["wait_secs"] = wait_secs
+        return 0
+
+    monkeypatch.setattr(bootstrap, "provision", fake_provision)
+    rc = bootstrap.main(["--venv", str(tmp_path / "venv")])
+    assert rc == 0
+    assert seen["wait_secs"] >= bootstrap.STALE_LOCK_SECS
+
+    # An explicit --wait override still wins (operator can shorten/lengthen at will).
+    bootstrap.main(["--venv", str(tmp_path / "venv"), "--wait", "5"])
+    assert seen["wait_secs"] == 5.0

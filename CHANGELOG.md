@@ -2,8 +2,8 @@
 
 All notable changes to the **creativity-graph** Claude Code plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html); `version` is set to `0.2.1` in
-`.claude-plugin/plugin.json` and the matching `marketplace.json` entry.
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html); the current release is the topmost
+version section below.
 
 The plugin turns a non-self-grounding conceptual document into a grounded, queryable knowledge
 graph: a human-editable Markdown **canon** (the single source of truth, §1.2), a span-present

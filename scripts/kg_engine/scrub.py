@@ -90,11 +90,23 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     # IPv4 and (conservative) full-form IPv6 BEFORE phone, so the phone rule can't eat IP octets first.
     ("IP", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
     ("IP", re.compile(r"\b(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}\b")),
-    ("PHONE", re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)[\s.-]?)?\d{3}[\s.-]?\d{3,4}(?!\d)")),
+    # Phone numbers, but NOT bare 6-7 digit prose runs or dash-separated page ranges (F11/M5): the old
+    # two-group `\d{3}[\s.-]?\d{3,4}` matched "100-200" and even separator-less "100200", over-redacting
+    # ordinary figures into ⟦PHONE⟧ (restored on write, but it degraded extraction). A real number must
+    # carry phone-ish structure — a `+`/country-code prefix, a parenthesized area code, OR three
+    # separator-grouped runs (>=10 digits) — so a bare two-group number is no longer enough to qualify.
+    ("PHONE", re.compile(
+        r"(?<!\d)(?:"
+        r"\+\d{1,3}[\s.-]?(?:\(\d{2,4}\)[\s.-]?)?\d{2,4}(?:[\s.-]?\d{2,4}){1,3}"  # +country (area)? grp grp …
+        r"|\(\d{2,4}\)[\s.-]?\d{3}[\s.-]?\d{3,4}"                                  # (415) 555-2671
+        r"|\d{3}[\s.-]\d{3}[\s.-]\d{4}"                                            # 415-555-2671 (3-3-4, >=10 digits)
+        r")(?!\d)")),
     # Person heuristic (high only): a courtesy title is sufficient; a bare Title-Case bigram is gated
     # behind the given-name lexicon (_is_personal_name) so concept bigrams survive (scrub-4).
     ("PERSON", re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b")),
-    ("PERSON", re.compile(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b")),  # gated by _is_personal_name in scrub()
+    # Groups (first | gap | second) so scrub() can resume at the SECOND token's start when the first is
+    # a non-name (F6): a real full name beginning inside a spared bigram is still re-tested, not skipped.
+    ("PERSON", re.compile(r"\b([A-Z][a-z]+)(\s+)([A-Z][a-z]+)\b")),  # gated by _is_personal_name in scrub()
     ("ADDRESS", re.compile(r"\b\d{1,5}\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Dr|Drive)\b")),
 ]
 
@@ -102,7 +114,7 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
 # lexicon. Bound by position but asserted by pattern so a future reorder/insertion fails LOUDLY here
 # instead of silently gating the wrong rule (e.g. turning off PERSON or mis-gating ADDRESS).
 _BARE_PERSON_RE = _PATTERNS[-2][1]
-assert _BARE_PERSON_RE.pattern == r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", \
+assert _BARE_PERSON_RE.pattern == r"\b([A-Z][a-z]+)(\s+)([A-Z][a-z]+)\b", \
     "PERSON rule order changed — re-bind _BARE_PERSON_RE to the bare Title-Case bigram pattern"
 
 _PLACEHOLDER_RE = re.compile(r"⟦([A-Z]+):(\d+)⟧")
@@ -177,10 +189,27 @@ class Scrubber:
             if pat is _BARE_PERSON_RE:
                 # scrub-4: only redact a bare Title-Case bigram that looks like an actual personal
                 # name (first token in the given-name lexicon); leave concept bigrams untouched.
-                out = pat.sub(
-                    lambda m: placeholder("PERSON", m.group(0)) if _is_personal_name(m.group(0)) else m.group(0),
-                    out,
-                )
+                # F6: re.sub() scans non-overlapping, so sparing a non-name FIRST token ("Researcher
+                # Alan", "Yesterday Michael") would skip past the real name that begins inside the
+                # spared span. Iterate manually and, on a spared non-name bigram, resume at the SECOND
+                # token's start (m.start(3)) so "Alan Turing"/"Michael Smith" is still re-tested.
+                pieces: list[str] = []
+                pos = 0
+                while True:
+                    m = pat.search(out, pos)
+                    if m is None:
+                        pieces.append(out[pos:])
+                        break
+                    if _is_personal_name(m.group(0)):
+                        pieces.append(out[pos:m.start()])
+                        pieces.append(placeholder("PERSON", m.group(0)))
+                        pos = m.end()
+                    else:
+                        # keep the non-name first token + gap verbatim; rescan from the second token.
+                        second = m.start(3)
+                        pieces.append(out[pos:second])
+                        pos = second
+                out = "".join(pieces)
             else:
                 out = pat.sub(lambda m, c=cat: placeholder(c, m.group(0)), out)
         return out, new_mapping

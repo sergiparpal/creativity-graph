@@ -48,7 +48,14 @@ class Reconciler:
     # ---- state
     def _load_state(self) -> dict:
         try:
-            return json.loads(self.state_path.read_text())
+            # engine-written file: pin utf-8 so non-ASCII ids round-trip regardless of locale (§1.8).
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            # valid-JSON-but-non-dict (e.g. `[1,2,3]`, `null`) would crash scan() with AttributeError,
+            # and that crash (swallowed by the background reconcile) never self-heals because scan dies
+            # before _save_state. Coerce a non-dict to the fresh-dict default via the same fail-open path.
+            if not isinstance(state, dict):
+                raise ValueError("reconcile state is not a JSON object")
+            return state
         except (FileNotFoundError, ValueError, OSError):
             return {"files": {}, "epistemic": {}, "consumed": {}}
 
@@ -63,8 +70,11 @@ class Reconciler:
         justify it and is caught as a forgery."""
         counts: dict[str, int] = {}
         try:
-            lines = self.audit_path.read_text().splitlines()
-        except (FileNotFoundError, OSError):
+            # engine-written log: pin utf-8 so non-ASCII keys round-trip regardless of locale. A
+            # locale-mismatched read (undefined bytes -> UnicodeError) must degrade to "no audit" and
+            # fail-open rather than crash the whole reconcile (§1.8).
+            lines = self.audit_path.read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, OSError, UnicodeError):
             return counts
         for line in lines:
             line = line.strip()
@@ -78,14 +88,44 @@ class Reconciler:
                 counts.get(f"{rec.get('key', '')}||{rec.get('to', '')}", 0) + 1)
         return counts
 
+    @staticmethod
+    def _file_keys(p) -> "list[str] | None":
+        """The node + edge baseline keys a single canon file contributes, or None if it cannot be
+        parsed — matching all_nodes()/all_edges(), which skip a malformed note. Used to maintain
+        live_keys incrementally in scan() (reconciler-6) so the prune pass needn't re-read+parse the
+        whole canon a SECOND time per sweep. Parses by-path with fallback_id=p.stem, byte-identically
+        to all_nodes(), so the incrementally-built live set equals the old all_nodes()-derived one."""
+        try:
+            node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
+        except Exception:  # noqa: BLE001 — a malformed note has no parseable keys
+            return None
+        return [f"node:{node.id}", *(e.id for e in node.edges)]
+
     # ---- scan
     def scan(self, full_sweep: bool = False) -> ReconcileReport:
         state = self._load_state()
-        files_state: dict = state.get("files", {})
-        epistemic: dict = state.get("epistemic", {})
-        consumed: dict = state.get("consumed", {})
+        # Coerce each sub-key defensively: a hand-edited / truncated state with `{"files": null}` (or a
+        # non-dict sub-value) would otherwise crash scan() before _save_state can heal it. `or {}`
+        # rescues null; the isinstance guard rescues a non-dict (e.g. a list) — both fail open to fresh.
+        files_state = state.get("files") or {}
+        epistemic = state.get("epistemic") or {}
+        consumed = state.get("consumed") or {}
+        if not isinstance(files_state, dict):
+            files_state = {}
+        if not isinstance(epistemic, dict):
+            epistemic = {}
+        if not isinstance(consumed, dict):
+            consumed = {}
         audit = self._audit_counts()
         report = ReconcileReport(full_sweep=full_sweep)
+        # On a FULL SWEEP we visit and hash every note in the loop below, so we can build the live
+        # file/key sets INCREMENTALLY (reconciler-6) and skip the old post-loop all_nodes() re-parse —
+        # a hash match proves the cached keys are current, so the incremental sets are byte-identical to
+        # the all_nodes()-derived ones. On the cheap (mtime/size) pre-gate path the loop SKIPS unchanged
+        # notes, so cached keys could be stale under an (mtime,size) collision; there we fall back to the
+        # authoritative all_nodes() recompute for pruning, exactly as before this change.
+        live_files: set[str] = set()
+        live_keys: set[str] = set()
 
         for p in self.canon.note_paths():  # excludes .tmp-* atomic-write temporaries (canon-5)
             report.scanned += 1
@@ -95,11 +135,19 @@ class Reconciler:
             # pre-filter: unchanged mtime+size and not a full sweep -> skip the expensive re-read
             prefilter_same = (prev.get("mtime") == st.st_mtime and prev.get("size") == st.st_size)
             if prefilter_same and not full_sweep:
-                continue
+                continue  # cheap pre-gate: trust (mtime,size); the full-sweep prune below re-reads
             digest = _sha256(p)
             if full_sweep and prefilter_same and prev.get("sha256") == digest:
-                # mtime/size matched AND hash matches -> genuinely unchanged even under sweep
-                files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest}
+                # mtime/size AND hash matched -> genuinely unchanged even under sweep. Carry the cached
+                # keys forward (backfill once if absent) so live_keys stays complete without a re-parse.
+                keys = prev.get("keys")
+                if keys is None:
+                    keys = self._file_keys(p)
+                files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest,
+                                    "keys": keys if keys is not None else []}
+                live_files.add(rel)
+                if keys:
+                    live_keys.update(keys)
                 continue
 
             report.changed.append(rel)
@@ -109,6 +157,9 @@ class Reconciler:
                 # (reconciler-4) — leaving that note un-reconciled on every scan.
                 node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
             except Exception:  # noqa: BLE001 — a single malformed note must not crash the sweep
+                # the note still exists on disk (so its files_state entry must survive the prune), but a
+                # malformed note contributes NO parseable keys — exactly what all_nodes() would yield.
+                live_files.add(rel)
                 continue  # leave its file_state untouched so it's retried next scan
             mutated = False
 
@@ -132,10 +183,26 @@ class Reconciler:
                 epistemic[ekey] = e.epistemic_state.value
 
             if mutated:
+                # write_one persists to the CANONICAL slug path (node_path(node.id)). When the note we
+                # actually read lives at a NON-canonical filename (e.g. hand-created Foo.md for id 'Foo',
+                # slug -> foo.md), the correction would otherwise land in a NEW canonical file while the
+                # stale original keeps its forged state — a duplicate edge in two states, and re-statting
+                # the untouched original would re-skip it forever (reconciler-3, self-concealing). So:
+                # write the corrected node canonically, then delete the stale non-canonical original, and
+                # record the canonical file in files_state instead of re-statting the now-deleted `p`.
                 self.canon.write_one(node)
+                canonical = self.canon.node_path(node.id)
+                if canonical != p.resolve():
+                    p.unlink(missing_ok=True)  # drop the duplicate; only the corrected canonical remains
+                    files_state.pop(rel, None)
+                    rel = canonical.name
+                    p = canonical
                 st = p.stat()
                 digest = _sha256(p)
-            files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest}
+            keys = [f"node:{node.id}", *(e.id for e in node.edges)]
+            files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest, "keys": keys}
+            live_files.add(rel)
+            live_keys.update(keys)
 
         # Prune the `epistemic` BASELINE for anything no longer live. Edge ids are deterministic, so a
         # deleted-then-recreated edge would otherwise inherit the old "already grounded" baseline and
@@ -147,13 +214,19 @@ class Reconciler:
         # spent, and the audit log is append-only (never pruned). Pruning consumed would let an old,
         # still-present audit record be re-spent by a recreated edge — re-opening the very replay the
         # count check defeats. Its growth tracks the audit log, which is the permanent record anyway.
-        live_nodes = self.canon.all_nodes()
-        live_files = {p.name for p in self.canon.note_paths()}
-        live_keys = {f"node:{n.id}" for n in live_nodes}
-        live_keys |= {e.id for n in live_nodes for e in n.edges}
-        for rel in [r for r in files_state if r not in live_files]:
+        if full_sweep:
+            # every note was visited+hashed in the loop, so the incremental sets equal an
+            # all_nodes()/note_paths() recompute exactly — without the redundant second full read.
+            prune_files, prune_keys = live_files, live_keys
+        else:
+            # cheap pre-gate skipped unchanged notes (their cached keys may be stale under an (mtime,size)
+            # collision), so recompute authoritatively — byte-identical to the pre-reconciler-6 prune.
+            live_nodes = self.canon.all_nodes()
+            prune_files = {p.name for p in self.canon.note_paths()}
+            prune_keys = {f"node:{n.id}" for n in live_nodes} | {e.id for n in live_nodes for e in n.edges}
+        for rel in [r for r in files_state if r not in prune_files]:
             del files_state[rel]
-        for k in [k for k in epistemic if k not in live_keys]:
+        for k in [k for k in epistemic if k not in prune_keys]:
             del epistemic[k]
 
         self._save_state({"files": files_state, "epistemic": epistemic, "consumed": consumed})
@@ -184,7 +257,9 @@ class Reconciler:
     def reattach_after_reproject(self, graph_json: str | Path) -> OrphanReport:
         report = OrphanReport()
         try:
-            data = json.loads(Path(graph_json).read_text())
+            # engine-written derived layer: pin utf-8 so non-ASCII edge ids match the canon (parsed
+            # utf-8) regardless of locale, rather than mojibake-missing a live verdict (§1.8).
+            data = json.loads(Path(graph_json).read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError):
             return report
         derived_edge_ids = {e.get("id") for e in data.get("links", data.get("edges", []))}

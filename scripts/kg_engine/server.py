@@ -56,6 +56,7 @@ class KGEngine:
         self.metrics_mode = metrics_mode
         self.max_edges_per_kb = max_edges_per_kb
         self.source_path = Path(source_path) if source_path else None
+        self._source_cache: tuple[float, str] | None = None  # (mtime, text) — memoize the fixed source
         self.pack = None
         if pack_path and Path(pack_path).exists():
             try:
@@ -65,9 +66,20 @@ class KGEngine:
 
     # ---- source text (for span verification)
     def source_text(self) -> str:
-        if self.source_path and self.source_path.exists():
+        # Memoized: the source is fixed for the session, but kg_write and every hypothesis-promoting
+        # kg_ground read it (F34/N7 — uncached read_text per call). Key on mtime so an edited source
+        # (e.g. a test rewriting it) is still picked up; otherwise serve the cached text.
+        if not (self.source_path and self.source_path.exists()):
+            self._source_cache = None
+            return ""
+        try:
+            mtime = self.source_path.stat().st_mtime
+        except OSError:
+            self._source_cache = None
             return self.source_path.read_text(encoding="utf-8")
-        return ""
+        if self._source_cache is None or self._source_cache[0] != mtime:
+            self._source_cache = (mtime, self.source_path.read_text(encoding="utf-8"))
+        return self._source_cache[1]
 
     # ---- tools -----------------------------------------------------------
     def kg_ping(self) -> dict:
@@ -100,16 +112,29 @@ class KGEngine:
                                    restore=restore, max_edges_per_kb=self.max_edges_per_kb)
         nodes = merge_results_into_nodes(results)
         info = self.canon.write_nodes(list(nodes.values()), message=message) if nodes else None
+        rolled_back = bool(info and info.rolled_back)
         summary: dict = {d.value: 0 for d in Disposition}
         for r in results:
             summary[r.disposition.value] += 1
+        # CONTRACT (F10/M4): the dispositions summary and written_nodes are built from PRE-write
+        # ValidationResults; if the batch ROLLED BACK nothing persisted. Re-bucket the would-have-been
+        # ACCEPTED/DEMOTED counts into a `rolled_back` bucket and empty written_nodes so the payload can
+        # never contradict `rolled_back: True`. Backend consumers: when rolled_back is True,
+        # written_nodes is [] and the accepted/demoted counts must NOT be trusted/accumulated.
+        written = list(nodes)
+        if rolled_back:
+            persisted = (Disposition.ACCEPTED.value, Disposition.DEMOTED.value)
+            summary["rolled_back"] = sum(summary.get(d, 0) for d in persisted)
+            for d in persisted:
+                summary[d] = 0
+            written = []
         return {
             "dispositions": summary,
             "details": [{"kind": r.kind, "id": getattr(r.item, "id", None), "disposition": r.disposition.value,
                          "reason": r.reason, "retryable": r.retryable} for r in results],
-            "written_nodes": list(nodes),
-            "rolled_back": bool(info and info.rolled_back),
-            "error": (info.error if info and info.rolled_back else None),
+            "written_nodes": written,
+            "rolled_back": rolled_back,
+            "error": (info.error if rolled_back else None),
         }
 
     def kg_propose(self, payload: dict, *, message: str = "kg_propose") -> dict:
@@ -172,52 +197,56 @@ class KGEngine:
         by = by if by in ("agent", "human", "deterministic") else "agent"
         state = EpistemicState(verdict)
         promoted_to = None
-        if kind == "node":
-            if not self.canon.exists(target_id):
-                return {"ok": False, "error": "node not found"}
-            node = self.canon.read_node(target_id)
-            frm = node.epistemic_state.value
-            node.epistemic_state = state
-            key = f"node:{node.id}"
-        else:
-            node = self._owner_of_edge(target_id)
-            if node is None:
-                return {"ok": False, "error": "edge not found"}
-            edge = next(e for e in node.edges if e.id == target_id)
-            # the hypothesized→grounded promotion gate: a span-less proposal earns grounding only with
-            # support, which upgrades its provenance. Decided BEFORE any state change so a refusal leaves
-            # the edge untouched (no audit record, no write).
-            if edge.provenance == Provenance.HYPOTHESIZED and state == EpistemicState.GROUNDED:
-                restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
-                if support_span and support_span.strip():
-                    check = restore(support_span) if restore else support_span
-                    if not span_verifies(check, self.source_text()):
-                        return {"ok": False, "error": "support-span-not-in-source"}
-                    if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
-                        return {"ok": False, "error": "support-span-too-short"}
-                    edge.span = check
-                    edge.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
-                    promoted_to = Provenance.SPAN_PRESENT.value
-                elif support_note and support_note.strip():
-                    edge.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
-                    edge.notes = (edge.notes + " | " if edge.notes else "") + f"citation: {support_note.strip()}"
-                    promoted_to = Provenance.INFERRED.value
-                else:
-                    return {"ok": False, "error": "hypothesis-needs-support"}
-            frm = edge.epistemic_state.value
-            edge.epistemic_state = state
-            edge.verdict_by = by
-            edge.verdict_at = utcnow()
-            if note:
-                edge.notes = (edge.notes + " | " if edge.notes else "") + note
-            key = edge.id
-        # Hold the single-writer lease across the WHOLE audit-append + write + compensating-truncate
-        # sequence so it is atomic w.r.t. other writers. Otherwise a concurrent session's legitimate
-        # audit append could land between our offset capture and our truncate, and our whole-tail
-        # truncate would discard it (server-3). write_one re-acquires the lease re-entrantly.
+        # Acquire the single-writer lease FIRST, then read the owning node FRESH under the lease, mutate,
+        # audit, and write — so the whole read-modify-write is atomic w.r.t. other writers. Reading before
+        # locking (the old order) let a concurrent multi-process grounding clobber our edits with a
+        # whole-node overwrite (lost update, F17/L5). The lease also still guards the audit-append +
+        # write + compensating-truncate sequence (server-3); write_one re-acquires it re-entrantly.
         if not self.canon.try_acquire_lock():
             return {"ok": False, "error": "canon vault is locked by another live session"}
         try:
+            if kind == "node":
+                if not self.canon.exists(target_id):
+                    return {"ok": False, "error": "node not found"}
+                try:
+                    node = self.canon.read_node(target_id)  # corrupt/invalid-UTF-8 note → structured error (F13/L1)
+                except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
+                    return {"ok": False, "error": f"node unreadable: {e}"}
+                frm = node.epistemic_state.value
+                node.epistemic_state = state
+                key = f"node:{node.id}"
+            else:
+                node = self._owner_of_edge(target_id)
+                if node is None:
+                    return {"ok": False, "error": "edge not found"}
+                edge = next(e for e in node.edges if e.id == target_id)
+                # the hypothesized→grounded promotion gate: a span-less proposal earns grounding only with
+                # support, which upgrades its provenance. Decided BEFORE any state change so a refusal leaves
+                # the edge untouched (no audit record, no write).
+                if edge.provenance == Provenance.HYPOTHESIZED and state == EpistemicState.GROUNDED:
+                    restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
+                    if support_span and support_span.strip():
+                        check = restore(support_span) if restore else support_span
+                        if not span_verifies(check, self.source_text()):
+                            return {"ok": False, "error": "support-span-not-in-source"}
+                        if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
+                            return {"ok": False, "error": "support-span-too-short"}
+                        edge.span = check
+                        edge.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
+                        promoted_to = Provenance.SPAN_PRESENT.value
+                    elif support_note and support_note.strip():
+                        edge.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
+                        edge.notes = (edge.notes + " | " if edge.notes else "") + f"citation: {support_note.strip()}"
+                        promoted_to = Provenance.INFERRED.value
+                    else:
+                        return {"ok": False, "error": "hypothesis-needs-support"}
+                frm = edge.epistemic_state.value
+                edge.epistemic_state = state
+                edge.verdict_by = by
+                edge.verdict_at = utcnow()
+                if note:
+                    edge.notes = (edge.notes + " | " if edge.notes else "") + note
+                key = edge.id
             # Append the audit record BEFORE persisting the verdict: a CRASH between the two leaves an
             # audit record with no state change (harmless, unconsumed) rather than a verdict with no
             # audit record (which the reconciler would re-quarantine). But a CAUGHT write failure (slug
@@ -290,7 +319,10 @@ class KGEngine:
             return {"ok": False, "error": "node not found"}
         if self.canon.exists(new):
             return {"ok": False, "error": "target id exists"}
-        node = self.canon.read_node(old)
+        try:
+            node = self.canon.read_node(old)  # corrupt/invalid-UTF-8 note → structured error (F13/L1)
+        except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
+            return {"ok": False, "error": f"node unreadable: {e}", "old": old, "new": new}
         # A rename recomputes edge ids (and the node id), but the kg_ground audit record + reconciler
         # baseline are keyed by those ids. Collect every policed-state (verdict OR obsolete) item whose
         # id CHANGES so we can write a migrating audit record for the NEW id — otherwise the reconciler
@@ -418,15 +450,15 @@ class KGEngine:
         from .harness import absorption
         self._ensure_projected()
         try:
-            data = json.loads(self.projector.graph_path.read_text()) if self.projector.graph_path.exists() \
-                else {"nodes": [], "links": []}
+            data = json.loads(self.projector.graph_path.read_text(encoding="utf-8")) \
+                if self.projector.graph_path.exists() else {"nodes": [], "links": []}
         except (ValueError, OSError):
             data = {"nodes": [], "links": []}
         hist_path = self.projector.derived / "generations.json"
         history, now = {}, None
         if hist_path.exists():
             try:
-                blob = json.loads(hist_path.read_text())
+                blob = json.loads(hist_path.read_text(encoding="utf-8"))
                 if isinstance(blob, dict):
                     history = blob.get("tracked", {}) if "tracked" in blob else blob
                     now = blob.get("generation")
@@ -527,7 +559,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_ping()
 
     @mcp.tool()
-    def kg_scrub(text: str = None) -> dict:
+    def kg_scrub(text: str | None = None) -> dict:
         """Egress PII/secret scrub (§1.9): redact a snippet (or the source) with consistent placeholders
         before handing text to a subagent; the canon later restores spans to the original."""
         return engine.kg_scrub(text)
@@ -568,7 +600,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_metrics()
 
     @mcp.tool()
-    def kg_generate(mechanism: str = "bridge", k: int = 10, second_graph: str = None) -> dict:
+    def kg_generate(mechanism: str = "bridge", k: int = 10, second_graph: str | None = None) -> dict:
         """Generate hypothesized idea candidates from the graph's structure (PLAN Stage 3). Mechanisms:
         bridge (§2/§4), seed (§3 residual), compression (§7 new nodes), regroup (§8), transplant (§5),
         ensemble (§9) — or "all"/"default". READ-ONLY: candidates are proposals (provenance=hypothesized,
@@ -583,16 +615,18 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_absorption()
 
     @mcp.tool()
-    def kg_operate(op: str, target: str = None, label: str = "", body: str = "", k: int = None) -> dict:
+    def kg_operate(op: str, target: str | None = None, label: str = "", body: str = "",
+                   members: list[str] | None = None, k: int | None = None) -> dict:
         """The four endo operations (§8) that WRITE hypothesized structure via the propose lane:
         collapse (cluster→compression node + collapses_into), explode (node→latent facet children),
         regroup (persist §8 re-partition bridges), open (new primitive + attachment points). Everything
-        lands hypothesized/unverified with no span — never a verdict, never a forged anchor."""
-        return engine.kg_operate(op, target=target, label=label, body=body, k=k)
+        lands hypothesized/unverified with no span — never a verdict, never a forged anchor.
+        `members` names an explicit member set for collapse (else the cluster is inferred from target)."""
+        return engine.kg_operate(op, target=target, label=label, body=body, members=members, k=k)
 
     @mcp.tool()
-    def query_graph(node_type: str = None, relation: str = None, epistemic_state: str = None,
-                    limit: int = 50) -> dict:
+    def query_graph(node_type: str | None = None, relation: str | None = None,
+                    epistemic_state: str | None = None, limit: int = 50) -> dict:
         """Query nodes/edges by type, relation, or epistemic state (ranked by precomputed degree)."""
         return engine.query_graph(node_type=node_type, relation=relation,
                                   epistemic_state=epistemic_state, limit=limit)
@@ -603,7 +637,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.get_node(node_id) or {"error": "not found"}
 
     @mcp.tool()
-    def get_neighbors(node_id: str, relation: str = None) -> list:
+    def get_neighbors(node_id: str, relation: str | None = None) -> list:
         """Edges incident to a node, optionally filtered by relation."""
         return engine.get_neighbors(node_id, relation)
 
@@ -613,7 +647,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return {"path": engine.shortest_path(source, target)}
 
     @mcp.tool()
-    def kg_context(query: str = None, budget: int = 2000) -> dict:
+    def kg_context(query: str | None = None, budget: int = 2000) -> dict:
         """Grounding-aware, provenance-carrying, token-budgeted context for the session."""
         return engine.kg_context(query, budget)
 

@@ -306,6 +306,15 @@ def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids) -> 
             edge.span = check_span
         # a verifying span justifies span-present provenance; if the agent under-claimed (inferred),
         # leave it; if it claimed span-present we keep it.
+        # failure memory binds re-extraction too (§1.7): if this EXACT identity already lives in
+        # FAILURE_STATES, re-emitting it would otherwise dedup into the canon and overwrite the
+        # failed/rejected verdict with a fresh `unverified` edge — silently erasing the memory of a
+        # refutation. Quarantine it (never merged) so the verdict can never be reset by a re-build.
+        # Unlike the hypothesized lane we check ONLY the same `ident`, not the reverse: a span-present
+        # edge has genuine textual support for ITS OWN direction, so the reverse edge is a distinct
+        # honest claim, not a re-proposal of the refuted one.
+        if ident in failure_ids:
+            return _ok("edge", edge, Disposition.QUARANTINED, "collapses-into-known-failure", False, ident)
 
     # undeclared edge type -> quarantine (never silently accepted) — applies to every lane
     if edge_types is not None and edge.relation not in edge_types:

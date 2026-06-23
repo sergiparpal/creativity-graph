@@ -118,9 +118,12 @@ def slug(s: str) -> str:
     # macOS/HFS+ copy-paste vs NFC) produce the SAME slug — otherwise the same logical node/edge
     # forks into two ids/filenames and dedup (§1.4) silently fails.
     s = unicodedata.normalize("NFC", str(s)).strip().lower()
-    # MAP punctuation to a separator rather than DELETING it: deleting collapses distinct inputs
-    # ('a/b' vs 'ab', 'I/O' vs 'IO', 'foo.bar' vs 'foobar') onto one id/filename, conflating two
-    # genuinely different nodes/edges. Mapping to '-' preserves distinctness.
+    # MAP punctuation to a separator rather than DELETING it. This is the WEAKER of two guarantees,
+    # not perfect injectivity: punctuation and separators all collapse to a single '-', so
+    # punctuation-only variants are *intentionally* unified — slug('a/b')==slug('a-b')==slug('a b')
+    # and slug('!!!foo!!!')==slug('foo'). What mapping (vs deleting) buys is that distinct inputs
+    # which differ by a SEPARATING mark stay distinct ('a/b' vs 'ab', 'I/O' vs 'IO', 'foo.bar' vs
+    # 'foobar' do NOT collapse onto one id/filename, as deletion would conflate them).
     s = re.sub(r"[^\w\s-]", "-", s)
     return re.sub(r"[\s_-]+", "-", s).strip("-") or "node"
 

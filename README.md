@@ -92,7 +92,7 @@ These are enforced by the engine — agents cannot opt out:
 5. **validation at two points.** Extraction precision is gated **at build time**
    (`f4_probe.py score` ≥ 0.70) and the bridge metric is gated **at ground time**
    (`kg_engine.harness specificity`) before any specificity-weighted ranking is trusted.
-6. **PII scrub on egress (§1.9).** `kg_scrub` (the 11th tool) wraps `Scrubber(sensitivity)`:
+6. **PII scrub on egress (§1.9).** `kg_scrub` (the egress scrub tool) wraps `Scrubber(sensitivity)`:
    secrets (always) + PII (per sensitivity) are redacted with consistent placeholders
    (`⟦SECRET:1⟧` etc.) before text is handed to a subagent. Egress scrubbing is now wired into
    `kg_write` too: span verification restores placeholder spans to the **original** source text
@@ -146,7 +146,7 @@ full chain.
 |---|---|---|---|
 | `source_path` | absolute path | — | the document the graph is built and grounded against. |
 | `sensitivity` | `low` \| `medium` \| `high` | `medium` | egress scrubbing: `low` = secrets only; `medium` = + structured PII; `high` = + person/address heuristics. |
-| `metrics_mode` | `structure_only` \| `with_embeddings` | `structure_only` | `structure_only` uses graph structure as the bridge signal; `with_embeddings` is accepted but currently inert (the former `sqlite-vss` candidate generator was removed). |
+| `metrics_mode` | `structure_only` | `structure_only` | the only effective value: graph structure is the bridge signal. The engine never branches on this (it is stored and echoed by `kg_ping` only), and there is no enum constraint — an embeddings path is **not implemented** (the former `sqlite-vss` candidate generator was removed), so any other value is inert. |
 
 Confirm the server sees your config:
 

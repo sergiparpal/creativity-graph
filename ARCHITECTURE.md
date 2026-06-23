@@ -53,10 +53,12 @@ same identity updates the existing one, never creates a duplicate. `edge.id` is 
 ## Boundary dispositions (§1.8) — `validate()` returns one per item
 
 - `ACCEPTED`  — valid; span verifies; type declared. Written to canon, `epistemic_state=unverified`.
-- `DEMOTED`   — written, but a claimed axis is downgraded. Cases: claimed `authored_by=human` **or**
-  `deterministic` → demote to `agent` (a write payload may not forge a human verdict *or* a parser-authored, span-exempt
-  edge); payload set `epistemic_state` to any non-`unverified` state (a verdict **or** `obsolete`) → reset
-  to `unverified` (those flow only through `kg_ground`).
+- `DEMOTED`   — written, but a claimed axis is downgraded. Cases: claimed `authored_by=human` → demote to
+  `agent` (a write payload may not forge a human verdict); claimed `authored_by=deterministic` → demote to
+  `agent` on the span-present/inferred lane (a parser-authored, span-exempt edge would bypass §1.5) but
+  **preserved** on the hypothesized lane (no span check to bypass — a discovery mechanism may legitimately
+  author a candidate); payload set `epistemic_state` to any non-`unverified` state (a verdict **or**
+  `obsolete`) → reset to `unverified` (those flow only through `kg_ground`).
 - `QUARANTINED` — structurally valid but untrusted; not merged into trusted canon. Cases: undeclared
   node/edge type (routed to the `undeclared-type` bucket, never silently accepted); reconciler-detected
   out-of-band epistemic_state transition (forged verdict re-quarantined).
@@ -71,7 +73,10 @@ same identity updates the existing one, never creates a duplicate. `edge.id` is 
 - An `authored_by=deterministic` edge is span-present by construction (parser-exact) **only when it comes
   from the in-process parser**. A *write payload* cannot self-declare `deterministic` to skip the span
   check: the boundary demotes that claim to `agent`, so the edge then needs a verifying span like any
-  other. (Span-present must be unreachable-around, not opt-out.)
+  other. (Span-present must be unreachable-around, not opt-out.) **Exception — the hypothesized lane:** a
+  `hypothesized` candidate carries no span and so has no span-present check to bypass, so a deterministic
+  *discovery mechanism* may legitimately author it — the boundary **preserves** `deterministic` there and
+  demotes only the (still-forgeable) `human` claim to `agent`.
 - Every agent edge MUST carry a non-empty `span`. Missing → `REJECTED/no-supporting-span`.
 - The span must verify against the **original** source text (whitespace-normalized, case-insensitive
   substring). Restore scrubber placeholders before verifying. Not found → `REJECTED/span-not-in-source`.
@@ -79,8 +84,11 @@ same identity updates the existing one, never creates a duplicate. `edge.id` is 
 ## Never-forge-a-verdict (§1.4, §1.8)
 
 A write payload may not assert a verdict. `epistemic_state ∈ {grounded,rejected,failed}` in a write →
-demoted to `unverified`. `authored_by=human` in a write → demoted to `agent`. Verdicts are applied ONLY
-through `kg_ground`, which stamps `verdict_by`, `verdict_at`, and appends an audit record. The reconciler
+demoted to `unverified` (every lane, including hypothesized). `authored_by=human` in a write → demoted to
+`agent`. A claimed `authored_by=deterministic` is demoted to `agent` on the span-present/inferred lane (it
+would bypass the span check); on the **hypothesized** lane there is no span check to bypass, so a
+deterministic discovery-mechanism author is **preserved** there. Verdicts are applied ONLY through
+`kg_ground`, which stamps `verdict_by`, `verdict_at`, and appends an audit record. The reconciler
 re-quarantines any out-of-band epistemic_state transition that lacks a matching audit record.
 
 ## Memory of failures (§1.7)
@@ -114,9 +122,10 @@ edit, or a non-git vault — still reprojects.
   `kg_context(query=None, budget=2000) -> dict`.
 - `harness`: `agreement(label_sets) -> alpha`; `specificity(graph, corpus) -> verdict`;
   `ideation(outputs_by_condition) -> table`.
-- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration (`kg_ping`, `kg_scrub`, `query_graph`,
-  `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_write`, `kg_ground`, `kg_rename`,
-  `kg_metrics`).
+- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 15 tools: `kg_ping`,
+  `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_write`,
+  `kg_ground`, `kg_rename`, `kg_metrics`, plus the four generative-layer tools `kg_propose`,
+  `kg_generate`, `kg_operate`, `kg_absorption`.
 
 All filesystem state goes under `${KG_DATA}` (derived, caches, locks may live with canon under
 `${KG_PROJECT_DIR}`); `${CLAUDE_PLUGIN_ROOT}` is read-only bundled code.

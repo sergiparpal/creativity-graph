@@ -1,7 +1,9 @@
 """The canonical layer (§1.2): human-editable Markdown notes, crash-safe single-writer I/O.
 
 - single-file writes: temp-file + atomic os.replace
-- multi-file mutations: write-all-then-one-commit, with git-as-rollback (stash-before-reset)
+- multi-file mutations: snapshot every touched file's bytes, write-all-then-one-commit; on any write
+  failure restore the in-memory snapshot (same on git and non-git vaults — git is used only for the
+  success-path commit, never for rollback)
 - a reclaimable lease lock so a dead/expired session never wedges the vault
 """
 from __future__ import annotations
@@ -57,7 +59,7 @@ class LeaseLock:
 
     def _read(self) -> dict | None:
         try:
-            return json.loads(self.path.read_text())
+            return json.loads(self.path.read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError):
             return None
 
@@ -130,7 +132,7 @@ class LeaseLock:
     @staticmethod
     def _read_path(p: Path) -> dict | None:
         try:
-            return json.loads(p.read_text())
+            return json.loads(p.read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
             return None
 
@@ -153,18 +155,48 @@ class LeaseLock:
 
     def heartbeat(self, now: float | None = None) -> None:
         rec = self._read()
-        if rec is not None and not self._owned_by_self(rec):
-            return  # never refresh another session's lock
+        # Refresh, never acquire: a heartbeat only extends a lock we VERIFIABLY hold. If the record is
+        # gone (rec is None) or owned by someone else, do nothing — blind-writing a fresh self-owned
+        # record here would be an un-CAS'd acquisition that could steal a path a successor reclaimed
+        # after our lease lapsed. Acquisition goes solely through acquire()'s O_EXCL/reclaim CAS (F16).
+        if rec is None or not self._owned_by_self(rec):
+            return
         now = time.time() if now is None else now
-        merged = (rec or {})
+        merged = dict(rec)
         merged.update({"pid": self.pid, "host": self.host, "ttl": self.ttl, "heartbeat_at": now})
         merged.setdefault("acquired_at", now)
         _atomic_write(self.path, json.dumps(merged))
 
     def release(self) -> None:
+        # Read-then-unlink would be a TOCTOU: if our lease lapsed past TTL and a successor reclaimed the
+        # path between our _read() and the unlink, a plain unlink(self.path) would delete THEIR lock.
+        # Mirror acquire()'s reclaim discipline — rename our lock aside (only one racer can move a given
+        # inode), confirm the MOVED record is still ours, then unlink it; if the path was already
+        # reclaimed (our rename moved someone else's record, or the record changed under us) put it back
+        # and leave the successor's lock untouched (F15).
         rec = self._read()
-        if rec and self._owned_by_self(rec):
-            self.path.unlink(missing_ok=True)
+        if not (rec and self._owned_by_self(rec)):
+            return
+        sidelined = self.path.with_name(f"{self.path.name}.release-{self.pid}-{int(time.time() * 1000)}")
+        try:
+            os.replace(self.path, sidelined)
+        except (FileNotFoundError, OSError):
+            return  # already gone/reclaimed — nothing of ours to release
+        moved = self._read_path(sidelined)
+        if moved is not None and self._owned_by_self(moved):
+            try:
+                os.unlink(sidelined)
+            except OSError:
+                pass
+            return
+        # we moved a foreign/changed record aside (a successor reclaimed the path) — restore it
+        try:
+            os.replace(sidelined, self.path)
+        except OSError:
+            try:
+                os.unlink(sidelined)
+            except OSError:
+                pass
 
 
 def _pid_probe(pid: int, host: str, my_host: str) -> bool:
@@ -208,13 +240,13 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -222,6 +254,10 @@ def _atomic_write(path: Path, text: str) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 # --------------------------------------------------------------------------- Canon
@@ -241,13 +277,20 @@ class RollbackInfo:
 class Canon:
     """Markdown canon rooted at a project dir; notes live under <project>/canon/."""
 
-    def __init__(self, project_dir: str | os.PathLike):
+    def __init__(self, project_dir: str | os.PathLike, *, ensure_layout: bool = True):
         self.root = Path(project_dir)
         self.notes_dir = self.root / CANON_SUBDIR
-        self.notes_dir.mkdir(parents=True, exist_ok=True)
         self.lock = LeaseLock(self.root / LOCK_NAME)
         self._lock_depth = 0  # re-entrancy guard so nested writes don't deadlock the single-writer lease
-        self._ensure_git_excludes()
+        # ensure_layout=False lets a READ-ONLY consumer (e.g. the precontext PreToolUse hook, which runs
+        # on every Grep/Glob/Read) construct a Canon for kg_context reads WITHOUT the constructor side
+        # effects: the canon-dir mkdir and the .git/info/exclude rewrite (_ensure_git_excludes re-reads
+        # that file on every call). Reads over a missing notes_dir just glob empty; a write through such
+        # an instance still self-heals the dir via _atomic_write_bytes' parent mkdir. Default True keeps
+        # the original eager-layout behavior for every writer (server/backend/reconciler).
+        if ensure_layout:
+            self.notes_dir.mkdir(parents=True, exist_ok=True)
+            self._ensure_git_excludes()
 
     def _ensure_git_excludes(self) -> None:
         """Keep transient runtime files (session lock, temp files, reconcile state) out of git in ANY
@@ -304,10 +347,30 @@ class Canon:
         try:
             existing = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=node.id)
         except Exception:
-            return  # unreadable existing note is handled elsewhere; don't mask it as a collision
+            # An UNREADABLE existing note at the target path. With fallback_id=node.id we cannot tell
+            # whether it is the node's OWN corrupt file (the common self-heal case — overwrite-to-repair
+            # must keep working) or a distinct/foreign note that would be silently destroyed. Be
+            # conservative: back up its raw bytes BEFORE the write proceeds so the overwrite is never
+            # lossy, then allow the write (F28). The backup is a dotfile, so note_paths() ignores it.
+            self._backup_unreadable(p)
+            return
         if existing.id != node.id:
             raise ValueError(
                 f"node id slug collision: {node.id!r} and {existing.id!r} both map to {p.name}")
+
+    @staticmethod
+    def _backup_unreadable(p: Path) -> None:
+        """Preserve the raw bytes of an unreadable note about to be overwritten, under a dotfile sibling
+        (hidden from note_paths()), so a foreign/corrupt note is recoverable rather than lost."""
+        try:
+            data = p.read_bytes()
+        except OSError:
+            return  # cannot read the bytes at all — nothing to preserve, let the write proceed
+        backup = p.with_name(f".{p.name}.unreadable-{int(time.time() * 1000)}.bak")
+        try:
+            _atomic_write_bytes(backup, data)
+        except OSError:
+            pass  # best-effort backup; never block the self-heal write on it
 
     # ---- paths
     def node_path(self, node_id: str) -> Path:
@@ -362,14 +425,18 @@ class Canon:
         finally:
             self._release_lock()
 
-    # ---- multi-file mutation with git-as-rollback
+    # ---- multi-file mutation with snapshot-restore rollback
     def write_nodes(self, nodes: list[Node], *, message: str, commit: bool = True,
                     merge: bool = True) -> RollbackInfo:
         """Write a batch of nodes, then one commit. With `merge` (default) incoming edges are merged
         into existing notes (single-canonical-edge rule); with `merge=False` each node is written
         verbatim (used by kg_rename, which has already rewritten every endpoint and must NOT re-merge
-        the pre-rename edges back in). On any failure: stash-before-reset (git) or restore the pre-write
-        snapshot (non-git), so a partial batch never persists (§Stage 1)."""
+        the pre-rename edges back in). On any WRITE failure restore the pre-batch in-memory byte
+        snapshot of every touched file (same on git and non-git vaults), so a partial batch never
+        persists (§Stage 1). The commit is OUTSIDE the rollback scope and best-effort: once the atomic
+        writes have durably landed, a git failure (unset user.name/email, a rejecting hook, index.lock
+        contention) must NOT revert the already-fsynced canon — mirror kg_rename (write, then check=False
+        add/commit)."""
         repo = self.root
         self._acquire_lock()
         try:
@@ -387,13 +454,16 @@ class Canon:
                     merged = self._merge_into_existing(node) if merge else node
                     merged.updated_at = utcnow()
                     _atomic_write(self.node_path(merged.id), node_to_markdown(merged))
-                if commit and _git_ok(repo):
-                    _git(repo, "add", "-A")
-                    # allow empty so a no-op batch still succeeds
-                    _git(repo, "commit", "-m", message, "--allow-empty")
-                return RollbackInfo(False)
             except Exception as e:  # noqa: BLE001 — rollback must catch everything
                 return self._rollback(repo, str(e), snapshot)
+            # The writes have durably landed. Commit OUTSIDE the rollback try: a non-zero git exit must
+            # not revert fsynced canon (F2). check=False so a commit failure is non-fatal and never
+            # leaves content staged-but-reverted — same posture as kg_rename's success-path commit.
+            if commit and _git_ok(repo):
+                _git(repo, "add", "-A", check=False)
+                # allow empty so a no-op batch still succeeds
+                _git(repo, "commit", "-m", message, "--allow-empty", check=False)
+            return RollbackInfo(False)
         finally:
             self._release_lock()
 

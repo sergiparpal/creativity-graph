@@ -12,7 +12,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 try {
@@ -62,9 +62,13 @@ try {
   }
   if (!py) process.exit(0);
 
+  // Compare on a canonical forward-slash form: SCRIPTS uses the native separator (backslash
+  // on Windows) but .mcp.json injects `${CLAUDE_PLUGIN_ROOT}/scripts` with forward slashes,
+  // so a raw includes() would never match on Windows and prepend a redundant entry each call.
   const env = { ...process.env };
+  const canon = (p) => p.split(sep).join("/");
   const parts = env.PYTHONPATH ? env.PYTHONPATH.split(delimiter) : [];
-  if (!parts.includes(SCRIPTS)) env.PYTHONPATH = [SCRIPTS, ...parts].join(delimiter);
+  if (!parts.map(canon).includes(canon(SCRIPTS))) env.PYTHONPATH = [SCRIPTS, ...parts].join(delimiter);
 
   // stdin (the tool payload) -> precontext.py; its stdout (the additionalContext JSON)
   // -> this hook's stdout. stderr is dropped so a stray traceback never reaches the log.

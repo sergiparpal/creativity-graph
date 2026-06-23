@@ -96,6 +96,13 @@ class BackendExtractor:
                 "the headless backend needs the 'anthropic' SDK: "
                 "uv sync --extra backend  (or  pip install 'kg-engine[backend]')"
             ) from e
+        # The SDK resolves the key lazily, so anthropic.Anthropic() never raises on a missing key —
+        # it would surface only at the first messages.create() per section, get swallowed by run()'s
+        # per-section `except Exception`, and yield N near-identical 401s plus exit 1 instead of one
+        # actionable message. Assert it ONCE here; SystemExit is BaseException so it propagates past
+        # that per-section catch, mirroring the missing-SDK branch above.
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise SystemExit("the headless backend needs ANTHROPIC_API_KEY in the environment")
         self.client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
         return self.client
 
@@ -168,6 +175,27 @@ class BackendExtractor:
     def source_file_name(self) -> str:
         return self.engine.source_path.name if self.engine.source_path else "source.md"
 
+    # ---- model-aware max_tokens clamp -------------------------------------
+    def _effective_max_tokens(self) -> int:
+        """Clamp the requested max_tokens to the resolved model's registered non-streaming cap.
+
+        The SDK raises ValueError when max_tokens exceeds a model's MODEL_NONSTREAMING_TOKENS entry
+        (on a non-streamed create). DEFAULT_MODEL is not in that table (safe), but overriding to an
+        8192-capped id while leaving the 16000 default would raise on the first create() of every
+        section. Clamp to the table value when the model is registered; leave it untouched otherwise.
+        The SDK table is imported lazily and guarded so this is a no-op without the optional SDK.
+        """
+        try:
+            # The table is an SDK internal (anthropic._constants), not a top-level export — match the
+            # path the SDK's own messages resource imports it from.
+            from anthropic._constants import MODEL_NONSTREAMING_TOKENS  # noqa: PLC0415 — optional, SDK-only
+        except Exception:  # noqa: BLE001 — table moved/renamed or SDK absent → skip the clamp
+            return self.max_tokens
+        cap = MODEL_NONSTREAMING_TOKENS.get(self.model)
+        if isinstance(cap, int) and cap > 0 and self.max_tokens > cap:
+            return cap
+        return self.max_tokens
+
     # ---- one API call per section -----------------------------------------
     def extract_section(self, scrubbed_text: str, title: str = "") -> dict:
         """Call the model on one (already-scrubbed) section; return the raw {nodes, edges} JSON."""
@@ -180,7 +208,7 @@ class BackendExtractor:
         )
         resp = client.messages.create(
             model=self.model,
-            max_tokens=self.max_tokens,
+            max_tokens=self._effective_max_tokens(),
             system=SYSTEM_PROMPT,
             thinking={"type": "adaptive"},
             output_config={"format": {"type": "json_schema", "schema": self.section_schema()}},
@@ -274,6 +302,13 @@ class BackendExtractor:
                     scrubbed = self.engine.kg_scrub(body)["scrubbed"]
                     raw = self.extract_section(scrubbed, title)
                     result = self.engine.kg_write(self._stamp(raw), message=f"backend:{title or 'preamble'}")
+                    if result.get("rolled_back"):
+                        # The boundary rolled the whole section's write back (write_nodes raised): its
+                        # `written_nodes` is [] and the accepted/demoted counts never landed, so they
+                        # must NOT be accumulated. Record it as a failed section instead of over-reporting.
+                        failed_sections.append({"title": title or "preamble",
+                                                "error": result.get("error") or "kg_write rolled back"})
+                        continue
                     for k, v in result["dispositions"].items():
                         totals[k] += v
                     n_written += 1
