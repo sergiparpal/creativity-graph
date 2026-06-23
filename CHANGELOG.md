@@ -14,6 +14,44 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-23
+
+### Fixed — exhaustive review hardening
+
+A whole-codebase review surfaced 44 verified findings (0 critical, 6 high, 6 medium, the rest low/nit);
+all are fixed here, each with a regression test. No feature or contract changes — the public surface,
+the three axes, and every anti-nonsense guarantee are unchanged.
+
+**Integrity (high).**
+- The write boundary now **quarantines a re-emitted edge whose identity is already `failed`/`rejected`**
+  on the span-present/inferred lane too (`collapses-into-known-failure`), so an idempotent re-build can
+  no longer overwrite a refutation with a fresh `unverified` edge (§1.7).
+- `canon.write_nodes` moves the `git add`/`commit` **out of the data-rollback path**: a commit failure
+  (unset identity, a rejecting hook, index-lock contention) no longer discards already-fsynced canon.
+- The reconciler persists a forged-verdict correction **to the note it actually read** (and unlinks the
+  stale non-canonical original) instead of the slug path, so a hand-named note can no longer keep a
+  forged verdict in a self-concealing duplicate.
+- Six MCP tool wrappers accept explicit `null` (`X | None = None`); the `high`-sensitivity PERSON
+  scrubber no longer leaks a name shadowed by a leading Title-Case non-name word.
+
+**Robustness (medium).** `kg_absorption` emits JSON-safe `null` (not `Infinity`); `kg_context` shares
+one token budget across the grounded/hypothesized lanes and reports the true total; the reconciler reads
+audit/state/graph as UTF-8 and degrades on a locale mismatch instead of crashing; `kg_write` reports an
+empty write set on rollback (and the headless backend honors it); the PHONE scrubber no longer
+over-redacts bare prose numbers; the release checklist lists all four version-bearing files the gate
+enforces.
+
+**Hardening (low/nit).** Structured MCP errors on a corrupt note; `LeaseLock` release/heartbeat TOCTOU
+fixes and lease-before-read in `kg_ground`; the rank advisory excludes never-pruned `failed`/`rejected`
+edges; `_load_state` tolerates a non-dict state file; clearer headless backend failures (single
+`SystemExit` on a missing API key, `max_tokens` clamp); bootstrap stamp folds interpreter identity,
+`--wait` outlasts `STALE_LOCK_SECS`, orphan-proof lock steal, dead `--run` removed; **GitPython dropped**
+(unused — the engine shells out to the `git` CLI); `transplant` O(m²) hoisting; `explode` `k`-clamping;
+Windows `PYTHONPATH` dedup; UTF-8 stdin in the precontext hook; the reconciler no longer re-parses the
+whole canon a second time per full sweep; the precontext read hook constructs a side-effect-free
+`Canon` (no canon-dir `mkdir` / `.git/info/exclude` rewrite per Grep/Glob/Read); and doc/tool-count
+syncs across `ARCHITECTURE.md`, `README.md`, and this changelog.
+
 ## [0.3.0] — 2026-06-22
 
 ### Added — The generative layer

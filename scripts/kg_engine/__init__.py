@@ -12,4 +12,4 @@ Submodules:
   server      the MCP server (KGEngine facade + FastMCP tool surface)
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"

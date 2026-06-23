@@ -1,6 +1,6 @@
 [project]
 name = "kg-engine"
-version = "0.3.0"
+version = "0.3.1"
 description = "Deterministic graph engine for the creativity-graph Claude Code plugin"
 requires-python = ">=3.10"
 # Core, always-installed dependencies. Each is verified to install from wheels with no
