@@ -14,6 +14,8 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-06-23
+
 ### Fixed
 - **Cross-platform: reconciler correction of a non-canonically named note now works on case-insensitive
   filesystems (macOS/Windows).** When a hand-created note used a non-canonical filename (`Foo.md` for id
@@ -22,9 +24,22 @@ JSON back across the MCP boundary.
   **same** file, so the unlink removed the file `write_one` had just rewritten (next `stat` →
   `FileNotFoundError`), and a case-preserving replace kept the stale `Foo.md` name regardless (CI red on the
   macOS/Windows matrix; Linux, being case-sensitive, unaffected). The reconciler now detects a non-canonical
-  note by directory-entry **name** (not by resolved path, whose casing is unreliable there) and **unlinks the
-  original before** the canonical write, so `write_one` creates a fresh, correctly-cased `foo.md`. Regression
-  test added (`tests/test_fix_reconciler.py`) asserting the unlink-before-write ordering.
+  note by comparing the directory-entry name to the canonical **slug** name (`f"{slug(id)}.md"`, with no
+  filesystem resolution — `Path.resolve()` returns the existing on-disk casing on Windows, which had masked
+  the difference) and **unlinks the original before** the canonical write, so `write_one` creates a fresh,
+  correctly-cased `foo.md`. Green across the full Linux/macOS/Windows CI matrix; regression test added
+  (`tests/test_fix_reconciler.py`) asserting the unlink-before-write ordering.
+
+### Documentation
+- Synced the living docs with the v0.3.x engine. Documented all **fifteen** MCP tools in
+  `references/tools.md` (the four generative-layer tools `kg_propose` / `kg_generate` / `kg_operate` /
+  `kg_absorption`, the `kg_ground` `support_span` / `support_note` promotion params, and the `kg_context`
+  `hypotheses[]` lane + `advisory.bridge_metric`); corrected the **four**-condition ideation experiment
+  (`control | graph | graph+generate | rag`) across the README, the `/kg-experiment` command, and the
+  `kg-evaluator` agent; and fixed stale claims (content-hash reprojection staleness, in-memory byte-snapshot
+  rollback, the deterministic-claim span demotion, `generate.py`/`operations.py`/`backend.py` in the module
+  lists, the test count) across `README.md`, `ARCHITECTURE.md`, `CLAUDE.md`, `SKILL.md`, and the skill
+  references.
 
 ## [0.3.1] — 2026-06-23
 
