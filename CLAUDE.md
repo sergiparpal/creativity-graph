@@ -234,8 +234,12 @@ makes it installable via `/plugin marketplace add sergiparpal/creativity-graph` 
 
 1. Commit the version bump and changelog on `main`.
 2. Push `main` to the public repo so the updated `marketplace.json` (with the bumped version) is live.
-3. Tag the release: `claude plugin tag creativity-graph <version>`.
-4. `git tag vX.Y.Z && git push --tags`.
+3. Tag the release: `claude plugin tag . --push`. The CLI takes the plugin **path** (not a name), reads
+   the version from `plugin.json`, validates that the enclosing `marketplace.json` entry agrees, and
+   creates **and** pushes the `creativity-graph--v<version>` tag — the repo's convention (cf. the
+   existing `creativity-graph--v0.3.0`). Drop `--push` to create it locally first, then
+   `git push origin refs/tags/creativity-graph--v<version>`. (There is no separate plain `vX.Y.Z` tag;
+   `--dry-run` prints exactly what would be tagged.)
 
 Publishing is hard to reverse and makes the release publicly installable — do it only when steps 1–3
 are green and the version is final.
