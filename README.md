@@ -144,9 +144,14 @@ full chain.
 
 | option | values | default | effect |
 |---|---|---|---|
-| `source_path` | absolute path | — | the document the graph is built and grounded against. |
+| `source_path` | absolute path | **none — set this** | the document the graph is built and grounded against. **Effectively required:** there is no default, so until you set it the graph has nothing to verify spans against. |
 | `sensitivity` | `low` \| `medium` \| `high` | `medium` | egress scrubbing: `low` = secrets only; `medium` = + structured PII; `high` = + person/address heuristics. |
 | `metrics_mode` | `structure_only` | `structure_only` | the only effective value: graph structure is the bridge signal. The engine never branches on this (it is stored and echoed by `kg_ping` only), and there is no enum constraint — an embeddings path is **not implemented** (the former `sqlite-vss` candidate generator was removed), so any other value is inert. |
+
+> ⚠️ **Set `source_path` first.** It has no default. If it is left unconfigured, every extracted edge fails
+> the span-present check (`REJECTED: span-not-in-source`) because there is no source text to verify against —
+> the graph builds but is empty/unusable. Point it at the absolute path of the document you want grounded
+> (the bundled `examples/source.md` is only used as a fallback when you run from inside this repo).
 
 Confirm the server sees your config:
 
