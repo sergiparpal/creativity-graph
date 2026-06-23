@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .canon import Canon, GROUND_AUDIT
-from .model import EpistemicState, GROUNDABLE_STATES, VERDICT_STATES, node_from_markdown
+from .model import EpistemicState, GROUNDABLE_STATES, VERDICT_STATES, node_from_markdown, slug
 
 __all__ = ["Reconciler", "ReconcileReport", "OrphanReport", "GROUND_AUDIT"]
 
@@ -189,21 +189,23 @@ class Reconciler:
                 # else a duplicate edge in two states, and re-statting the untouched original would
                 # re-skip it forever (reconciler-3, self-concealing).
                 #
-                # Detect "non-canonical" by the directory-entry NAME (a case-sensitive string compare),
-                # NOT by resolved path: on a case-insensitive filesystem (macOS/Windows) path resolution
-                # casing is unreliable, but note_paths() yields the real stored name ('Foo.md' vs the slug
-                # 'foo.md'). And remove the original BEFORE writing: there Foo.md and foo.md are the SAME
-                # file, so a write-then-unlink would delete the just-written note, and a case-preserving
-                # replace would keep the stale 'Foo.md' name anyway. Deleting first lets write_one create a
-                # fresh, correctly-cased foo.md; on a case-sensitive FS it just drops the distinct duplicate.
-                # The corrected node is in memory, so a crash in the tiny unlink->write window at worst drops
-                # an already-forged note (re-corrected next sweep), never a grounded one.
-                canonical = self.canon.node_path(node.id)
-                if p.name != canonical.name:
+                # Detect "non-canonical" by comparing the directory-entry name to the PURE SLUG name
+                # (`slug(id).md`), a plain case-sensitive string compare with NO filesystem resolution.
+                # node_path() calls Path.resolve(), and on Windows resolve() returns the EXISTING on-disk
+                # casing ('Foo.md'), which would mask the difference from the canonical 'foo.md' and skip
+                # this correction; note_paths() yields the real stored name ('Foo.md'). And remove the
+                # original BEFORE writing: on a case-insensitive filesystem (macOS/Windows) Foo.md and
+                # foo.md are the SAME file, so a write-then-unlink would delete the just-written note, and a
+                # case-preserving replace would keep the stale 'Foo.md' name anyway. Deleting first lets
+                # write_one create a fresh, correctly-cased foo.md; on a case-sensitive FS it just drops the
+                # distinct duplicate. The corrected node is in memory, so a crash in the tiny unlink->write
+                # window at worst drops an already-forged note (re-corrected next sweep), never a grounded one.
+                canonical_name = f"{slug(node.id)}.md"
+                if p.name != canonical_name:
                     p.unlink(missing_ok=True)  # drop the non-canonical original before the canonical write
                     files_state.pop(rel, None)
-                    rel = canonical.name
-                    p = canonical
+                    rel = canonical_name
+                    p = self.canon.notes_dir / canonical_name
                 self.canon.write_one(node)
                 st = p.stat()
                 digest = _sha256(p)
