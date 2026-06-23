@@ -17,7 +17,12 @@ import typing
 
 from kg_engine.canon import RollbackInfo
 from kg_engine.model import Node, Provenance
-from kg_engine.server import _register
+from kg_engine.server import _register, build_engine_from_env
+
+# env vars that feed source/project resolution in build_engine_from_env — cleared so the host
+# environment can't leak into these tests
+_RESOLUTION_ENV = ("KG_SOURCE_PATH", "CLAUDE_PLUGIN_OPTION_SOURCE_PATH", "KG_PROJECT_DIR",
+                   "CLAUDE_PROJECT_DIR", "KG_PACK_PATH", "KG_DATA")
 
 
 # --- a FakeMCP that captures the registered wrapper callables (no MCP client needed) ---------------
@@ -165,3 +170,37 @@ def test_f31_explicit_member_collapse_reachable_through_wrapper(engine):
     rels = {e.relation for e in engine.canon.all_edges()}
     assert "collapses_into" in rels
     assert any(e.provenance == Provenance.HYPOTHESIZED for e in engine.canon.all_edges())
+
+
+def test_unsubstituted_source_path_placeholder_falls_back_not_taken_literally(tmp_path, monkeypatch):
+    """An unconfigured `source_path` (no default in plugin.json) reaches the engine as the LITERAL
+    `${user_config.source_path}` via `.mcp.json`. build_engine_from_env must treat that the same as unset
+    — like `bootstrap._clean` / `launch_server.clean` — or `source_text()` reads a non-existent file and
+    every agent edge fails span verification (`span-not-in-source`). With the bundled example present in the
+    project, resolution falls back to it instead of the literal path."""
+    for var in _RESOLUTION_ENV:
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "examples").mkdir()
+    example = tmp_path / "examples" / "source.md"
+    example.write_text("# demo source\n", encoding="utf-8")
+    monkeypatch.setenv("KG_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("KG_SOURCE_PATH", "${user_config.source_path}")  # unsubstituted literal
+
+    engine = build_engine_from_env()
+    assert engine.source_path == example                  # fell back to the bundled example...
+    assert str(engine.source_path) != "${user_config.source_path}"   # ...not taken literally
+    assert engine.source_text().strip() == "# demo source"
+
+
+def test_unsubstituted_source_path_with_no_fallback_is_none(tmp_path, monkeypatch):
+    """A real user vault has no `examples/source.md`, so the unsubstituted placeholder must resolve to a
+    clean 'no source configured' state (None) — never the literal path, which would silently reject
+    every edge."""
+    for var in _RESOLUTION_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("KG_PROJECT_DIR", str(tmp_path))   # empty vault, no examples/
+    monkeypatch.setenv("KG_SOURCE_PATH", "${user_config.source_path}")
+
+    engine = build_engine_from_env()
+    assert engine.source_path is None
+    assert engine.source_text() == ""

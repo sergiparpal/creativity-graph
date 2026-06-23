@@ -527,17 +527,24 @@ def build_engine_from_env(*, project=None, data=None, source=None, pack=None) ->
     """Construct a KGEngine from environment config, with optional explicit overrides (CLI flags win
     over env). All resolution — project dir, source, pack auto-discovery, and the flood rate limit —
     lives here so every caller (MCP server, headless backend) gets identical behavior."""
-    project = project or os.environ.get("KG_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    data = data or os.environ.get("KG_DATA")
-    # treat an empty env value the same as unset, so a blank `${user_config.*}` substitution falls back
-    # to the documented default instead of an empty string the engine then misreports.
+    # Treat an empty OR unsubstituted `${...}` env value the same as unset. When a `${user_config.*}`
+    # placeholder is never substituted — e.g. `source_path`, which has no default in plugin.json — Claude
+    # Code passes the literal `${user_config.source_path}` through `.mcp.json`. Taking that as a real path
+    # silently breaks the engine: `source_text()` reads a non-existent file and returns "", so every agent
+    # edge fails span verification (`span-not-in-source`). Mirrors `bootstrap._clean` / `launch_server.clean`,
+    # which strip the same values; without it the documented `examples/source.md` fallback never fires.
+    def _env(key):  # noqa: E306
+        v = (os.environ.get(key) or "").strip()
+        return None if not v or v.startswith("${") else v
+    project = project or _env("KG_PROJECT_DIR") or _env("CLAUDE_PROJECT_DIR") or os.getcwd()
+    data = data or _env("KG_DATA")
     opt = lambda k, d=None: (os.environ.get(f"CLAUDE_PLUGIN_OPTION_{k}") or "").strip() or d  # noqa: E731
-    src = source or opt("SOURCE_PATH") or (os.environ.get("KG_SOURCE_PATH") or "").strip() or None
+    src = source or opt("SOURCE_PATH") or _env("KG_SOURCE_PATH")
     if not src:
         # documented default: build/ground against the bundled example when nothing is configured
         guess = Path(project) / "examples" / "source.md"
         src = str(guess) if guess.exists() else None
-    pack_path = pack or os.environ.get("KG_PACK_PATH")
+    pack_path = pack or _env("KG_PACK_PATH")
     if not pack_path:
         guess = Path(project) / "pack" / "pack.yaml"
         pack_path = str(guess) if guess.exists() else None

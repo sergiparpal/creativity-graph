@@ -14,6 +14,20 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-06-23
+
+### Fixed
+- **Out-of-box usability: an unconfigured `source_path` no longer silently breaks span verification.**
+  `source_path` has no default in `plugin.json`, so when it is left unset Claude Code passes the **literal**
+  string `${user_config.source_path}` through `.mcp.json` as `KG_SOURCE_PATH`. `build_engine_from_env` took
+  that literal as a real path: `source_text()` then read a non-existent file and returned `""`, so **every**
+  agent edge failed the span-present check (`REJECTED:span-not-in-source`) — the graph built but was unusable,
+  and silently. The resolver now treats an empty **or** unsubstituted `${...}` env value as unset (mirroring
+  `bootstrap._clean` / `launch_server.clean`, which already strip the same values), applied to
+  `KG_SOURCE_PATH` / `KG_PROJECT_DIR` / `KG_DATA` / `KG_PACK_PATH` — so the documented `examples/source.md`
+  fallback can fire and an unconfigured source surfaces as a clean "no source" state. Found by an
+  adversarial cross-platform install audit; regression tests added (`tests/test_fix_server.py`).
+
 ## [0.3.2] — 2026-06-23
 
 ### Fixed
