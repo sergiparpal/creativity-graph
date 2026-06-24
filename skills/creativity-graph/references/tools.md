@@ -11,10 +11,10 @@ field is missing, grep the engine source, don't guess.
 
 A plugin-bundled MCP server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>` — here both the
 plugin and the server are named `creativity-graph`, so every tool is `mcp__plugin_creativity-graph_creativity-graph__<tool>`
-(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **fifteen** are the **only**
-graph tools — the eleven verify/read tools (§1.1–§1.11) plus the four generative-layer tools (§1.12–§1.15).
-There is no `kg_build` / `kg_query` / `kg_project` MCP tool — those are slash commands (`/kg-build`, …) that
-*orchestrate* these tools.
+(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **sixteen** are the **only**
+graph tools — the eleven verify/read tools (§1.1–§1.11) plus the four generative-layer tools (§1.12–§1.15)
+plus the read-only `kg_agenda` (§1.16). There is no `kg_build` / `kg_query` / `kg_project` MCP tool — those
+are slash commands (`/kg-build`, …) that *orchestrate* these tools.
 
 Mutation tools (`kg_write`, `kg_propose`, `kg_ground`, `kg_rename`) write the **canon** (human-editable Markdown,
 the single source of truth) — `kg_propose` (§1.12) is the hypothesized write lane and `kg_operate` (§1.14) writes
@@ -368,6 +368,32 @@ graph plus the `derived/generations.json` ledger that `/kg-generate` appends to.
 
 `status ∈ fertile | absorbed | isolated`. With no ledger yet, `tracked` is `0` and `note` explains that
 `/kg-generate` has not started tracking the window (never an error).
+
+### 1.16 `mcp__plugin_creativity-graph_creativity-graph__kg_agenda(limit=5)`
+
+**Read-only structural "suggested questions"** (R6). Reads ONLY precomputed derived columns (node ranks +
+edge provenance/state) and returns ~`limit` structural gaps, split into two lanes that mirror `kg_context`'s
+`items[]`/`hypotheses[]`:
+
+```json
+{"answerable_now": [{"detector": "well-grounded", "lane": "answerable_now", "focus": ["compression"],
+                     "question": "'compression' is a well-grounded hub (degree 4, 4 grounded) — how do its neighbours (claim, …) interrelate?",
+                     "signals": {"degree": 4, "structural_bridge": 1, "betweenness": 0.3, "spec_betweenness": 0.2, "specificity": 0.7}}],
+ "blocked_on_grounding": [{"detector": "under-grounded-hub", "lane": "blocked_on_grounding", "focus": ["betweenness"],
+                           "question": "Hub 'betweenness' (degree 5) is under-grounded — only 1/5 of its edges are grounded. Drain its unverified queue (/kg-ground) to trust it.", "signals": {…}}],
+ "count": 2, "limit": 5, "gate_on": 0, "ranked_by": "structural_bridge",
+ "note": "structural suggestions — a heuristic, not a guarantee. …"}
+```
+
+- **Detectors**: `orphan` (degree 0), `hypothesized-only` (every live edge a proposal — always **blocked**,
+  never laundered into answerable), `under-grounded-hub`, `well-grounded` (the only **answerable_now** kind),
+  `edgeless-communities` (a disconnected cluster). The `answerable_now` vs `blocked_on_grounding` split is the
+  honesty move: a question you cannot ground-back-honestly surfaces as blocked.
+- **Ranking** mirrors `kg_context`'s gate-aware switch — `spec_betweenness` **only** when `gate_on=1`, else the
+  `structural_bridge`/degree advisory; **never** raw betweenness as lead. `ranked_by` reports which.
+- **Read-only / measure-never-gate**: it asserts no edges, copies no spans, stamps no verdicts; the question
+  text is session-time only and never written to the canon. It is a **heuristic, not a guarantee** — it
+  suggests where to look or what to ground next; it never answers or acts. `limit` is clamped to `[1, 50]`.
 
 ---
 

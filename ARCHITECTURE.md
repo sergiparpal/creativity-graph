@@ -131,10 +131,10 @@ edit, or a non-git vault — still reprojects.
   (+ `DISPATCH`), each returning a propose-lane payload (`provenance=hypothesized`, no span, no verdict).
 - `backend`: `BackendExtractor` + `main(argv)` — the headless `python -m kg_engine.backend extract` driver
   (extract → boundary → canon → project) used for an unattended, session-less rebuild.
-- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 15 tools: `kg_ping`,
-  `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_write`,
-  `kg_ground`, `kg_rename`, `kg_metrics`, plus the four generative-layer tools `kg_propose`,
-  `kg_generate`, `kg_operate`, `kg_absorption`.
+- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 16 tools: `kg_ping`,
+  `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`
+  (read-only structural agenda), `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`, plus the four
+  generative-layer tools `kg_propose`, `kg_generate`, `kg_operate`, `kg_absorption`.
 
 All filesystem state goes under `${KG_DATA}` (derived, caches, locks may live with canon under
 `${KG_PROJECT_DIR}`); `${CLAUDE_PLUGIN_ROOT}` is read-only bundled code.

@@ -40,6 +40,11 @@ _NEW_NODE_COLUMNS = {"betweenness", "spec_betweenness", "specificity", "gate_on"
 # row-count analogue.
 MAX_CONTEXT_TOKENS = 100_000
 
+# R6 (kg_agenda) detector thresholds. A node with >= _HUB_DEGREE live edges is a "hub"; its
+# grounded/(grounded+unverified) ratio splits well-grounded (answerable) from under-grounded (blocked).
+_HUB_DEGREE = 3
+_GROUNDED_RATIO = 0.5
+
 
 def _like_escape(term: str) -> str:
     """Escape SQL LIKE wildcards so a query term like `span_present` or `100%` matches literally
@@ -784,3 +789,168 @@ class Projector:
             }
         finally:
             con.close()
+
+    # ---- R6: read-only structural agenda (and the shared reader seam R1 reuses)
+    def _agenda_reader(self) -> "tuple[list[dict], list[dict]]":
+        """Read ALL node + edge rows from the derived index into plain dicts, then close. READ-ONLY by
+        construction: the connection is opened `PRAGMA query_only=ON`, so a consumer physically cannot
+        write through it. This is the shared seam both R6 (`kg_agenda`) and R1 (the exporter) consume —
+        `projector.py` stays the SOLE writer of the derived layer (graph.json/index.sqlite)."""
+        con = self._ro()
+        try:
+            con.execute("PRAGMA query_only=ON")
+            nodes = [dict(r) for r in con.execute("SELECT * FROM nodes")]
+            edges = [dict(r) for r in con.execute("SELECT * FROM edges")]
+            return nodes, edges
+        finally:
+            con.close()
+
+    def kg_agenda(self, *, limit: int = 5) -> dict:
+        """Read-only structural "suggested questions" (R6). Reads ONLY precomputed derived columns and
+        returns ~`limit` structural gaps split into `answerable_now[]` (well-grounded neighbourhoods)
+        vs `blocked_on_grounding[]` (orphans, hypothesized-only neighbourhoods, under-grounded hubs,
+        disconnected clusters) — mirroring kg_context's items[]/hypotheses[]. Ranked by the existing
+        honest signal (gate-aware, mirroring kg_context's switch; never raw betweenness as lead). It
+        asserts no edges, copies no spans, stamps no verdicts — measure-never-gate (it suggests, never
+        acts); the question text is session-time only and never touches the canon."""
+        return _agenda_from_rows(*self._agenda_reader(), limit=limit)
+
+
+# --------------------------------------------------------------------------- R6 agenda builder (pure)
+
+
+def _agenda_signals(n: dict) -> dict:
+    """The honest signals carried on each suggestion so the ranking is transparent — degree (the
+    advisory), the structural-bridge / betweenness / specificity columns, never a minted scalar."""
+    return {
+        "degree": n.get("degree") or 0,
+        "community": n.get("community"),
+        "structural_bridge": n.get("structural_bridge") or 0,
+        "betweenness": n.get("betweenness") or 0.0,
+        "spec_betweenness": n.get("spec_betweenness") or 0.0,
+        "specificity": n.get("specificity"),
+    }
+
+
+def _neighbor_labels(nid: str, live_edges: list, by_id: dict, *, cap: int = 4) -> list:
+    names, seen = [], set()
+    for e in live_edges:
+        other = e.get("target") if e.get("source") == nid else e.get("source")
+        if other == nid or other in seen:
+            continue
+        seen.add(other)
+        names.append((by_id.get(other) or {}).get("label") or other)
+        if len(names) >= cap:
+            break
+    return names
+
+
+def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
+    """Pure R6 agenda builder over precomputed derived rows (no DB, no canon — testable in isolation).
+
+    Detectors (each node matches at most one): orphan (degree 0), hypothesized-only (every live edge a
+    proposal), well-grounded hub (answerable), under-grounded hub (blocked), plus edgeless-communities
+    (a disconnected cluster of >=2 nodes). Ranked by the gate-aware honest signal — `spec_betweenness`
+    ONLY when `gate_on=1`, else `structural_bridge`/betweenness/degree (mirroring kg_context's switch;
+    never raw betweenness as lead). Split into the two lanes, each capped at `limit`. Read-only — it
+    only inspects rows and returns text."""
+    limit = max(1, min(int(limit), 50))
+    gate_on = int(next((n.get("gate_on") for n in nodes if n.get("gate_on") is not None), 0) or 0)
+    ranked_by = "spec_betweenness" if gate_on else "structural_bridge"
+    by_id = {n["id"]: n for n in nodes}
+
+    incident: dict = {n["id"]: [] for n in nodes}
+    for e in edges:
+        for endp in (e.get("source"), e.get("target")):
+            if endp in incident:
+                incident[endp].append(e)
+
+    def rank_key(n: dict):  # mirror kg_context's gate switch; never raw betweenness as lead
+        d = n.get("degree") or 0
+        if gate_on:
+            return (float(n.get("spec_betweenness") or 0.0), d)
+        return (int(n.get("structural_bridge") or 0), float(n.get("betweenness") or 0.0), d)
+
+    gaps: list = []  # (rank_key, item)
+    emitted: set = set()  # node ids already surfaced by a node-level detector (one detector per node)
+
+    for n in nodes:
+        nid = n["id"]
+        label = n.get("label") or nid
+        deg = n.get("degree") or 0
+        live = [e for e in incident[nid] if e.get("epistemic_state") not in ("failed", "rejected")]
+        grounded = sum(1 for e in live if e.get("epistemic_state") == "grounded")
+        unverified = sum(1 for e in live if e.get("epistemic_state") == "unverified")
+        decided = grounded + unverified
+
+        if deg == 0:
+            item = {"detector": "orphan", "lane": "blocked_on_grounding", "focus": [nid],
+                    "question": f"'{label}' is isolated — it has no live relations. What should connect "
+                                f"to it, and can that be grounded?"}
+        elif live and all(e.get("provenance") == "hypothesized" for e in live):
+            item = {"detector": "hypothesized-only", "lane": "blocked_on_grounding", "focus": [nid],
+                    "question": f"Every relation on '{label}' is a hypothesis — its role is unverified. "
+                                f"Ground them (/kg-ground) before treating it as established."}
+        elif deg >= _HUB_DEGREE and decided and grounded / decided >= _GROUNDED_RATIO:
+            nbrs = _neighbor_labels(nid, live, by_id)
+            item = {"detector": "well-grounded", "lane": "answerable_now", "focus": [nid],
+                    "question": f"'{label}' is a well-grounded hub (degree {deg}, {grounded} grounded) — "
+                                f"how do its neighbours ({', '.join(nbrs)}) interrelate?"}
+        elif deg >= _HUB_DEGREE and decided and grounded / decided < _GROUNDED_RATIO:
+            item = {"detector": "under-grounded-hub", "lane": "blocked_on_grounding", "focus": [nid],
+                    "question": f"Hub '{label}' (degree {deg}) is under-grounded — only {grounded}/{decided} "
+                                f"of its edges are grounded. Drain its unverified queue (/kg-ground) to trust it."}
+        else:
+            continue
+        item["signals"] = _agenda_signals(n)
+        gaps.append((rank_key(n), item))
+        emitted.add(nid)  # this node is now covered — don't re-surface it in an edgeless-communities item
+
+    # edgeless communities: a disconnected cluster (>=2 nodes, no LIVE inter-community edge) — a coverage
+    # gap, never answerable now. A single isolated node is already an `orphan`, so require >=2 members.
+    comm_of = {n["id"]: n.get("community") for n in nodes}
+    present = {c for c in comm_of.values() if c is not None and c != -1}
+    if len(present) > 1:
+        crossing: set = set()
+        for e in edges:
+            if e.get("epistemic_state") in ("failed", "rejected"):
+                continue
+            a, b = comm_of.get(e.get("source")), comm_of.get(e.get("target"))
+            if a is not None and b is not None and a != b:
+                crossing.add(a)
+                crossing.add(b)
+        for c in sorted(present - crossing):
+            # exclude members already surfaced by a node-level detector — so a lone island (an `orphan`)
+            # and a small cluster whose nodes are each already a gap (e.g. a freshly-proposed
+            # hypothesized-only pair) are NOT re-surfaced here (one detector per node). Fire only when
+            # >=2 members remain genuinely uncovered.
+            fresh = [m for m in nodes if m.get("community") == c and m["id"] not in emitted]
+            if len(fresh) < 2:
+                continue
+            rep = max(fresh, key=lambda m: m.get("degree") or 0)
+            labels = ", ".join((m.get("label") or m["id"]) for m in fresh[:3])
+            more = "…" if len(fresh) > 3 else ""
+            gaps.append((rank_key(rep), {
+                "detector": "edgeless-communities", "lane": "blocked_on_grounding",
+                "focus": [m["id"] for m in fresh],
+                "question": f"The '{rep.get('label') or rep['id']}' cluster ({labels}{more}) is disconnected "
+                            f"from the rest of the graph — what relation bridges it?",
+                "signals": _agenda_signals(rep)}))
+
+    gaps.sort(key=lambda gi: gi[0], reverse=True)
+    answerable: list = []
+    blocked: list = []
+    for _, item in gaps:
+        bucket = answerable if item["lane"] == "answerable_now" else blocked
+        if len(bucket) < limit:
+            bucket.append(item)
+    return {
+        "answerable_now": answerable,
+        "blocked_on_grounding": blocked,
+        "count": len(answerable) + len(blocked),
+        "limit": limit,
+        "gate_on": gate_on,
+        "ranked_by": ranked_by,
+        "note": ("structural suggestions — a heuristic, not a guarantee. answerable_now reads grounded "
+                 "content; blocked_on_grounding needs grounding (or extraction) first."),
+    }

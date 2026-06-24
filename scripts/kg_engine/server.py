@@ -525,6 +525,9 @@ class KGEngine:
     def kg_context(self, query: str | None = None, budget: int = 2000) -> dict:
         self._ensure_projected(); return self.projector.kg_context(query, budget=budget)
 
+    def kg_agenda(self, *, limit: int = 5) -> dict:
+        self._ensure_projected(); return self.projector.kg_agenda(limit=limit)
+
 
 # --------------------------------------------------------------------------- MCP wiring
 
@@ -663,6 +666,16 @@ def _register(mcp, engine: KGEngine) -> None:
     def kg_context(query: str | None = None, budget: int = 2000) -> dict:
         """Grounding-aware, provenance-carrying, token-budgeted context for the session."""
         return engine.kg_context(query, budget)
+
+    @mcp.tool()
+    def kg_agenda(limit: int = 5) -> dict:
+        """Read-only structural "suggested questions" (R6). Reads ONLY precomputed derived columns and
+        returns ~limit structural gaps split into answerable_now[] (well-grounded neighbourhoods) vs
+        blocked_on_grounding[] (orphans, hypothesized-only neighbourhoods, under-grounded hubs,
+        disconnected clusters). Ranked by the honest gate-aware signal (mirrors kg_context). It suggests,
+        never acts — asserts no edges, copies no spans, stamps no verdicts (measure-never-gate); a
+        hypothesized-only neighbourhood surfaces as BLOCKED, never as answerable. Heuristic, not a guarantee."""
+        return engine.kg_agenda(limit=limit)
 
 
 def main() -> None:

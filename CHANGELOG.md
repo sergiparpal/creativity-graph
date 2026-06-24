@@ -61,6 +61,21 @@ JSON back across the MCP boundary.
   `/kg-ground` gains a **Stage 0b — Drain stale verdicts** step. Coverage extends `tests/test_projector.py`
   (single- and multi-file divergence, unverified/inferred never flagged, failed-with-missing-span, no-mutate,
   persisted-and-reused, no-source) and `tests/test_grounding.py` (re-grounding clears).
+- **`kg_agenda` — read-only structural "suggested questions" (16th MCP tool).** A new read-only tool that
+  reads **only** precomputed derived columns (node ranks + edge provenance/state — never the canon, never a
+  span) and returns ~5 structural gaps, each a templated question, split into **`answerable_now[]`** (well-
+  grounded neighbourhoods) vs **`blocked_on_grounding[]`** (orphans, hypothesized-only neighbourhoods,
+  under-grounded hubs, disconnected clusters) — mirroring `kg_context`'s `items[]`/`hypotheses[]`. The split
+  is the honesty move: a hypothesized-only neighbourhood surfaces as **blocked**, never as answerable. It is
+  ranked by the **existing** honest gate-aware signal (`spec_betweenness` only when `gate_on=1`, else the
+  structural-bridge/degree advisory; never raw betweenness as lead) — no new "interestingness" scalar is
+  minted. It **asserts no edges, copies no spans, stamps no verdicts** (measure-never-gate — it suggests,
+  never acts; the question text is session-time only and never written to the canon), reading through a new
+  shared read-only `Projector._agenda_reader()` seam (opened `PRAGMA query_only`). Surfaced as an MCP tool and
+  as optional steps in `/kg-query` (orientation) and `/kg-ground` (the `blocked_on_grounding[]` lane is an
+  alternative prioritization read). MCP tool surface grows **15 → 16**. Coverage in `tests/test_agenda.py`
+  (every detector, the two-lane split, gate-aware ranking, specificity down-weight, read-only invariance,
+  limit clamp, empty graph) plus `tests/test_manifests.py::test_kg_agenda_registered`.
 
 ## [0.3.3] — 2026-06-23
 

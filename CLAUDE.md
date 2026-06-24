@@ -136,12 +136,12 @@ grounding loop is the post-hoc filter, and promotion (`kg_ground` with support) 
 Evaluation **measures, never gates** (§4): below-threshold results iterate up to 3× then record the
 best and proceed — no human gate blocks the flow. Results are appended to `PROGRESS.md`.
 
-## MCP tool surface (15 tools)
+## MCP tool surface (16 tools)
 
 Namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`:
 - **Mutations (write canon):** `kg_write` (the boundary), `kg_propose` (the *hypothesized* write lane — forces hypothesized provenance, refuses text claims), `kg_ground` (the *sole* verdict gateway — stamps `verdict_by`/`verdict_at` + audit record; `support_span`/`support_note` promote a hypothesis and upgrade its provenance), `kg_rename`.
 - **Generative (read derived → propose; §2–§14):** `kg_generate` (six discovery mechanisms, read-only), `kg_operate` (the four §8 endo operations, write via the propose lane), `kg_absorption` (the §14 absorption window).
-- **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` (grounded `items[]` + a separate `hypotheses[]` + `advisory.bridge_metric`).
+- **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` (grounded `items[]` + a separate `hypotheses[]` + `advisory.bridge_metric`), `kg_agenda` (read-only structural "suggested questions" — R6; `answerable_now[]` vs `blocked_on_grounding[]`, off the shared read-only `_agenda_reader()` seam; suggests, never acts).
 - **Utility:** `kg_ping`, `kg_metrics`, `kg_scrub` (egress PII/secret redaction with consistent placeholders; `kg_write` restores placeholders to original text for the canon).
 
 ## Installation system (cross-platform engine provisioning)

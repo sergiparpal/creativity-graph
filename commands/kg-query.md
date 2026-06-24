@@ -1,7 +1,7 @@
 ---
 description: Answer a question against the knowledge graph with provenance and falsification counters attached.
 argument-hint: <question>
-allowed-tools: mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__get_node, mcp__plugin_creativity-graph_creativity-graph__get_neighbors, mcp__plugin_creativity-graph_creativity-graph__shortest_path
+allowed-tools: mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__get_node, mcp__plugin_creativity-graph_creativity-graph__get_neighbors, mcp__plugin_creativity-graph_creativity-graph__shortest_path, mcp__plugin_creativity-graph_creativity-graph__kg_agenda
 ---
 
 You are answering a question **against the grounded knowledge graph**, not against your own prior
@@ -20,6 +20,15 @@ Question: **$ARGUMENTS**
   point at what *is* there.
 
 ## Procedure
+
+### 0. (Optional) Orient with the structural agenda
+If you want to suggest *where to look* (e.g. the question is open-ended, or you're cold-starting a session),
+you **may** call `mcp__plugin_creativity-graph_creativity-graph__kg_agenda(limit=5)` first. It reads only
+precomputed structural signals and returns `answerable_now[]` (well-grounded neighbourhoods you can answer
+from now) vs `blocked_on_grounding[]` (orphans, hypothesized-only neighbourhoods, under-grounded hubs,
+disconnected clusters that need `/kg-ground` or extraction first). It is a **heuristic, not a guarantee** and
+suggests questions — it never answers them. This step is optional: skip it to keep the query token budget
+predictable, and never present a `blocked_on_grounding` gap as if it were answered.
 
 ### 1. Get grounded, token-budgeted context
 Call `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=$ARGUMENTS)`. This is the primary source. It returns:

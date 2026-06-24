@@ -306,11 +306,11 @@ measurement rather than a slogan.
 ## The MCP tool surface
 
 Server name `creativity-graph` ⇒ tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`. The
-**eleven** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
-`query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`) plus the **four**
+**twelve** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
+`query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`) plus the **four**
 generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
 mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) are the
-**fifteen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
+**sixteen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
 commands).
 
 | tool | purpose |
@@ -325,7 +325,8 @@ commands).
 | `get_node(node_id)` | a node dict with its incident edges. |
 | `get_neighbors(node_id, relation)` | `[edge dicts]`. |
 | `shortest_path(source, target)` | `{path: [node_ids] | null}`. |
-| `kg_context(query, budget)` | budgeted context pack: `{items[]` (grounded), `hypotheses[]` (the separate hypothesized lane), `approx_tokens, budget, falsification_counters:{failed_or_rejected_edges}, advisory:{signal:"structural-bridge", note, nodes[], bridge_metric}}`. |
+| `kg_context(query, budget)` | budgeted context pack: `{items[]` (grounded), `hypotheses[]` (the separate hypothesized lane), `approx_tokens, budget, falsification_counters:{failed_or_rejected_edges}, advisory:{signal:"structural-bridge", note, nodes[], bridge_metric, stale_verdicts[]}}`. |
+| `kg_agenda(limit=5)` | **read-only** structural "suggested questions" (R6) → `{answerable_now[]` (well-grounded), `blocked_on_grounding[]` (orphans / hypothesized-only / under-grounded hubs / disconnected clusters)`, ranked_by, gate_on, count, note}`. Suggests, never acts; heuristic, not a guarantee. |
 | `kg_propose(payload)` | the **hypothesized** write lane → the `kg_write` shape `+ {propose_lane, refused_text_claims}`; forces `provenance=hypothesized`, refuses text claims. |
 | `kg_generate(mechanism, k, second_graph)` | **read-only** discovery → `{mechanism, k, gate_on, count, candidates[], note}`; `bridge\|seed\|compression\|regroup\|transplant\|ensemble`. |
 | `kg_operate(op, …)` | the four §8 endo ops (`collapse\|explode\|regroup\|open`) — write via the propose lane → the `kg_propose` shape `+ {ok, op, info}`. |

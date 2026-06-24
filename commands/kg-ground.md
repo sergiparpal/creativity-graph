@@ -1,7 +1,7 @@
 ---
 description: Drain the grounding queue — verdict unverified edges, attack hub candidates, then report verdict counts and falsification memory.
 argument-hint: "[query-or-node-filter]"
-allowed-tools: Task, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph
+allowed-tools: Task, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__kg_agenda
 ---
 
 # /kg-ground — grounding loop + adversarial grounder + memory of failures (§1.6/§1.7/§1.8, plan Stage 6)
@@ -30,6 +30,11 @@ Find what is actually pending before spending any subagent budget.
 
 If the `unverified` count is 0 and there are no hub candidates, stop and report "queue empty — nothing to
 ground". Otherwise proceed.
+
+> **Alternative prioritization (optional).** `mcp__plugin_creativity-graph_creativity-graph__kg_agenda()`'s
+> `blocked_on_grounding[]` lane is a read-only structural shortlist of what grounding would unblock —
+> under-grounded hubs and hypothesized-only neighbourhoods, ranked by the honest gate-aware signal. Use it to
+> pick which hubs/edges to drain first; it suggests, never grounds (verdicts still flow only through `kg_ground`).
 
 ## Stage 0b — Drain stale verdicts (source-staleness advisory, R3)
 
