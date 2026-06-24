@@ -145,6 +145,17 @@ def test_compute_stamp_reacts_to_interpreter_identity(tmp_path, monkeypatch):
     assert bumped_platform != bumped_arch
 
 
+def test_compute_stamp_keys_on_explicit_venv_interpreter_identity():
+    """review-M7: the stamp keys on the VENV interpreter's identity passed in, not the running one — so a
+    different bootstrapping/checking interpreter computes the SAME stamp the build wrote. Distinct
+    identities give distinct stamps; the same identity is stable; no-arg falls back to the running one."""
+    a = bootstrap.compute_stamp("3.12\0linux\0x86_64")
+    b = bootstrap.compute_stamp("3.13\0linux\0x86_64")
+    assert a != b
+    assert a == bootstrap.compute_stamp("3.12\0linux\0x86_64")
+    assert bootstrap.compute_stamp() == bootstrap.compute_stamp(bootstrap._running_identity())
+
+
 # --------------------------------------------------------------------------- #
 # is_ready
 # --------------------------------------------------------------------------- #

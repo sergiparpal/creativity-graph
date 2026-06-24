@@ -31,9 +31,11 @@ function clean(value) {
   return v;
 }
 
-// Expand a leading '~' to the home dir and resolve to an absolute path — mirroring
-// bootstrap.resolve_venv_dir's .expanduser().resolve(). A '~' or relative
-// KG_ENGINE_VENV / CLAUDE_PLUGIN_DATA must land us in the SAME place bootstrap.py used.
+// Expand a leading '~' to the home dir and resolve to an absolute path. For an ABSOLUTE or '~'-prefixed
+// KG_ENGINE_VENV / CLAUDE_PLUGIN_DATA this lands in the SAME place bootstrap.resolve_venv_dir's
+// .expanduser().resolve() does. NOTE: a RELATIVE override is resolved against the repo ROOT here, whereas
+// bootstrap.py's .resolve() uses the process CWD — so a relative override can diverge between the two
+// (overrides are normally absolute, so this is a documented edge, not the common path).
 function expandResolve(p) {
   if (p === "~") p = homedir();
   else if (p.startsWith("~/") || p.startsWith("~\\")) p = join(homedir(), p.slice(2));
@@ -100,7 +102,18 @@ function foregroundCatchUp(sys, force) {
       /* best-effort */
     }
   }
-  spawnSync(sys, [BOOTSTRAP, "--venv", dir], { stdio: ["ignore", 2, "inherit"] });
+  const r = spawnSync(sys, [BOOTSTRAP, "--venv", dir], { stdio: ["ignore", 2, "inherit"] });
+  // Surface a spawn failure (ENOENT — sys not runnable) or a non-zero bootstrap exit (2 = still
+  // provisioning past the wait deadline; 1 = build failed) instead of silently swallowing it and
+  // launching against a possibly-unready venv. The server's early-failure self-heal is still the net.
+  if (r.error || (typeof r.status === "number" && r.status !== 0)) {
+    process.stderr.write(
+      "[creativity-graph] engine provisioning did not complete" +
+        (r.error ? ` (${r.error.code || r.error.message})` : ` (bootstrap exit ${r.status})`) +
+        "; the background worker may still be building — retry shortly if tools are missing.\n"
+    );
+  }
+  return r;
 }
 
 // The venv is fresh only when bootstrap.py --check exits 0 (interpreter present AND the

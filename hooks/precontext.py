@@ -6,7 +6,19 @@ import os
 import pathlib
 import sys
 
-root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+
+def _clean(value: "str | None") -> str:
+    """Mirror bootstrap._clean / the launchers' clean(): drop empty, whitespace, and unsubstituted
+    ${...} values so an unset/unsubstituted env var never sends us to a bogus path (review-low)."""
+    if not value:
+        return ""
+    v = value.strip()
+    if not v or v.startswith("${"):
+        return ""
+    return v
+
+
+root = _clean(os.environ.get("CLAUDE_PLUGIN_ROOT"))
 if root:
     sys.path.insert(0, str(pathlib.Path(root) / "scripts"))
 
@@ -24,10 +36,15 @@ def main() -> int:
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     except Exception:
         return 0
-    project = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
+    # Resolve project/data with the SAME precedence the server uses (build_engine_from_env): KG_PROJECT_DIR
+    # / KG_DATA (the .mcp.json override knobs) win over the CLAUDE_* defaults — else precontext reads a
+    # DIFFERENT vault/derived dir than the server whenever those overrides are set (review-low).
+    project = _clean(os.environ.get("KG_PROJECT_DIR")) or _clean(os.environ.get("CLAUDE_PROJECT_DIR")) \
+        or payload.get("cwd")
     if not project:
         return 0
-    data = os.environ.get("CLAUDE_PLUGIN_DATA") or str(pathlib.Path(project) / ".kg-data")
+    data = _clean(os.environ.get("KG_DATA")) or _clean(os.environ.get("CLAUDE_PLUGIN_DATA")) \
+        or str(pathlib.Path(project) / ".kg-data")
     # Check the index exists BEFORE constructing the engine — this hook runs on every Grep/Glob/Read;
     # don't build context (or touch the derived tree) when nothing has been projected yet.
     if not (pathlib.Path(data) / "derived" / "index.sqlite").exists():

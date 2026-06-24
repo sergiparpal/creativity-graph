@@ -128,7 +128,31 @@ def venv_python(venv_dir: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # Idempotency: content stamp
 # --------------------------------------------------------------------------- #
-def compute_stamp() -> str:
+def _running_identity() -> str:
+    """The ABI identity (minor version + platform + arch) of the interpreter running THIS process."""
+    return f"{sys.version_info[0]}.{sys.version_info[1]}\0{sys.platform}\0{platform.machine()}"
+
+
+def _interp_identity(python_exe=None) -> str:
+    """The ABI identity of `python_exe` — the VENV's interpreter, not whatever interpreter happens to be
+    running bootstrap. Querying the venv python (not sys.*) makes the stamp track the interpreter that
+    actually ABI-binds the wheels, so a DIFFERENT bootstrapping/checking interpreter (e.g. a system-Python
+    upgrade between sessions, or uv picking its own python to build the venv) computes the SAME stamp the
+    build wrote — no spurious full rebuild of a still-valid venv (review-M7). Falls back to the running
+    interpreter when no venv python is available yet (the first build, before the venv exists)."""
+    if python_exe is not None:
+        code = ("import sys,platform;"
+                "print(f'{sys.version_info[0]}.{sys.version_info[1]}'+chr(0)+sys.platform+chr(0)+platform.machine())")
+        try:
+            out = subprocess.run([str(python_exe), "-c", code], capture_output=True, text=True, timeout=30)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _running_identity()
+
+
+def compute_stamp(interp_identity: "str | None" = None) -> str:
     """Hash the inputs whose change should trigger a rebuild.
 
     ``pyproject.toml`` is the declared source of the engine's dependencies (``uv.lock`` is
@@ -141,19 +165,26 @@ def compute_stamp() -> str:
     untouched — an unversioned stdlib-venv symlink re-pointed, a pyenv re-point, a moved
     arch — would otherwise keep the stamp matching while ``import`` crashes on a wheel
     ABI mismatch. Hashing the interpreter identity forces a clean rebuild instead.
+
+    `interp_identity` should be the VENV interpreter's identity (see ``_interp_identity``); when omitted
+    it falls back to the running interpreter — used only before any venv exists (review-M7).
     """
+    ident = interp_identity if interp_identity is not None else _running_identity()
     h = hashlib.sha256()
     h.update(SCHEMA.encode())
-    h.update(f"{sys.version_info[0]}.{sys.version_info[1]}".encode())
-    h.update(b"\0")
-    h.update(sys.platform.encode())
-    h.update(b"\0")
-    h.update(platform.machine().encode())
+    h.update(ident.encode())
     h.update(b"\0")
     h.update(PYPROJECT.name.encode())
     h.update(b"\0")
     h.update(PYPROJECT.read_bytes() if PYPROJECT.exists() else b"")
     return h.hexdigest()
+
+
+def _current_stamp(venv_dir: Path) -> str:
+    """The stamp to compare an existing venv against: hashed with the VENV interpreter's identity (not
+    the running one), so a different checking interpreter computes the same stamp the build wrote (M7)."""
+    py = venv_python(venv_dir)
+    return compute_stamp(_interp_identity(py if py.exists() else None))
 
 
 def is_ready(venv_dir: Path, stamp: str) -> bool:
@@ -402,7 +433,10 @@ def do_install(venv_dir: Path, stamp: str) -> Path:
     # verify_imports has succeeded, so the presence of a matching stamp implies a verified
     # venv (bootstrap-2) and a crash between pointer and stamp never fakes "ready".
     _atomic_write_text(venv_dir / PTR_NAME, py.as_posix())
-    _atomic_write_text(venv_dir / STAMP_NAME, stamp)
+    # Re-stamp with the BUILT venv's own interpreter identity (uv may have built the venv with a
+    # different interpreter than the one running bootstrap), so a later --check under yet another
+    # interpreter compares equal and doesn't force a spurious rebuild (review-M7).
+    _atomic_write_text(venv_dir / STAMP_NAME, compute_stamp(_interp_identity(py)))
     print(f"[bootstrap] Engine interpreter: {py.as_posix()}", flush=True)
     print(f"[bootstrap] Wrote {venv_dir / PTR_NAME}", flush=True)
     return py
@@ -446,7 +480,7 @@ def maybe_reconcile(venv_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 def provision(venv_dir: Path, *, wait_secs: float, reconcile: bool = False) -> int:
     """Ensure the venv is current. Foreground; returns a process exit code."""
-    stamp = compute_stamp()
+    stamp = _current_stamp(venv_dir)  # compare against the VENV interpreter's identity (review-M7)
     if is_ready(venv_dir, stamp):
         print(f"[bootstrap] Engine already provisioned at {venv_dir}", flush=True)
         if reconcile:
@@ -466,22 +500,28 @@ def provision(venv_dir: Path, *, wait_secs: float, reconcile: bool = False) -> i
     # the launcher racing the background hook).
     deadline = time.time() + max(0.0, wait_secs)
     while not try_acquire(venv_dir):
-        if is_ready(venv_dir, stamp):
+        # re-evaluate readiness against the VENV interpreter's identity each iteration (M7): once
+        # another builder lands the venv, _current_stamp queries that interpreter and matches.
+        if is_ready(venv_dir, _current_stamp(venv_dir)):
             print("[bootstrap] Another setup just finished — engine ready.", flush=True)
             if reconcile:
                 maybe_reconcile(venv_dir)
             return 0
         if time.time() >= deadline:
+            # We gave up waiting and the venv is NOT ready. Return NON-zero (review-low: wait-deadline):
+            # a legitimately long cold source-build (igraph/leidenalg from sdist) can outlast the
+            # deadline, and returning 0 here would tell the launcher "ready" and launch the server
+            # against an unprovisioned venv. 2 = "still provisioning", distinct from a build failure (1).
             print(
-                "[bootstrap] Another setup is already in progress; "
+                "[bootstrap] Another setup is still in progress past the wait deadline; "
                 "it will finish in the background. Try again shortly.",
                 flush=True,
             )
-            return 0
+            return 2
         time.sleep(2.0)
 
     try:
-        if is_ready(venv_dir, stamp):  # re-check now that we hold the lock
+        if is_ready(venv_dir, _current_stamp(venv_dir)):  # re-check now that we hold the lock
             if reconcile:
                 maybe_reconcile(venv_dir)
             return 0
@@ -530,15 +570,24 @@ def spawn_background(venv_dir: Path) -> int:
     else:
         kwargs["start_new_session"] = True
 
-    subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()),
-         "--reconcile", "--venv", str(venv_dir)],
-        stdout=log,
-        stderr=log,
-        stdin=subprocess.DEVNULL,
-        close_fds=True,
-        **kwargs,
-    )
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()),
+             "--reconcile", "--venv", str(venv_dir)],
+            stdout=log,
+            stderr=log,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+            **kwargs,
+        )
+    finally:
+        # The detached child inherited its own dup of the log fd; close the PARENT's copy so it doesn't
+        # leak for the parent's lifetime (review-nit). DEVNULL is the int -1 sentinel, not a file object.
+        if hasattr(log, "close"):
+            try:
+                log.close()
+            except OSError:
+                pass
     return 0
 
 
@@ -580,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         # Freshness probe for the launcher: silent on stdout (it shares stdout with the
         # JSON-RPC channel), exit code carries the answer. 0 == ready & current.
-        return 0 if is_ready(venv_dir, compute_stamp()) else 1
+        return 0 if is_ready(venv_dir, _current_stamp(venv_dir)) else 1
 
     print(
         f"[bootstrap] System Python: {sys.version.split()[0]} ({sys.executable})",
