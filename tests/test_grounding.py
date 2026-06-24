@@ -194,6 +194,65 @@ def test_rejected_hypothesis_binds_next_generation(engine):
                    for c in engine.kg_generate("all", k=20)["candidates"])
 
 
+# --------------------------------------------------------------------------- R4: multi-source promotion
+
+
+def _multi_source_engine(vault, tmp_path):
+    """An engine whose source is a DIRECTORY of two .md files (R4)."""
+    from pathlib import Path
+    from kg_engine.server import KGEngine
+    srcdir = tmp_path / "sources"
+    srcdir.mkdir()
+    (srcdir / "a.md").write_text("Alpha grounds beta in the first document.\n", encoding="utf-8")
+    (srcdir / "b.md").write_text("Gamma bridges delta across the second document.\n", encoding="utf-8")
+    pack_path = Path(__file__).resolve().parents[1] / "pack" / "pack.yaml"
+    return KGEngine(vault, source_path=srcdir, pack_path=pack_path)
+
+
+def test_multi_source_support_span_promotes_from_any_file(vault, tmp_path):
+    """A hypothesis promotes when its support span is verbatim in ANY declared source — here a span
+    from the SECOND document — and the provenance upgrades to span-present (source-aware kg_ground)."""
+    eng = _multi_source_engine(vault, tmp_path)
+    eng.kg_propose({"edges": [{"source": "gamma", "target": "delta", "relation": "bridges"}]})
+    eid = edge_id("gamma", "bridges", "delta")
+    out = eng.kg_ground(eid, "grounded", support_span="Gamma bridges delta")  # lives in b.md
+    assert out["ok"] and out["provenance_upgraded_to"] == "span-present"
+    e = next(x for x in eng.canon.all_edges() if x.id == eid)
+    assert e.provenance == Provenance.SPAN_PRESENT and e.epistemic_state == EpistemicState.GROUNDED
+
+    # a different hypothesis promotes from the FIRST document too
+    eng.kg_propose({"edges": [{"source": "alpha", "target": "beta", "relation": "grounds"}]})
+    aid = edge_id("alpha", "grounds", "beta")
+    assert eng.kg_ground(aid, "grounded", support_span="Alpha grounds beta")["ok"]
+
+
+def test_multi_source_support_span_not_in_any_source_refused(vault, tmp_path):
+    """Preserve the existing contract: a support span in NONE of the declared sources is still refused
+    `support-span-not-in-source` (the not-in-any reason is unchanged for multi-source)."""
+    eng = _multi_source_engine(vault, tmp_path)
+    eng.kg_propose({"edges": [{"source": "gamma", "target": "delta", "relation": "bridges"}]})
+    eid = edge_id("gamma", "bridges", "delta")
+    out = eng.kg_ground(eid, "grounded", support_span="this phrase is in neither document at all")
+    assert out["ok"] is False and out["error"] == "support-span-not-in-source"
+    e = next(x for x in eng.canon.all_edges() if x.id == eid)
+    assert e.provenance == Provenance.HYPOTHESIZED and e.epistemic_state == EpistemicState.UNVERIFIED
+
+
+def test_multi_source_kg_write_verifies_per_file(vault, tmp_path):
+    """End-to-end through kg_write: an edge whose span lives in b.md but is attributed to a.md is
+    REJECTED, while the same span attributed to b.md is written — source-aware span-present (R4)."""
+    eng = _multi_source_engine(vault, tmp_path)
+    out = eng.kg_write({"edges": [
+        {"source": "gamma", "target": "delta", "relation": "bridges",
+         "span": "Gamma bridges delta", "source_file": "a.md", "authored_by": "agent"},
+        {"source": "gamma", "target": "delta", "relation": "bridges",
+         "span": "Gamma bridges delta", "source_file": "b.md", "authored_by": "agent"},
+    ]})
+    reasons = {d["reason"] for d in out["details"] if d["kind"] == "edge"}
+    assert "span-not-in-named-source" in reasons          # the a.md mis-attribution rejected
+    assert edge_id("gamma", "bridges", "delta") in {e.id for e in eng.canon.all_edges()}  # b.md one landed
+
+
 def test_failed_edge_not_pruned_and_surfaced(engine):
     _seed_queue(engine)
     eid = edge_id("betweenness", "confounded_by", "generality-confound")

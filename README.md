@@ -170,7 +170,7 @@ syncable audit log — is a deliberately deferred follow-up; see `CHANGELOG.md`.
 
 | option | values | default | effect |
 |---|---|---|---|
-| `source_path` | absolute path | **none — set this** | the document the graph is built and grounded against. **Effectively required:** there is no default, so until you set it the graph has nothing to verify spans against. |
+| `source_path` | absolute path — a **file, directory, or glob** of `.md`/`.txt` | **none — set this** | the document(s) the graph is built and grounded against. A single file is the common case; a **directory or glob** (R4) builds from every `.md`/`.txt` member, and each edge's span is verified against the specific file it came from (`source_file`). **Effectively required:** there is no default, so until you set it the graph has nothing to verify spans against. *(Markdown/text only — no PDF/media.)* |
 | `sensitivity` | `low` \| `medium` \| `high` | `medium` | egress scrubbing: `low` = secrets only; `medium` = + structured PII; `high` = + person/address heuristics. |
 | `metrics_mode` | `structure_only` | `structure_only` | the only effective value: graph structure is the bridge signal. The engine never branches on this (it is stored and echoed by `kg_ping` only), and there is no enum constraint — an embeddings path is **not implemented** (the former `sqlite-vss` candidate generator was removed), so any other value is inert. |
 

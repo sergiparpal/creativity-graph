@@ -16,7 +16,8 @@ You do **not** call `kg_write` yourself, and you **never** assert a verdict — 
 
 ## Inputs
 
-- `$1` — the source path to build from. **Default**: `${CLAUDE_PLUGIN_OPTION_SOURCE_PATH}` if set, else
+- `$1` — the source to build from: a single **file**, or a **directory / glob** of `.md`/`.txt` files
+  (R4 — multi-document). **Default**: `${CLAUDE_PLUGIN_OPTION_SOURCE_PATH}` if set, else
   `examples/source.md`. Resolve once at the top:
 
   ```
@@ -25,19 +26,29 @@ You do **not** call `kg_write` yourself, and you **never** assert a verdict — 
 
 ## Procedure
 
-### 0. Resolve & sanity-check the source (Bash)
+### 0. Resolve & enumerate the source FILES (Bash)
+
+A single file is the common case; a directory or glob builds from **every** `.md`/`.txt` member. Build the
+file list, then iterate the sections **within each file**, carrying that file's **basename** as `source_file`.
 
 ```bash
 SOURCE="${1:-${CLAUDE_PLUGIN_OPTION_SOURCE_PATH:-examples/source.md}}"
-test -f "$SOURCE" || { echo "source not found: $SOURCE"; exit 1; }
-echo "building from: $SOURCE"
-# Enumerate the section headings so you can iterate one section at a time.
-grep -nE '^## ' "$SOURCE"
+# Build the list of source FILES (a single file, every .md/.txt in a directory, or a glob).
+if [ -d "$SOURCE" ]; then
+  FILES=$(find "$SOURCE" -maxdepth 1 -type f \( -name '*.md' -o -name '*.txt' \) ! -name '.*' | sort)
+else
+  FILES=$(ls -1 $SOURCE 2>/dev/null | sort)   # a single file or a shell glob
+fi
+[ -n "$FILES" ] || { echo "no .md/.txt source found at: $SOURCE"; exit 1; }
+echo "building from:"; echo "$FILES"
+# For each file, enumerate its section headings (you iterate one section per extractor launch).
+for f in $FILES; do echo "== $f =="; grep -nE '^## ' "$f"; done
 ```
 
 The demo corpus (`examples/source.md`) is the five-section "theory of grounded conceptual knowledge":
 **§1 Compression and the cost of generality**, **§2 Provenance and the span**, **§3 Bridges and betweenness**,
-**§4 Memory of failures**, **§5 The canon and the projection**. One extractor launch per `## ` section.
+**§4 Memory of failures**, **§5 The canon and the projection**. One extractor launch per `## ` section, **per
+file**; pass the file's basename (e.g. `source.md`) as the extractor's `source_file`.
 
 ### 1. Egress scrub — the §1.9 egress point (now WIRED)
 
@@ -64,11 +75,13 @@ as `span-not-in-source` (fabrication).
 
 ### 2. Launch the `kg-extractor` subagent per section (Task)
 
-For **each** `## ` section, launch the extractor with the **section's verbatim text** and its source filename.
-The extractor reads the section, emits a single complete `kg_write` payload, and reports its dispositions back to
-you. Run sections **sequentially** so later sections can reference node IDs created earlier (the boundary
-auto-creates placeholder nodes for an edge's `source`, and targets may reference not-yet-created nodes — so order
-is for legibility, not correctness).
+For **each** `## ` section **of each file**, launch the extractor with the **section's verbatim text** and the
+**basename of the file it came from** as `source_file`. The extractor stamps every edge in that section with that
+basename; with a multi-file build the boundary verifies each span against **that file specifically** (R4 — a span
+attributed to the wrong file is REJECTED `span-not-in-named-source`). The extractor reads the section, emits a
+single complete `kg_write` payload, and reports its dispositions back to you. Run sections **sequentially** so
+later sections can reference node IDs created earlier (the boundary auto-creates placeholder nodes for an edge's
+`source`, and targets may reference not-yet-created nodes — so order is for legibility, not correctness).
 
 Exact Task invocation (repeat per section, substituting the heading + body):
 

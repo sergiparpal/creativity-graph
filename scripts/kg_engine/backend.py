@@ -243,8 +243,10 @@ class BackendExtractor:
                 f"(stop_reason={stop!r}): {e}; got: {snippet!r}") from e
 
     # ---- stamp the deterministic axes the boundary expects ----------------
-    def _stamp(self, raw: dict) -> dict:
-        sf = self.source_file_name()
+    def _stamp(self, raw: dict, source_file: str | None = None) -> dict:
+        # R4: stamp each edge with the basename of the file the span came from, so the source-aware
+        # boundary can verify it against THAT file. Falls back to the single-source name.
+        sf = source_file or self.source_file_name()
         nodes = [
             {
                 "id": n.get("id"),
@@ -279,41 +281,45 @@ class BackendExtractor:
 
     # ---- full pipeline ----------------------------------------------------
     def run(self, source_path: str | os.PathLike | None = None) -> dict:
-        """Extract the whole source, write through the boundary, then project. Returns a summary."""
+        """Extract every configured source FILE section by section, write through the boundary, then
+        project. Returns a summary. With a directory/glob source (R4) this is an outer per-file loop;
+        each edge is stamped with its file's basename so the boundary verifies it source-aware."""
         if source_path:
             self.engine.source_path = Path(source_path)
-        src = self.engine.source_text()
-        if not src.strip():
+        sources = self.engine.source_set()
+        if not sources:
             raise SystemExit("no source text: set --source or KG_SOURCE_PATH")
 
         totals: Counter = Counter()
-        sections = self.split_sections(src)
         n_written = 0
         failed_sections: list[dict] = []
         try:
-            for title, body in sections:
-                if not body.strip():
-                    continue
-                # A transient API error (or a RuntimeError on refusal / max_tokens / non-JSON) for one
-                # section must not abort the whole multi-section run: isolate it, record it, and keep
-                # going so the sections that did land are not lost.
-                try:
-                    # §1.9 egress scrub before the text reaches the model; kg_write restores spans for the canon.
-                    scrubbed = self.engine.kg_scrub(body)["scrubbed"]
-                    raw = self.extract_section(scrubbed, title)
-                    result = self.engine.kg_write(self._stamp(raw), message=f"backend:{title or 'preamble'}")
-                    if result.get("rolled_back"):
-                        # The boundary rolled the whole section's write back (write_nodes raised): its
-                        # `written_nodes` is [] and the accepted/demoted counts never landed, so they
-                        # must NOT be accumulated. Record it as a failed section instead of over-reporting.
-                        failed_sections.append({"title": title or "preamble",
-                                                "error": result.get("error") or "kg_write rolled back"})
+            for fname, ftext in sources.texts.items():
+                for title, body in self.split_sections(ftext):
+                    if not body.strip():
                         continue
-                    for k, v in result["dispositions"].items():
-                        totals[k] += v
-                    n_written += 1
-                except Exception as e:  # noqa: BLE001 — isolate any per-section failure
-                    failed_sections.append({"title": title or "preamble", "error": f"{type(e).__name__}: {e}"})
+                    # A transient API error (or a RuntimeError on refusal / max_tokens / non-JSON) for
+                    # one section must not abort the whole run: isolate it, record it, and keep going so
+                    # the sections that did land are not lost.
+                    try:
+                        # §1.9 egress scrub before the text reaches the model; kg_write restores spans for the canon.
+                        scrubbed = self.engine.kg_scrub(body)["scrubbed"]
+                        raw = self.extract_section(scrubbed, title)
+                        result = self.engine.kg_write(self._stamp(raw, source_file=fname),
+                                                      message=f"backend:{fname}:{title or 'preamble'}")
+                        if result.get("rolled_back"):
+                            # The boundary rolled the whole section's write back (write_nodes raised):
+                            # its `written_nodes` is [] and the accepted/demoted counts never landed, so
+                            # they must NOT be accumulated. Record it as a failed section instead of
+                            # over-reporting.
+                            failed_sections.append({"title": title or "preamble",
+                                                    "error": result.get("error") or "kg_write rolled back"})
+                            continue
+                        for k, v in result["dispositions"].items():
+                            totals[k] += v
+                        n_written += 1
+                    except Exception as e:  # noqa: BLE001 — isolate any per-section failure
+                        failed_sections.append({"title": title or "preamble", "error": f"{type(e).__name__}: {e}"})
         finally:
             # Always reconcile the derived layer with whatever landed, even if a section raised — the
             # canon may have been partially updated and must not be left with a stale projection.

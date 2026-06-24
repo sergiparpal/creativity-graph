@@ -181,6 +181,41 @@ def test_paraphrase_is_fabrication(pack):
     assert e.disposition == Disposition.REJECTED and e.reason == "span-not-in-source"
 
 
+# ---- source-aware span verification (R4) ---------------------------------
+
+def test_source_aware_named_file_split(tmp_path, pack):
+    """With a SourceSet, a span present in file B but attributed to file A is REJECTED
+    `span-not-in-named-source`; the same span attributed to B (or unattributed) is ACCEPTED."""
+    from kg_engine.sources import SourceSet
+    d = tmp_path / "src"
+    d.mkdir()
+    (d / "a.md").write_text("A compression grounds the claims beneath it.\n", encoding="utf-8")
+    (d / "b.md").write_text("Betweenness is confounded by the generality confound.\n", encoding="utf-8")
+    sources = SourceSet(d)
+
+    def _run(source_file):
+        return _by_target(validate_payload(
+            {"edges": [{"source": "betweenness", "target": "gc", "relation": "confounded_by",
+                        "span": "Betweenness is confounded by the generality confound",
+                        "source_file": source_file, "authored_by": "agent"}]},
+            pack=pack, source_text=sources.concat, sources=sources))["gc"]
+
+    assert _run("a.md").reason == "span-not-in-named-source"   # present in B, attributed to A
+    assert _run("b.md").disposition == Disposition.ACCEPTED    # attributed to its real file
+    assert _run("").disposition == Disposition.ACCEPTED        # unattributed -> any declared source
+
+
+def test_sources_none_ignores_source_file_and_uses_blob(pack):
+    """`sources=None` preserves the exact single-blob behavior: the edge's `source_file` is irrelevant,
+    verification is against `source_text`. Guards every existing direct validate_payload call site."""
+    res = _by_target(validate_payload(
+        {"edges": [{"source": "compression", "target": "claim", "relation": "grounds",
+                    "span": "A compression grounds the claims beneath it",
+                    "source_file": "whatever-unknown.md", "authored_by": "agent"}]},
+        pack=pack, source_text=SRC))  # no sources= -> blob path
+    assert res["claim"].disposition == Disposition.ACCEPTED   # source_file ignored; verified vs SRC
+
+
 def test_quarantined_and_rejected_never_reach_canon(engine):
     """End-to-end through the REAL engine boundary: an undeclared-type (QUARANTINED) edge and a
     fabricated-span (REJECTED) edge must produce NO canon edge, while a legitimately accepted edge in

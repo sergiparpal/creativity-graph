@@ -22,13 +22,13 @@ from .model import (
     Provenance,
     normalize_text,
     slug,
-    span_verifies,
     utcnow,
 )
 from .pack import load_pack
 from .projector import Projector
 from .reconciler import GROUND_AUDIT, Reconciler
 from .scrub import Scrubber
+from .sources import SourceSet
 
 # Single source of truth shared with the reconciler's policed set (model.GROUNDABLE_STATES), so the
 # states kg_ground may stamp and the states the reconciler re-quarantines can never drift apart.
@@ -55,8 +55,10 @@ class KGEngine:
         self.sensitivity = sensitivity
         self.metrics_mode = metrics_mode
         self.max_edges_per_kb = max_edges_per_kb
+        # The configured source: a single file (back-compat), or a DIRECTORY / GLOB of .md/.txt (R4).
+        # Stays a single Path; SourceSet does the multi-file resolution behind source_set().
         self.source_path = Path(source_path) if source_path else None
-        self._source_cache: tuple[float, str] | None = None  # (mtime, text) — memoize the fixed source
+        self._source_set_cache: tuple[tuple, SourceSet] | None = None  # (signature, SourceSet) memo
         self.pack = None
         if pack_path and Path(pack_path).exists():
             try:
@@ -64,22 +66,22 @@ class KGEngine:
             except Exception:  # noqa: BLE001 — a bad pack must not crash the server
                 self.pack = None
 
-    # ---- source text (for span verification)
+    # ---- source set (for span verification)
+    def source_set(self) -> SourceSet:
+        """The resolved {basename → text} view over the configured source(s) (R4). Memoized on the
+        aggregate (resolved-file-list, mtime) signature so an added/removed/edited file is picked up
+        while the resolve+read stays off the hot path — generalizing the old per-file mtime memo. A
+        single configured file is a one-entry SourceSet, byte-identical to the prior single-blob path."""
+        sig = SourceSet.signature(self.source_path)
+        if self._source_set_cache is None or self._source_set_cache[0] != sig:
+            self._source_set_cache = (sig, SourceSet(self.source_path))
+        return self._source_set_cache[1]
+
     def source_text(self) -> str:
-        # Memoized: the source is fixed for the session, but kg_write and every hypothesis-promoting
-        # kg_ground read it (F34/N7 — uncached read_text per call). Key on mtime so an edited source
-        # (e.g. a test rewriting it) is still picked up; otherwise serve the cached text.
-        if not (self.source_path and self.source_path.exists()):
-            self._source_cache = None
-            return ""
-        try:
-            mtime = self.source_path.stat().st_mtime
-        except OSError:
-            self._source_cache = None
-            return self.source_path.read_text(encoding="utf-8")
-        if self._source_cache is None or self._source_cache[0] != mtime:
-            self._source_cache = (mtime, self.source_path.read_text(encoding="utf-8"))
-        return self._source_cache[1]
+        """The configured source(s) concatenated: a single file is its own text; a dir/glob is every
+        .md/.txt member joined. Feeds the flood-budget size and the projector's IDF corpus. Span
+        verification itself is source-aware via source_set().verifies (per-file), not this blob."""
+        return self.source_set().concat
 
     # ---- tools -----------------------------------------------------------
     def kg_ping(self) -> dict:
@@ -107,6 +109,7 @@ class KGEngine:
         existing_nodes = self.canon.all_nodes()  # read once; derive edges + node baseline from it
         existing_edges = [e for n in existing_nodes for e in n.edges]
         results = validate_payload(payload, pack=self.pack, source_text=self.source_text(),
+                                   sources=self.source_set(),
                                    existing=existing_edges,
                                    existing_node_ids={n.id for n in existing_nodes},
                                    restore=restore, max_edges_per_kb=self.max_edges_per_kb)
@@ -227,7 +230,10 @@ class KGEngine:
                     restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
                     if support_span and support_span.strip():
                         check = restore(support_span) if restore else support_span
-                        if not span_verifies(check, self.source_text()):
+                        # source-aware (R4): verify against the edge's named source if it has one, else
+                        # any declared source. The not-in-ANY-source contract is unchanged
+                        # (support-span-not-in-source) — a promotion span just has to exist SOMEWHERE.
+                        if not self.source_set().verifies(check, source_file=edge.source_file):
                             return {"ok": False, "error": "support-span-not-in-source"}
                         if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
                             return {"ok": False, "error": "support-span-too-short"}

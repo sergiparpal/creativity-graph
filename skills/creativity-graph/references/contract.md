@@ -57,7 +57,7 @@ these fields, no more.
 | `authored_by`     | enum           | `agent`      | extractors emit `agent`; never `human` (§4) |
 | `epistemic_state` | enum           | `unverified` | never emit a verdict (§4) |
 | `span`            | str            | `""`         | **VERBATIM** substring of the source — the §1.5 check. See §5 |
-| `source_file`     | str            | `""`         | e.g. `"source.md"` |
+| `source_file`     | str            | `""`         | **load-bearing (R4):** the basename of the file the span came from (e.g. `"source.md"`). With a multi-file source the span is verified against THIS file specifically; omit it for a single-source build (verifies against any declared source). See §5 |
 | `confidence`      | enum           | `INFERRED`   | `EXTRACTED` \| `INFERRED` \| `AMBIGUOUS` (graphify tier, read by `f4_probe`) |
 | `confidence_score`| float \| null  | `null`       | |
 | `notes`           | str            | `""`         | |
@@ -124,7 +124,8 @@ edited straight into canon, bypassing `kg_ground`).
 | reason                | retryable | meaning |
 |-----------------------|-----------|---------|
 | `no-supporting-span`  | false     | non-deterministic edge had empty/whitespace `span` (§5) |
-| `span-not-in-source`  | false     | `span` does not verify against the source — **fabrication** (§5) |
+| `span-not-in-source`  | false     | `span` does not verify against **any** declared source — **fabrication** (§5) |
+| `span-not-in-named-source` | false | `span` is in the corpus but **not** in the file named by `source_file` — mis-attributed (R4, §5). Fix `source_file` to the file the span is really from |
 | `span-too-short`      | false     | `span` found but shorter than 4 non-whitespace chars — degenerate anchor (§5) |
 | `truncated-payload`   | true      | `complete` was false (§1.3) — transport failure, whole payload dropped |
 | `schema-invalid: N errors` | true | Pydantic rejected the shape (extra/missing/mistyped field) |
@@ -173,7 +174,8 @@ reorder** — the span has to be a literal contiguous run of source words. Copy 
 `source.md`.
 
 - empty / whitespace-only `span` → `REJECTED/no-supporting-span` (not retryable).
-- present but not found in source → `REJECTED/span-not-in-source` (not retryable — fabrication).
+- present but not found in **any** declared source → `REJECTED/span-not-in-source` (not retryable — fabrication).
+- present in the corpus but **not** in the file named by `source_file` → `REJECTED/span-not-in-named-source` (not retryable — mis-attributed; R4). Set `source_file` to the basename of the file the span is really from (omit it to verify against any declared source).
 - present and found but fewer than 4 non-whitespace characters → `REJECTED/span-too-short` (not retryable — a degenerate 1-char anchor cites nothing).
 
 Verification is always against the ORIGINAL (unscrubbed) source. When the subagent saw scrubbed text (§1.9

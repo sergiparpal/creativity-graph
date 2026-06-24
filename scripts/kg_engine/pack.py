@@ -128,7 +128,13 @@ def _main(argv: list[str]) -> int:
         if not src:
             print("coverage needs a source path", file=sys.stderr)
             return 2
-        cov = coverage(pack, Path(src).read_text(encoding="utf-8"))
+        # R4: accept a file, directory, or glob of .md/.txt (a single file still works, byte-identical).
+        from .sources import SourceSet
+        sset = SourceSet(src)
+        if not sset:
+            print(f"no .md/.txt source found at: {src}", file=sys.stderr)
+            return 2
+        cov = coverage(pack, sset.concat)
         for k, v in cov.items():
             print(f"  {k}: {v}")
     return 0

@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+if TYPE_CHECKING:  # import only for typing; the boundary duck-types .verifies/.has_file at runtime
+    from .sources import SourceSet
 
 from .model import (
     AuthoredBy,
@@ -115,11 +118,17 @@ def validate_payload(
     existing_node_ids: Iterable[str] | None = None,
     restore=None,
     max_edges_per_kb: float | None = DEFAULT_MAX_EDGES_PER_KB,
+    sources: "SourceSet | None" = None,
 ) -> list[ValidationResult]:
     """Validate a raw payload dict/obj. Returns one ValidationResult per item.
 
     `pack` (optional) supplies `node_types` / `edge_types` sets for undeclared-type routing.
-    `source_text` is the ORIGINAL (unscrubbed) source used for span verification.
+    `source_text` is the ORIGINAL (unscrubbed) source used for span verification AND for the flood
+    budget below; for a multi-file `sources` it is the concat (size only — verification is per-file).
+    `sources` (R4, optional): a SourceSet making span verification source-aware — a span must verify
+    against a DECLARED source, and against the edge's named `source_file` specifically when it has one
+    (lenient any-source fallback when the named basename is unknown). `sources=None` preserves the exact
+    single-blob behavior against `source_text`, so every existing direct call site is unchanged.
     `restore` optionally maps a scrubbed span back to original text before verifying.
     `existing` is the current set of canonical edges (for dedup / single-canonical-edge).
     `existing_node_ids` are the ids the canon already holds, so the node flood guard is seeded
@@ -207,9 +216,11 @@ def validate_payload(
     # what was already refuted. Failure memory binds generation.
     failure_ids = {e.id for e in existing_list if e.epistemic_state in FAILURE_STATES}
     written = 0
-    norm_source = normalize_text(source_text)  # normalize the source ONCE, not per edge
+    # single-blob fallback: normalize the source ONCE (skipped when a SourceSet drives verification,
+    # which keeps its own per-file normalized cache).
+    norm_source = "" if sources is not None else normalize_text(source_text)
     for ein in wp.edges:
-        r = _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids)
+        r = _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids, sources)
         # rate limit: once the canon-wide writable-edge budget is exhausted, reject the overflow as a
         # flood rather than letting it grow the graph unbounded (§Stage 9). Only NET-NEW edges are
         # charged: a deduped edge (already in the canon or repeated in this payload) grows the canon by
@@ -239,7 +250,7 @@ def _slug_label(label: str) -> str:
     return slug(label)
 
 
-def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids) -> ValidationResult:
+def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids, sources=None) -> ValidationResult:
     edge = Edge(
         source=ein.source, target=ein.target, relation=ein.relation,
         provenance=ein.provenance, authored_by=ein.authored_by,
@@ -294,7 +305,17 @@ def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids) -> 
             return _ok("edge", edge, Disposition.REJECTED, "no-supporting-span", False, ident)
         check_span = restore(edge.span) if restore else edge.span
         ns = normalize_text(check_span)
-        if not ns or ns not in norm_source:  # span-present (§1.5), against the pre-normalized source
+        # span-present (§1.5). Source-aware (R4) when a SourceSet is supplied: the span must verify
+        # against a DECLARED source, and against the edge's NAMED source_file specifically when it has
+        # one. Split the reject so a mis-attributed span (present in the corpus, absent in the named
+        # file) is `span-not-in-named-source`, distinct from `span-not-in-source` (absent everywhere).
+        if sources is not None:
+            if not ns or not sources.verifies(check_span, source_file=edge.source_file):
+                reason = ("span-not-in-named-source"
+                          if (edge.source_file and sources.has_file(edge.source_file))
+                          else "span-not-in-source")
+                return _ok("edge", edge, Disposition.REJECTED, reason, False, ident)
+        elif not ns or ns not in norm_source:  # single-blob fallback against the pre-normalized source
             return _ok("edge", edge, Disposition.REJECTED, "span-not-in-source", False, ident)
         # reject a degenerate anchor (a 1-char span is in almost any prose): require a meaningful floor
         # of real characters so span-present cites something, not just any substring (boundary-5 / §1.5).

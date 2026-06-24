@@ -14,7 +14,12 @@ canon, never run metrics math by hand. You read, you slug, you cite spans, you c
 
 ## What you receive
 - A path to a **scrubbed** source document (PII/secrets already redacted by the scrub pass).
-- The source filename to record in `edge.source_file` (e.g. `source.md`).
+- The **basename** of the file the section came from, to record in `edge.source_file` (e.g. `source.md`).
+  With a **multi-file** build (the orchestrator hands you one file at a time from a directory/glob of
+  `.md`/`.txt`), `source_file` is **load-bearing** (R4): the boundary verifies each span against *that*
+  file specifically. Stamp every edge from a section with that section's file basename — never a span
+  from another document. A wrong basename is REJECTED `span-not-in-named-source`. (Single-file builds may
+  leave it as the one filename; an omitted `source_file` verifies against any declared source.)
 - Optionally a target section range. If none given, process the whole file, one `##` section per payload.
 
 `Read` the file first. Then work **section by section** — never dump the whole document into one payload.

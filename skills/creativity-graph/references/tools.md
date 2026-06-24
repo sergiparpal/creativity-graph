@@ -86,7 +86,8 @@ REJECTED as `truncated-payload`.
 - `dispositions` — counts keyed by every `Disposition` value: `ACCEPTED | DEMOTED | QUARANTINED | REJECTED`.
 - `details[]` — one per validated item: `kind` (`node`|`edge`), `id` (the derived edge id
   `e_{source}__{relation}__{target}`, or `null`), `disposition`, `reason` (e.g. `no-supporting-span`,
-  `span-not-in-source`, `truncated-payload`, `schema-invalid`, `forged-verdict-stripped`,
+  `span-not-in-source`, `span-not-in-named-source` (R4: span present in the corpus but not in the edge's
+  named `source_file`), `truncated-payload`, `schema-invalid`, `forged-verdict-stripped`,
   `human-claim-stripped`, `undeclared-node-type`, `undeclared-edge-type`), `retryable` (**`false`** for SEMANTIC rejections — no-span,
   span-not-in-source; **`true`** for TRANSPORT — truncation, schema-invalid).
 - `written_nodes[]` — node ids actually committed (includes boundary-auto-created placeholder source nodes).

@@ -33,6 +33,20 @@ JSON back across the MCP boundary.
   deliberately deferred spike. Coverage in `tests/test_canonmerge.py` (edge union, equal-verdict
   preservation, verdict-conflict demotion forge-proof over every cross-state pair, body 3-way merge,
   malformed fail-open, and a git end-to-end merge).
+- **Multi-document / source-aware ingestion (`.md`/`.txt`).** `KG_SOURCE_PATH` (the `source_path`
+  userConfig) now resolves a **single file, a directory, or a glob** of `.md`/`.txt` into an ordered
+  `{basename → text}` map (the new `SourceSet`, `scripts/kg_engine/sources.py`), and span verification is
+  now **source-aware**: a span must verify against a **declared** source, and — when an edge carries a
+  `source_file` — against **that file specifically** (a lenient any-source fallback when the named basename
+  is unknown, e.g. a legacy `source.md` or a typo). This turns the previously-dead `Edge.source_file` field
+  **load-bearing**, *strengthening* span-present (§1.5): the boundary now splits a mis-attributed span
+  (present in the corpus, absent in the named file) into a new `span-not-in-named-source` reject, distinct
+  from `span-not-in-source` (absent everywhere). The headless backend extracts per file (stamping each
+  edge's `source_file`), the projector's IDF corpus spans every file, and `pack validate … <dir|glob>`
+  works. **Single-file builds are byte-identical** to before (a one-entry `SourceSet`), and direct
+  `validate_payload` callers without a `SourceSet` keep the exact single-blob behavior. **Markdown/text
+  only — no PDF/media** (a lossy transcript as a "verbatim" span would break span-present). Coverage in
+  `tests/test_sources.py` plus extensions to `test_invariants.py` / `test_grounding.py`.
 
 ## [0.3.3] — 2026-06-23
 
