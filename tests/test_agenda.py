@@ -107,6 +107,51 @@ def test_cluster_already_matched_by_node_detector_is_not_double_counted():
     assert len(all_focus) == len(set(all_focus))
 
 
+def test_failed_crossing_edge_does_not_connect_communities():
+    """review-low coverage gap: invariant 6 — a `failed`/`rejected` inter-community edge is negative
+    information and must NOT count as connecting two clusters. Two communities joined ONLY by a failed
+    crossing edge are still islands, so both surface as edgeless-communities (the failed edge is skipped
+    in the crossing computation, projector.py)."""
+    nodes = [_n("p", community=0, degree=1), _n("q", community=0, degree=1),
+             _n("r", community=1, degree=1), _n("s", community=1, degree=1)]
+    edges = [_e("p", "q"), _e("r", "s"),
+             _e("q", "r", epistemic_state="failed")]  # the ONLY crossing edge is refuted
+    out = _agenda_from_rows(nodes, edges, limit=10)
+    edgeless = [g["focus"] for g in out["blocked_on_grounding"] if g["detector"] == "edgeless-communities"]
+    assert sorted(edgeless) == [["p", "q"], ["r", "s"]]  # failed crossing did NOT bridge them
+
+
+def test_a_grounded_crossing_edge_does_connect_communities():
+    """The positive control for the above: a GROUNDED crossing edge connects the two communities, so
+    neither is an island (no edgeless-communities gap)."""
+    nodes = [_n("p", community=0, degree=1), _n("q", community=0, degree=2),
+             _n("r", community=1, degree=2), _n("s", community=1, degree=1)]
+    edges = [_e("p", "q"), _e("r", "s"), _e("q", "r", epistemic_state="grounded")]
+    out = _agenda_from_rows(nodes, edges, limit=10)
+    assert "edgeless-communities" not in {g["detector"] for g in out["blocked_on_grounding"]}
+
+
+def test_hub_ratio_exactly_half_is_well_grounded():
+    """The grounded/decided == _GROUNDED_RATIO (0.5) boundary is inclusive (>=): a degree-3 hub with one
+    grounded and one unverified live edge (ratio 0.5) is `well-grounded`, not `under-grounded`."""
+    nodes = [_n("h", degree=3), _n("a", degree=1), _n("b", degree=1)]
+    edges = [_e("h", "a", epistemic_state="grounded"),
+             _e("h", "b", provenance="inferred", epistemic_state="unverified")]
+    out = _agenda_from_rows(nodes, edges, limit=5)
+    assert [g["detector"] for g in out["answerable_now"]] == ["well-grounded"]
+    assert "under-grounded-hub" not in {g["detector"] for g in out["blocked_on_grounding"]}
+
+
+def test_just_below_hub_degree_is_not_a_hub():
+    """The just-below-hub negative: a degree-(_HUB_DEGREE - 1) node with decided edges is NOT a hub, so it
+    fires neither well-grounded nor under-grounded (no node-level detector)."""
+    nodes = [_n("d2", degree=2), _n("a", degree=1), _n("b", degree=1)]
+    edges = [_e("d2", "a", epistemic_state="grounded"), _e("d2", "b", epistemic_state="grounded")]
+    out = _agenda_from_rows(nodes, edges, limit=5)
+    dets = {g["detector"] for g in out["answerable_now"] + out["blocked_on_grounding"]}
+    assert "well-grounded" not in dets and "under-grounded-hub" not in dets
+
+
 # --------------------------------------------------------------------------- two-lane split + ranking
 
 

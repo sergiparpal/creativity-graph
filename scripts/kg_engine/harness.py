@@ -154,14 +154,24 @@ def absorption(graph_data: dict, history: dict, *, now=None, absorb_growth: int 
 
     G = node_link_graph(graph_data).to_undirected()
     deg = dict(G.degree())
+    # `history` comes straight from generations.json, which the server passes UNVALIDATED — a record may
+    # be a non-dict or carry a non-numeric field. Guard every read so a malformed file degrades to
+    # "skip that record" instead of crashing the kg_absorption tool (review-low).
+    def _as_int(x, default=0):
+        try:
+            return int(x)
+        except (TypeError, ValueError):
+            return default
+
+    history = {k: v for k, v in history.items() if isinstance(v, dict)}
     if now is None:
-        ats = [int(r.get("introduced_at", 0)) for r in history.values()]
+        ats = [_as_int(r.get("introduced_at", 0)) for r in history.values()]
         now = (max(ats) + 1) if ats else 1
     out: dict = {}
     for nid, rec in history.items():
-        d0 = int(rec.get("introduced_degree", 0))
+        d0 = _as_int(rec.get("introduced_degree", 0))
         d1 = int(deg.get(nid, 0))
-        t = max(1, int(now) - int(rec.get("introduced_at", 0)))
+        t = max(1, _as_int(now) - _as_int(rec.get("introduced_at", 0)))
         growth = max(0, d1 - d0)
         rate = growth / t
         if d1 <= 0:

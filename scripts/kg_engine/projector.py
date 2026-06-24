@@ -39,6 +39,8 @@ _NEW_NODE_COLUMNS = {"betweenness", "spec_betweenness", "specificity", "gate_on"
 # serialize the entire edge table into one response (server-4). The limit clamp on query_graph is the
 # row-count analogue.
 MAX_CONTEXT_TOKENS = 100_000
+# Cap the R3 stale-verdict advisory list in kg_context so it can't bypass the token budget (review-low).
+_STALE_VERDICTS_CAP = 50
 
 # R6 (kg_agenda) detector thresholds. A node with >= _HUB_DEGREE live edges is a "hub"; its
 # grounded/(grounded+unverified) ratio splits well-grounded (answerable) from under-grounded (blocked).
@@ -130,7 +132,8 @@ class Ranks:
 class Projector:
     def __init__(self, canon: Canon, derived_dir: str | Path | None = None, *,
                  metrics_mode: str = "structure_only", source_text: "str | Callable[[], str] | None" = None,
-                 source_set: "Callable[[], SourceSet] | None" = None):
+                 source_set: "Callable[[], SourceSet] | None" = None,
+                 specificity_seeds: "dict | Callable[[], dict] | None" = None):
         self.canon = canon
         self.derived = Path(derived_dir) if derived_dir else (canon.root / "derived")
         self.derived.mkdir(parents=True, exist_ok=True)
@@ -146,8 +149,25 @@ class Projector:
         # re-verifies each grounded/failed span-present edge against its OWN source_file (per-file, never
         # a global concat). Absent -> no staleness is ever flagged (can't diverge from a missing source).
         self._source_set = source_set
+        # Pack-author-pinned per-term specificity (pack.specificity_seeds), as a dict or zero-arg
+        # callable. Merged OVER the corpus IDF in _ranks so an author can boost/pin a term's specificity
+        # — previously validated but never consumed (review-low: specificity_seeds unused).
+        self._specificity_seeds = specificity_seeds
+
+    def _spec_seeds(self) -> dict:
+        s = self._specificity_seeds() if callable(self._specificity_seeds) else self._specificity_seeds
+        return s or {}
 
     def _src_text(self) -> str:
+        # Prefer the SourceSet's concat when configured, so the IDF corpus (specificity weighting) and
+        # the R3 staleness advisory read the IDENTICAL source bytes — one source of truth, no divergence
+        # between the two source inputs (review-low: IDF vs R3 source). Fall back to the explicit
+        # source_text for a standalone Projector built without a source_set.
+        if self._source_set is not None:
+            try:
+                return self._source_set().concat or ""
+            except Exception:  # noqa: BLE001 — a source-read hiccup must never break ranking
+                pass
         src = self._source_text() if callable(self._source_text) else self._source_text
         return src or ""
 
@@ -167,8 +187,13 @@ class Projector:
 
     @staticmethod
     def _file_hash(node) -> str:
-        # hash the canonical edge/axis content (not mtime) so reprojection is content-driven
-        payload = json.dumps(node.frontmatter(), sort_keys=True) + node.body
+        # hash the canonical edge/axis content (not mtime) so reprojection is content-driven. EXCLUDE the
+        # created_at/updated_at timestamps: they are metadata, not content, and a hand-authored note that
+        # omits them gets a fresh utcnow() on every parse (model.Node.__post_init__) — which would churn
+        # this hash and force a redundant reprojection on every read until the note is written back
+        # (review-low: timestamp staleness churn). A real edge/axis/verdict change still moves the hash.
+        fm = {k: v for k, v in node.frontmatter().items() if k not in ("created_at", "updated_at")}
+        payload = json.dumps(fm, sort_keys=True) + node.body
         return hashlib.sha256(payload.encode()).hexdigest()
 
     def _build_graph(self, nodes):
@@ -221,6 +246,12 @@ class Projector:
         betweenness = nx.betweenness_centrality(und) if und.number_of_nodes() > 2 else {n: 0.0 for n in und}
         corpus = self._corpus()
         seeds = idf_seeds(corpus) if corpus else {}
+        # merge the pack's author-pinned specificity_seeds OVER the corpus IDF (lowercased to match
+        # idf_seeds' tokenization). An explicit pack seed wins, making the validated config actually
+        # drive specificity / spec_betweenness (review-low: specificity_seeds was never consumed).
+        pack_seeds = self._spec_seeds()
+        if pack_seeds:
+            seeds = {**seeds, **{str(k).lower(): float(v) for k, v in pack_seeds.items()}}
         default = (sum(seeds.values()) / len(seeds)) if seeds else 1.0
         specificity = {n: _node_specificity(G.nodes[n].get("label") or n, seeds, default) for n in G.nodes()}
         spec_betweenness = {n: betweenness.get(n, 0.0) * specificity.get(n, default) for n in G.nodes()}
@@ -231,7 +262,12 @@ class Projector:
         # both raw and weighted values are always stored, so nothing is hidden.
         gate_on = 0
         try:
-            verdict = _specificity_gate(_node_link_data(G), corpus)
+            # Decide the gate over the SAME live (failed/rejected-excluded) subgraph the stored ranks are
+            # computed on — NOT the full graph G. Passing G let the adversarial grounder's `failed`
+            # counter-edges (the exact edges §1.7 excludes from centrality) flip the gate that then
+            # governs ranking of a live-subgraph spec_betweenness the gate never measured (review-M2).
+            # `live` carries node attrs (incl. label) via add_nodes_from above, so _node_specificity works.
+            verdict = _specificity_gate(_node_link_data(live), corpus)
             gate_on = 1 if verdict.get("gate_on") else 0
         except Exception:  # noqa: BLE001 — a gate-computation hiccup must never break projection
             gate_on = 0
@@ -555,6 +591,14 @@ class Projector:
     def is_stale(self) -> bool:
         if not self.db_path.exists() or not self.graph_path.exists():
             return True
+        # schema gate (review-H2): a derived DB built before the Stage-2 node columns
+        # (betweenness/spec_betweenness/specificity/gate_on) must reproject EVEN when the canon is
+        # unchanged — else the cheap-sig short-circuit below returns False forever on a read-only vault
+        # after a plugin upgrade, and every read tool crashes with `no such column: betweenness` (the
+        # read path's _ro() has no schema-heal). _schema_outdated() is a single O(1) PRAGMA, cheap
+        # enough to front every read; a True here forces a full reproject that heals the schema.
+        if self._schema_outdated():
+            return True
         prior = self._read_meta()
         # cheap pre-gate (projector-2): if the canon dir's (count, newest mtime) is unchanged since the
         # last projection, nothing on disk changed -> not stale, WITHOUT a git fork or a full YAML
@@ -761,6 +805,10 @@ class Projector:
                 stale_verdicts = json.loads(srow[0]) if srow and srow[0] else []
             except (ValueError, TypeError):
                 stale_verdicts = []
+            # cap the advisory list so it can't bypass the token budget and bloat the payload unbounded
+            # (review-low: stale_verdicts uncapped). Surface the true total so truncation stays visible.
+            stale_total = len(stale_verdicts)
+            stale_verdicts = stale_verdicts[:_STALE_VERDICTS_CAP]
             if gate_on:
                 bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes "
                           "ORDER BY spec_betweenness DESC, degree DESC LIMIT 10")
@@ -785,7 +833,7 @@ class Projector:
                 "falsification_counters": counters,
                 "advisory": {"signal": "structural-bridge", "note": "advisory heuristic, not a guarantee",
                              "nodes": bridges, "bridge_metric": bridge_metric,
-                             "stale_verdicts": stale_verdicts},
+                             "stale_verdicts": stale_verdicts, "stale_verdicts_total": stale_total},
             }
         finally:
             con.close()

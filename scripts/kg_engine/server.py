@@ -49,7 +49,8 @@ class KGEngine:
         # pass the bound source reader so the projector can IDF-weight specificity off the source corpus
         # (PLAN Stage 2). It is read lazily, once per real reprojection, off the hot path.
         self.projector = Projector(self.canon, self.data_dir / "derived", metrics_mode=metrics_mode,
-                                   source_text=self.source_text, source_set=self.source_set)
+                                   source_text=self.source_text, source_set=self.source_set,
+                                   specificity_seeds=lambda: dict(getattr(self.pack, "specificity_seeds", {}) or {}))
         self.scrubber = Scrubber(sensitivity)
         self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
         self.sensitivity = sensitivity
@@ -278,8 +279,13 @@ class KGEngine:
         # kg_ground call, which made draining the grounding queue quadratic (server-2). The index is
         # read-only here; on a miss (just-written edge not yet projected, or no index) fall back to a
         # scan so correctness never depends on derived freshness.
+        #
+        # Do NOT _ensure_projected() here (review-M3): every prior kg_ground bumps node.updated_at, so
+        # is_stale() returns True on the next call and _ensure_projected would run a full
+        # betweenness/gate reproject — making a /kg-ground drain O(N * V*E), exactly the quadratic the
+        # index was added to remove. Correctness doesn't need freshness: a just-written edge the index
+        # hasn't seen is found by the canon-scan fallback below.
         try:
-            self._ensure_projected()
             src = self.projector.owner_of_edge(edge_id)
             if src and self.canon.exists(src):
                 node = self.canon.read_node(src)
@@ -382,7 +388,11 @@ class KGEngine:
                 # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
                 self._truncate_audit(audit_offset)
                 return {"ok": False, "error": f"rename rolled back: {info.error}", "old": old, "new": new}
-            self.canon.node_path(old).unlink(missing_ok=True)
+            try:
+                self.canon.node_path(old).unlink(missing_ok=True)
+            except OSError as e:  # the new note already landed; surface a structured error, not a raw raise
+                return {"ok": False, "error": f"rename wrote '{new}' but could not remove old '{old}': {e}",
+                        "old": old, "new": new, "touched": [n.id for n in touched]}
             from .canon import _git, _git_ok
             if _git_ok(self.canon.root):
                 _git(self.canon.root, "add", "-A", check=False)
