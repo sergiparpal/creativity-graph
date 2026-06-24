@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kg_engine.backend import BackendExtractor
+from kg_engine.backend import BackendExtractor, _NONSTREAMING_TIME_FLOOR
 
 # A valid section payload whose spans are verbatim substrings of the conftest SOURCE.
 _GOOD = {
@@ -75,6 +75,16 @@ def test_rolled_back_section_is_not_counted_as_written(engine, monkeypatch):
     assert "rollback" in out["failed_sections"][0]["error"]
     # projection still ran (run() does it in a finally), so the CLI exits non-zero on this partial run
     assert engine.projector.db_path.exists()
+
+
+def test_effective_max_tokens_clamps_to_sdk_time_floor(engine):
+    """review-M4: a --max-tokens override above the SDK's non-streaming time ceiling (~21333) is clamped,
+    so the first create() of every section doesn't raise ValueError pre-flight. The 16000 default, which
+    is already under the floor, is left untouched."""
+    over = BackendExtractor(engine, client=SimpleNamespace(), max_tokens=22000)
+    assert over._effective_max_tokens() <= _NONSTREAMING_TIME_FLOOR
+    under = BackendExtractor(engine, client=SimpleNamespace(), max_tokens=16000)
+    assert under._effective_max_tokens() == 16000
 
 
 def test_mixed_rolled_back_and_clean_sections_only_count_clean(engine, tmp_path, monkeypatch):

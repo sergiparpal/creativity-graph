@@ -39,6 +39,27 @@ def test_single_file_is_one_entry_byte_identical(tmp_path: Path):
     assert len(s) == 1 and bool(s)
 
 
+def test_non_utf8_file_is_skipped_not_crash(tmp_path: Path):
+    """review-H3: a non-UTF-8 / binary file among the resolved set is SKIPPED (UnicodeDecodeError is a
+    ValueError, not OSError), not propagated out of the constructor to disable the whole tool surface."""
+    d = _dir(tmp_path, **{"good.md": "Alpha grounds beta.\n"})
+    (d / "bad.md").write_bytes(b"\xff\xfe\x00\x01 not utf-8 \xff")  # invalid UTF-8
+    s = SourceSet(d)                                                # must not raise
+    assert s.basenames == ["good.md"]                              # the good file is still collected
+    assert "bad.md" not in s.texts
+
+
+def test_recursive_glob_collects_nested_sources(tmp_path: Path):
+    """review-low: a `**` glob recurses into nested directories rather than acting as a single `*`."""
+    root = tmp_path / "src"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "b").mkdir()
+    (root / "a" / "top.md").write_text(A_TXT, encoding="utf-8")
+    (root / "a" / "b" / "deep.md").write_text(B_TXT, encoding="utf-8")
+    s = SourceSet(str(root / "**" / "*.md"))
+    assert set(s.basenames) == {"top.md", "deep.md"}               # the nested file is reached
+
+
 def test_directory_collects_md_and_txt_sorted_skipping_dotfiles(tmp_path: Path):
     d = _dir(tmp_path, **{"a.md": A_TXT, "b.txt": B_TXT, "c.rst": "ignored", ".hidden.md": "ignored"})
     s = SourceSet(d)

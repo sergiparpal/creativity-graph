@@ -34,8 +34,12 @@ class SourceSet:
         for p in self.resolve(self.path):
             try:
                 self._texts[p.name] = p.read_text(encoding="utf-8")
-            except OSError:
-                continue  # an unreadable file is skipped, mirroring canon.all_nodes()'s tolerance
+            except (OSError, ValueError):
+                # OSError = unreadable; ValueError covers UnicodeDecodeError (its superclass, NOT an
+                # OSError) so a non-UTF-8 / binary / UTF-16 file among the resolved set is SKIPPED instead
+                # of propagating out of the constructor and disabling the whole tool surface (review-H3).
+                # Skip — never decode with errors='replace', which could forge phantom span matches.
+                continue  # mirrors canon.all_nodes()'s "one bad file must not crash every read" tolerance
         # normalized form per file, computed once for source-aware verification (off the hot path)
         self._norm: dict[str, str] = {name: normalize_text(t) for name, t in self._texts.items()}
 
@@ -61,7 +65,10 @@ class SourceSet:
         if p.is_dir():
             cands = list(p.iterdir())  # the case-insensitive suffix filter below unifies dir + glob
         elif _looks_like_glob(s):
-            cands = [Path(x) for x in _glob.glob(s)]
+            # recursive=True so a `**` segment recurses into nested directories rather than being
+            # treated as a single `*` (one level) — else `src/**/*.md` silently under-collects the
+            # nested sources R4 is meant to gather (review-low: ** glob recursion).
+            cands = [Path(x) for x in _glob.glob(s, recursive=True)]
         else:
             return []  # nonexistent literal path
         out: dict[str, Path] = {}

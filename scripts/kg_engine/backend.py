@@ -40,6 +40,11 @@ DEFAULT_MODEL = "claude-opus-4-8"
 # non-streaming ~10-minute timeout guard (which raises on much larger non-streamed values). Override
 # with --max-tokens / KG_BACKEND_MAX_TOKENS if a section needs more.
 DEFAULT_MAX_TOKENS = 16000
+# The SDK's non-streaming time guard ceiling: it requires streaming once a create()'s expected time
+# (3600 * max_tokens / 128000 s) exceeds ~10 min, i.e. max_tokens > 600 * 128000 / 3600 ≈ 21333. We
+# clamp to this in _effective_max_tokens so a large --max-tokens override can't fail every section
+# pre-flight (review-M4). Stable across the anthropic>=0.77 floor and current releases.
+_NONSTREAMING_TIME_FLOOR = 600 * 128000 // 3600  # 21333
 
 # Pack vocabulary fallback if no pack is loaded (keeps the schema valid; the boundary still
 # quarantines anything off-vocabulary).
@@ -185,16 +190,24 @@ class BackendExtractor:
         section. Clamp to the table value when the model is registered; leave it untouched otherwise.
         The SDK table is imported lazily and guarded so this is a no-op without the optional SDK.
         """
+        # Time-based guard (review-M4): independent of the per-model table, the SDK raises
+        # ValueError("Streaming is required ...") on a non-streamed create() when the expected time
+        # (3600 * max_tokens / 128000 seconds) exceeds the ~10-minute ceiling — i.e. when
+        # max_tokens > 600 * 128000 / 3600 ≈ 21333. DEFAULT_MODEL is NOT in the table below (cap None),
+        # so without this clamp a moderate override (the tool's own truncation message literally invites
+        # "raise --max-tokens", e.g. to 22000) makes the FIRST create() of every section raise pre-flight
+        # and the whole run produce nothing. The 16000 default is already under the floor, so unaffected.
+        eff = min(self.max_tokens, _NONSTREAMING_TIME_FLOOR)
         try:
             # The table is an SDK internal (anthropic._constants), not a top-level export — match the
             # path the SDK's own messages resource imports it from.
             from anthropic._constants import MODEL_NONSTREAMING_TOKENS  # noqa: PLC0415 — optional, SDK-only
-        except Exception:  # noqa: BLE001 — table moved/renamed or SDK absent → skip the clamp
-            return self.max_tokens
+        except Exception:  # noqa: BLE001 — table moved/renamed or SDK absent → skip the table clamp
+            return eff
         cap = MODEL_NONSTREAMING_TOKENS.get(self.model)
-        if isinstance(cap, int) and cap > 0 and self.max_tokens > cap:
+        if isinstance(cap, int) and cap > 0 and eff > cap:
             return cap
-        return self.max_tokens
+        return eff
 
     # ---- one API call per section -----------------------------------------
     def extract_section(self, scrubbed_text: str, title: str = "") -> dict:
@@ -210,6 +223,10 @@ class BackendExtractor:
             model=self.model,
             max_tokens=self._effective_max_tokens(),
             system=SYSTEM_PROMPT,
+            # passed as a plain dict deliberately: "adaptive" is a runtime-valid thinking type accepted
+            # by the API at the anthropic>=0.77 floor, but it is newer than the typed ThinkingConfigParam
+            # union at that floor — the dict avoids a static-typing mismatch with no runtime effect
+            # (review-low). The project runs no type-checker, so this is purely forward-doc.
             thinking={"type": "adaptive"},
             output_config={"format": {"type": "json_schema", "schema": self.section_schema()}},
             messages=[{"role": "user", "content": user}],
