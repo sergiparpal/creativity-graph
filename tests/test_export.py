@@ -168,15 +168,30 @@ def test_kg_export_is_read_only_on_projector_files_and_canon(engine):
 
 
 def test_html_escapes_script_close_in_labels(engine):
-    """A node label containing `</script>` must NOT break out of the inlined <script> block (the data is
-    `</`-escaped), so the document has exactly one real closing </script> tag (the template's)."""
+    """A node label containing `</script>` must NOT break out of the inlined <script> block (every `<`/`>`
+    is \\uXXXX-escaped), so the document has exactly one real closing </script> tag (the template's)."""
     from kg_engine.model import Node
     engine.canon.write_nodes([Node(id="x", label="evil</script><b>pwn")], message="seed")
     engine.projector.project()
     engine.kg_export("html")
     htext = (engine.projector.derived / "graph.html").read_text(encoding="utf-8")
     assert htext.count("</script>") == 1       # only the legitimate closing tag survives
-    assert "<\\/script>" in htext              # the label's close-tag was escaped in the inlined data
+    assert "evil</script>" not in htext        # the raw breakout sequence is gone
+    assert "\\u003c/script\\u003e" in htext    # the label's close-tag was unicode-escaped in the data
+
+
+def test_html_escapes_script_data_double_escape_breakout(engine):
+    """review-H1: a `<!--<script>` label must NOT defeat the inlining via the WHATWG
+    script-data-double-escape state (which a `</`-only escape would miss, swallowing the template's real
+    </script>). Every `<`/`>` is \\uXXXX-escaped, so no literal markup survives and the close still fires."""
+    from kg_engine.model import Node
+    engine.canon.write_nodes([Node(id="x", label="<!--<script>")], message="seed")
+    engine.projector.project()
+    engine.kg_export("html")
+    htext = (engine.projector.derived / "graph.html").read_text(encoding="utf-8")
+    assert "<!--<script>" not in htext         # the dangerous sequence never appears literally
+    assert htext.count("</script>") == 1       # the template's close is not swallowed
+    assert "\\u003c" in htext                   # angle brackets were unicode-escaped in the inlined data
 
 
 def test_export_dispatch_kinds(engine):

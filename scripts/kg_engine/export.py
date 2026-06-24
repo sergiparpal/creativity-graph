@@ -80,10 +80,14 @@ def build_html(engine) -> Path:
     """Render the self-contained offline ``graph.html`` (data inlined, no network, no ``<script src>``)
     and atomically write it under the derived dir. Returns its path. Read-only on the projector files."""
     data = _render_data(_load_render_model(engine))
-    # Inline the data as JSON inside a <script> block. A label/relation containing the literal
-    # "</script>" would otherwise close the script tag early (HTML-injection); escaping "</" to "<\/"
-    # is a no-op for the JS value (\/ is just /) but keeps the HTML parser from seeing a close tag.
-    payload = json.dumps(data, sort_keys=True).replace("</", "<\\/")
+    # Inline the data as JSON inside a <script> block. Escape EVERY markup-significant character, not just
+    # "</" — a "</"-only escape is defeated by the script-data-double-escape state: a label like
+    # "<!--<script>" enters that state and swallows the template's real </script>, breaking the render and
+    # opening a script-injection vector from untrusted source content (review-H1). The \uXXXX forms are a
+    # no-op for the parsed JS value (they round-trip to the same object) but leave no literal </>& for the
+    # HTML tokenizer, defeating both </script> and <!--<script>.
+    payload = (json.dumps(data, sort_keys=True)
+               .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
     html = HTML_TEMPLATE.replace("__KG_DATA_JSON__", payload)
     out = engine.projector.derived / "graph.html"
     _atomic_write(out, html)
@@ -144,7 +148,7 @@ def _report_md(metrics: dict, nodes: list, edges: list, stale: list, gate_on: in
         prov = _axis_breakdown(members, "provenance")
         auth = _axis_breakdown(members, "authored_by")
         est = _axis_breakdown(edges_by_comm.get(c, []), "epistemic_state")
-        names = ", ".join((m.get("label") or m["id"]) for m in sorted(members, key=lambda m: m["id"])[:8])
+        names = ", ".join(_md(m.get("label") or m["id"]) for m in sorted(members, key=lambda m: m["id"])[:8])
         more = " …" if len(members) > 8 else ""
         L.append(f"### Community {c} — {len(members)} node(s)")
         L.append(f"- members: {names}{more}")
@@ -158,7 +162,7 @@ def _report_md(metrics: dict, nodes: list, edges: list, stale: list, gate_on: in
     L.append(f"## Falsification memory (§1.7 — never pruned): {len(fails)}")
     if fails:
         for e in sorted(fails, key=lambda e: e.get("id") or "")[:50]:
-            L.append(f"- `{e.get('source')} --{e.get('relation')}--> {e.get('target')}` "
+            L.append(f"- `{_md(e.get('source'))} --{_md(e.get('relation'))}--> {_md(e.get('target'))}` "
                      f"[{e.get('epistemic_state')}]" + (f" — {_short(e.get('span'))}" if e.get("span") else ""))
     else:
         L.append("_(none — nothing refuted yet)_")
@@ -168,7 +172,7 @@ def _report_md(metrics: dict, nodes: list, edges: list, stale: list, gate_on: in
     L.append(f"## Stale verdicts (R3 — span no longer in source): {len(stale)}")
     if stale:
         for s in stale[:50]:
-            L.append(f"- `{s.get('edge_id')}` — {s.get('reason')}")
+            L.append(f"- `{_md(s.get('edge_id'))}` — {_md(s.get('reason'))}")
     else:
         L.append("_(none)_")
 
@@ -188,8 +192,17 @@ def _fmt(d: dict) -> str:
     return ", ".join(f"{k}: {v}" for k, v in sorted(d.items(), key=lambda kv: str(kv[0]))) if d else ""
 
 
+def _md(s) -> str:
+    """Neutralize markdown/HTML-significant characters in a value inlined into GRAPH_REPORT.md so an
+    untrusted label/relation/span cannot break a backtick code span or inject markup when the .md is
+    rendered as HTML (review-low). Uses visually-close lookalikes (no backtick, no </>) and collapses
+    newlines — safe both inside and outside a code span."""
+    return (str(s if s is not None else "")
+            .replace("`", "ʼ").replace("<", "‹").replace(">", "›").replace("\n", " ").strip())
+
+
 def _short(s: str, n: int = 80) -> str:
-    s = (s or "").replace("\n", " ").strip()
+    s = _md(s)
     return s if len(s) <= n else s[:n] + "…"
 
 
