@@ -10,7 +10,7 @@
   "keywords": ["knowledge-graph", "grounding", "provenance", "networkx", "mcp"],
   "userConfig": {
     "source_path": {
-      "type": "file",
+      "type": "string",
       "title": "Source document path",
       "description": "Path to the source the graph is built and grounded against — a single Markdown/text file, or a directory or glob of .md/.txt files (each edge's span is verified against the specific file it came from). Markdown/text only — no PDF/media."
     },

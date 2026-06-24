@@ -63,7 +63,17 @@ def main() -> int:
     if mcp is not None and "creativity-graph" not in (mcp.get("mcpServers") or {}):
         errors.append(".mcp.json: no 'creativity-graph' server declared")
 
-    _load_json("hooks/hooks.json", errors)
+    hooks = _load_json("hooks/hooks.json", errors)
+    if hooks is not None:
+        # structural check, not just JSON-validity (review-nit): the runtime expects a "hooks" object
+        # carrying the SessionStart (provision) and PreToolUse (precontext) events as non-empty arrays.
+        h = hooks.get("hooks")
+        if not isinstance(h, dict):
+            errors.append("hooks.json: top-level 'hooks' object missing")
+        else:
+            for evt in ("SessionStart", "PreToolUse"):
+                if not isinstance(h.get(evt), list) or not h.get(evt):
+                    errors.append(f"hooks.json: missing/empty '{evt}' hook array")
 
     market = _load_json(".claude-plugin/marketplace.json", errors)
     if market is not None and version is not None:
@@ -75,14 +85,21 @@ def main() -> int:
             if mv != version:
                 errors.append(f"version mismatch: plugin.json={version} marketplace.json entry={mv}")
 
-    # versions in pyproject.toml and the package __init__ must agree with the plugin manifest too
+    # versions in pyproject.toml and the package __init__ must agree with the plugin manifest too. The
+    # quote class accepts BOTH single- and double-quoted strings (valid TOML/Python) — a single-quoted
+    # version must not slip past the agreement check (review-low). A version line that is absent or
+    # unmatched is itself an ERROR, not a silent skip, so a reformatted/missing version can't pass CI.
     if version is not None:
-        py_v = _grep_version("pyproject.toml", r'^\s*version\s*=\s*"([^"]+)"', errors)
-        init_v = _grep_version("scripts/kg_engine/__init__.py", r'__version__\s*=\s*"([^"]+)"', errors)
-        if py_v is not None and py_v != version:
-            errors.append(f"version mismatch: plugin.json={version} pyproject.toml={py_v}")
-        if init_v is not None and init_v != version:
-            errors.append(f"version mismatch: plugin.json={version} kg_engine.__version__={init_v}")
+        for rel, pat, label in (
+            ("pyproject.toml", r'''^\s*version\s*=\s*["']([^"']+)["']''', "pyproject.toml"),
+            ("scripts/kg_engine/__init__.py", r'''__version__\s*=\s*["']([^"']+)["']''', "kg_engine.__version__"),
+        ):
+            found = _grep_version(rel, pat, errors)
+            if found is None:
+                if (ROOT / rel).exists():  # file present but no parseable version line
+                    errors.append(f"could not find a version string in {rel}")
+            elif found != version:
+                errors.append(f"version mismatch: plugin.json={version} {label}={found}")
 
     for stem in REQUIRED_AGENTS:
         if not (ROOT / "agents" / f"{stem}.md").exists():

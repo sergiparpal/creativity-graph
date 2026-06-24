@@ -171,14 +171,21 @@ def score(path):
         print(f"  {v:12} {c:4}  ({100*c/n:.0f}%)")
 
     per_rel = defaultdict(lambda: [0, 0])
+    has_relation = any("relation" in r for r in rows)
     for r in rows:
         ok = r["verdict"].strip().lower() in GOOD
-        per_rel[r.get("relation", "?")][0] += ok
-        per_rel[r.get("relation", "?")][1] += 1
+        rel = r.get("relation") or "?"
+        per_rel[rel][0] += ok
+        per_rel[rel][1] += 1
     print("\nprecision per relation (n>=3):")
-    for rel, (ok, tot) in sorted(per_rel.items(), key=lambda x: -x[1][1]):
-        if tot >= 3:
-            print(f"  {ok/tot:.2f}  ({ok}/{tot})  {rel}")
+    if not has_relation:
+        # don't present a single bogus "?" bucket as a per-relation breakdown when the sheet simply has
+        # no 'relation' column — say so instead (review-nit).
+        print("  (no 'relation' column in the sheet — per-relation breakdown unavailable)")
+    else:
+        for rel, (ok, tot) in sorted(per_rel.items(), key=lambda x: -x[1][1]):
+            if tot >= 3:
+                print(f"  {ok/tot:.2f}  ({ok}/{tot})  {rel}")
 
     # does a numeric confidence (if present) predict correctness?
     cs_correct, cs_wrong = [], []

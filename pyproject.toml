@@ -11,8 +11,12 @@ dependencies = [
     "pydantic>=2",         # the boundary contract (P_write validation)
     "networkx>=3",         # node-link graph.json interchange
     "pyyaml>=6",           # pack.yaml / glossary loader
-    "python-igraph>=0.11", # graph backend for Leiden
-    "leidenalg>=0.10",     # Leiden community detection
+    # Upper bounds pin BELOW the next (unverified) major so a fresh user venv can't silently pull a
+    # breaking API change that the guarded _leiden import would degrade through rather than surface
+    # (review-low). Verified working at igraph 1.0.0 / leidenalg 0.12.0; lift the cap after testing a
+    # newer major.
+    "python-igraph>=0.11,<2", # graph backend for Leiden
+    "leidenalg>=0.10,<1",     # Leiden community detection
 ]
 
 [project.optional-dependencies]
