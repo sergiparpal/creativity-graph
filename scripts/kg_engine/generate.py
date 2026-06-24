@@ -36,6 +36,19 @@ from .model import edge_id
 DEFAULT_SET = ["bridge", "seed", "compression"]
 ALL_SET = ["bridge", "seed", "compression", "regroup", "transplant", "ensemble"]
 
+# seed (§3) all-pairs BFS size gate (perf #8). At or below this node count `seed` runs the EXACT
+# original code path (unbounded BFS + full O(V^2) pair scan) so small graphs stay byte-identical with
+# the golden/reproducibility expectations. Above it, BFS is bounded by SEED_BFS_CUTOFF (see `seed`).
+SEED_ALLPAIRS_MAX_NODES = 400
+# The cutoff radius the seed model actually consumes. seed scores a pair by the residual of its
+# common-neighbour count; a shared neighbour can exist only at distance ≤ 2, so pairs at distance ≥ 3
+# always score 0 and are dropped. Radius 2 enumerates every pair seed can ever turn into a candidate.
+SEED_BFS_CUTOFF = 2
+
+# Distinct "argument not supplied" sentinel for the re-partition memo (perf #13). None is a real
+# _repartition return value (both community algorithms failed), so it cannot double as "not supplied".
+_UNSET = object()
+
 
 @dataclass
 class Candidate:
@@ -98,6 +111,19 @@ def _undirected_adjacency(G) -> dict:
     return adj
 
 
+def _shared(G, und, adj):
+    """Resolve the per-run shared structures (perf #12). On a full `kg_generate('all')` run the
+    undirected projection of G and its adjacency map are rebuilt once in `run_generators` and threaded
+    through; called standalone each mechanism passes None and builds them lazily here. The lazily-built
+    values are byte-for-byte identical to the threaded ones — same `G.to_undirected()` /
+    `_undirected_adjacency(G)` constructors — so output never changes either way."""
+    if und is None:
+        und = G.to_undirected()
+    if adj is None:
+        adj = _undirected_adjacency(G)
+    return und, adj
+
+
 def _is_failure(failures: set, source: str, relation: str, target: str) -> bool:
     """invariant 5 (PLAN §13): a candidate edge whose identity OR its reverse already lives in failure
     memory is dropped on sight — generation never re-proposes what was refuted."""
@@ -123,13 +149,14 @@ def _edge_cand(mechanism, source, target, relation, *, score, specificity, ratio
 # --------------------------------------------------------------------------- the six mechanisms
 
 
-def bridge(G, *, pack, corpus, failures, k=10) -> list:
+def bridge(G, *, pack, corpus, failures, k=10, adj=None) -> list:
     """§2/§4 — generate FROM the bridges (Swanson literature-based discovery, structurally). Rank
     non-adjacent, cross-community node pairs by the combined bridging strength of their endpoints; the
     strength is generality-controlled (spec_betweenness when the gate is on, structural-bridge/degree
     otherwise). Connecting two strong-but-separate hubs creates a shortcut the graph lacked."""
     gate_on = _gate_on(G)
-    adj = _undirected_adjacency(G)
+    if adj is None:
+        adj = _undirected_adjacency(G)
     nodes = list(G.nodes())
     cands: list = []
     for i, u in enumerate(nodes):
@@ -155,20 +182,27 @@ def bridge(G, *, pack, corpus, failures, k=10) -> list:
     return _rank(cands, k)
 
 
-def seed(G, *, pack, corpus, failures, k=10) -> list:
+def seed(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
     """§3 — the residual, not the product. For each non-adjacent connected pair compute graph distance
     d and a connectability proxy c (common-neighbour count). Fit E[c|d] as the mean c per distance, and
     score by the POSITIVE residual c - E[c|d] — "abnormally connectable for its distance." We do NOT
     multiply d×c (the source rejects that as double-counting one tension)."""
-    und = G.to_undirected()
-    adj = _undirected_adjacency(G)
+    und, adj = _shared(G, und, adj)
     nodes = list(G.nodes())
     # gather (u, v, d, c) for non-adjacent, connected pairs
     pairs: list = []
     by_dist: dict = defaultdict(list)
+    # perf #8 — bound the all-pairs BFS ONLY above the size gate; small graphs keep the exact original
+    # unbounded path (byte-identical golden output). cutoff=2 is exact, not an approximation: a model
+    # candidate needs a POSITIVE residual c-E[c|d], and the proxy c is the common-neighbour count
+    # (len(nbu & adj[v])). Two nodes share a common neighbour iff they are at distance ≤ 2, so every
+    # pair at d ≥ 3 has c = 0; those pairs only contribute zeros to by_dist[d], giving E[c|d]=0 and
+    # residual 0, which is dropped by the `residual <= 0` filter below. Thus no d ≥ 3 pair can ever
+    # become a candidate, and refusing to enumerate them (cutoff=2) changes nothing the model consumes.
+    cutoff = None if G.number_of_nodes() <= SEED_ALLPAIRS_MAX_NODES else SEED_BFS_CUTOFF
     for i, u in enumerate(nodes):
         try:
-            dist = nx.single_source_shortest_path_length(und, u)
+            dist = nx.single_source_shortest_path_length(und, u, cutoff=cutoff)
         except (nx.NetworkXError, nx.NodeNotFound):
             continue
         nbu = adj[u]
@@ -177,7 +211,7 @@ def seed(G, *, pack, corpus, failures, k=10) -> list:
                 continue  # adjacent — nothing to seed
             d = dist.get(v)
             if d is None or d < 2:
-                continue  # disconnected, or already adjacent
+                continue  # disconnected, beyond the cutoff radius, or already adjacent
             c = len(nbu & adj[v])  # common neighbours
             pairs.append([u, v, d, c])
             by_dist[d].append(c)
@@ -197,13 +231,14 @@ def seed(G, *, pack, corpus, failures, k=10) -> list:
     return _rank(cands, k)
 
 
-def compression(G, *, pack, corpus, failures, k=10) -> list:
+def compression(G, *, pack, corpus, failures, k=10, und=None) -> list:
     """§7 — new NODES, not new edges. Detect dense communities and propose a `compression` node that
     `collapses_into`-links the members, but only when an MDL screen shows a description-length SAVING
     (re-expressing the cluster's internal edges as a star through one new node costs fewer bits) AND the
     cluster is not vague (mean member specificity ≥ the graph-wide mean specificity). The label is left BLANK for the
     language layer (Stage 6) to name. Members are carried in the rationale."""
-    und = G.to_undirected()
+    if und is None:
+        und = G.to_undirected()
     mean_spec = _mean_specificity(G)
     by_comm: dict = defaultdict(list)
     for n in G.nodes():
@@ -235,13 +270,19 @@ def compression(G, *, pack, corpus, failures, k=10) -> list:
     return _rank(cands, k)
 
 
-def regroup(G, *, pack, corpus, failures, k=10) -> list:
+def regroup(G, *, pack, corpus, failures, k=10, und=None, adj=None, new_comm=_UNSET) -> list:
     """§8 — re-partition surfaces invisible bridges. Re-run Leiden at a DIFFERENT resolution and diff
     the community assignment against the stored one; any non-adjacent pair that was intra-community
     before but becomes cross-community under the new partition is a bridge that "was invisible under the
     prior partition." This is the generative use of the freedom of resolution."""
-    und = G.to_undirected()
-    new_comm = _repartition(und, resolution=4.0, seed=7)
+    if und is None:
+        und = G.to_undirected()
+    # perf #13 — the Leiden re-partition is the expensive step. On a full `kg_generate('all')` run it
+    # is computed once in `run_generators` and threaded in (regroup AND ensemble's degraded path share
+    # it), so Leiden runs once per run instead of twice. `_UNSET` (not None) is the "not supplied"
+    # sentinel: None is a legitimate _repartition result (both algorithms failed) and must flow through.
+    if new_comm is _UNSET:
+        new_comm = _repartition(und, resolution=4.0, seed=7)
     # _repartition returns None ONLY when BOTH community algorithms failed and it fell back to the
     # identity (all-nodes-its-own-community) partition — a non-partition that would make EVERY
     # intra-community pair "split apart", exploding into an O(n^2) slate of meaningless candidates
@@ -249,7 +290,8 @@ def regroup(G, *, pack, corpus, failures, k=10) -> list:
     # dict and still flows through (that is how regroup surfaces bridges on small graphs).
     if new_comm is None:
         return []
-    adj = _undirected_adjacency(G)
+    if adj is None:
+        adj = _undirected_adjacency(G)
     gate_on = _gate_on(G)
     nodes = list(G.nodes())
     cands: list = []
@@ -276,7 +318,7 @@ def regroup(G, *, pack, corpus, failures, k=10) -> list:
     return _rank(cands, k)
 
 
-def transplant(G, *, pack, corpus, failures, k=10) -> list:
+def transplant(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
     """§5 — hubs as macro-bridges. Take a high-degree hub from one community and import its reorganising
     pattern (its dominant outgoing relation) into the community with the highest ABSORPTION CAPACITY
     (proxy: high mean specificity, low density). Transfer is asymmetric — we transplant INTO the
@@ -284,7 +326,8 @@ def transplant(G, *, pack, corpus, failures, k=10) -> list:
     to audit (the language layer expands them in Stage 6)."""
     if G.number_of_nodes() < 4:
         return []
-    und = G.to_undirected()  # hoisted once: absorption() reads its neighbours m times per call (perf)
+    if und is None:
+        und = G.to_undirected()  # hoisted once: absorption() reads its neighbours m times per call (perf)
     by_comm: dict = defaultdict(list)
     for n in G.nodes():
         by_comm[_attr(G, n, "community", -1)].append(n)
@@ -319,7 +362,8 @@ def transplant(G, *, pack, corpus, failures, k=10) -> list:
         return []
     best_c, best_members = max(targets, key=lambda cm: (absorption(cm[1]), cm[0]))
     best_absorption = absorption(best_members)  # loop-invariant: compute once, reuse per candidate (perf)
-    adj = _undirected_adjacency(G)
+    if adj is None:
+        adj = _undirected_adjacency(G)
     cands: list = []
     for b in sorted(best_members, key=lambda n: (-float(_attr(G, n, "degree", 0)), n)):
         if b == hub or b in adj[hub]:
@@ -337,19 +381,23 @@ def transplant(G, *, pack, corpus, failures, k=10) -> list:
     return _rank(cands, k)
 
 
-def ensemble(G, *, pack, corpus, failures, k=10, second_graph=None) -> list:
+def ensemble(G, *, pack, corpus, failures, k=10, second_graph=None, und=None, adj=None,
+             new_comm=_UNSET) -> list:
     """§9 — exo: cross constructions. Given an optional SECOND construction (a second derived graph from
     a different pack/resolution), emit candidate bridges that exist in one construction's structure but
     not the other's — the bridges the graph's own dynamics would resist. With only one construction
     available, this degrades to `regroup` (the internal analogue), tagged so the slate stays honest."""
     if second_graph is None:
-        out = regroup(G, pack=pack, corpus=corpus, failures=failures, k=k)
+        # perf #13 — pass the shared undirected graph/adjacency and the run's memoized re-partition
+        # through to the degraded regroup so Leiden is not recomputed (already run by regroup on 'all').
+        out = regroup(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und, adj=adj,
+                      new_comm=new_comm)
         for c in out:
             c.mechanism = "ensemble"
             c.section = "§9"
             c.rationale = "no second construction supplied — degraded to regroup: " + c.rationale
         return out
-    adj1 = _undirected_adjacency(G)
+    adj1 = adj if adj is not None else _undirected_adjacency(G)
     own = set(G.nodes())
     adj2 = _undirected_adjacency(second_graph)
     cands: list = []
@@ -432,11 +480,57 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
         mechs = [mechanism]
     else:
         mechs = list(DEFAULT_SET)
+
+    # perf #12 — build the undirected projection + adjacency ONCE per run and thread them into every
+    # mechanism (they are otherwise rebuilt 5-6× on an 'all' run). The threaded values are identical to
+    # what each mechanism would build itself (same constructors), so output is unchanged. Built lazily
+    # (only when a mechanism in this run actually needs them) so a single-mechanism run pays no extra.
+    _shared_und = None
+    _shared_adj = None
+
+    def und_of():
+        nonlocal _shared_und
+        if _shared_und is None:
+            _shared_und = G.to_undirected()
+        return _shared_und
+
+    def adj_of():
+        nonlocal _shared_adj
+        if _shared_adj is None:
+            _shared_adj = _undirected_adjacency(G)
+        return _shared_adj
+
+    # perf #13 — memoize the §8 Leiden re-partition for the run: regroup and ensemble's degraded path
+    # both consume it, so on an 'all' run it is computed once instead of twice. Computed lazily; `_UNSET`
+    # means "not yet computed", distinct from a real None result (both community algorithms failed).
+    _shared_repart = _UNSET
+
+    def repart_of():
+        nonlocal _shared_repart
+        if _shared_repart is _UNSET:
+            _shared_repart = _repartition(und_of(), resolution=4.0, seed=7)
+        return _shared_repart
+
     out: list = []
     for m in mechs:
         fn = _DISPATCH[m]
-        if fn is ensemble:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, second_graph=second_graph)
+        if fn is bridge:
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, adj=adj_of())
+        elif fn is seed:
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(), adj=adj_of())
+        elif fn is compression:
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of())
+        elif fn is regroup:
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(),
+                      adj=adj_of(), new_comm=repart_of())
+        elif fn is transplant:
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(), adj=adj_of())
+        elif fn is ensemble:
+            # Only force the (lazy) re-partition for the degraded path; with a real second_graph
+            # ensemble takes the exo path and never consults new_comm, so leave it unforced (_UNSET).
+            ens_repart = repart_of() if second_graph is None else _UNSET
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, second_graph=second_graph,
+                      und=und_of(), adj=adj_of(), new_comm=ens_repart)
         else:
             out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k)
     # Dedup EDGE candidates across mechanisms by (source, target, relation) — the triple the canonical

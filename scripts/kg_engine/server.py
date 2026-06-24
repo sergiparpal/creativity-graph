@@ -102,12 +102,18 @@ class KGEngine:
         return {"scrubbed": scrubbed, "redactions": len(mapping),
                 "sensitivity": self.sensitivity, "categories": sorted({k.split(":")[0].strip("⟦") for k in mapping})}
 
-    def kg_write(self, payload: dict, *, message: str = "kg_write") -> dict:
-        """Validate an extraction payload at the boundary and write accepted/demoted items."""
+    def kg_write(self, payload: dict, *, message: str = "kg_write", existing_nodes=None) -> dict:
+        """Validate an extraction payload at the boundary and write accepted/demoted items.
+
+        `existing_nodes` is the canon baseline used for dedup + rate-limit seeding; it defaults to a
+        fresh parse (every existing call site is unchanged). The headless backend threads an
+        incrementally-maintained baseline so it doesn't re-parse the entire canon once per section
+        (backend-1/server-16)."""
         # if egress scrubbing happened this session, restore placeholder spans to the original before
         # span verification, and store the original in the canon (§1.9).
         restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
-        existing_nodes = self.canon.all_nodes()  # read once; derive edges + node baseline from it
+        if existing_nodes is None:
+            existing_nodes = self.canon.all_nodes()  # read once; derive edges + node baseline from it
         existing_edges = [e for n in existing_nodes for e in n.edges]
         results = validate_payload(payload, pack=self.pack, source_text=self.source_text(),
                                    sources=self.source_set(),
@@ -395,13 +401,33 @@ class KGEngine:
                         "old": old, "new": new, "touched": [n.id for n in touched]}
             from .canon import _git, _git_ok
             if _git_ok(self.canon.root):
-                _git(self.canon.root, "add", "-A", check=False)
+                # stage only what this rename touched — the rewritten notes + the removed old note —
+                # instead of `git add -A` re-scanning the whole working tree per rename (server-9).
+                paths = [str(self.canon.node_path(n.id)) for n in touched]
+                paths.append(str(self.canon.node_path(old)))
+                _git(self.canon.root, "add", "--", *paths, check=False)
                 _git(self.canon.root, "commit", "-m", message, "--allow-empty", check=False)
             return {"ok": True, "old": old, "new": new, "touched": [n.id for n in touched]}
         finally:
             self.canon._release_lock()
 
     def kg_metrics(self) -> dict:
+        # When the derived index is already fresh, serve counts from it with O(1) SQL instead of
+        # re-parsing the whole canon (server-3). kg_metrics is not itself a projection trigger, so when
+        # the index is stale we fall back to the authoritative canon parse rather than forcing a project.
+        try:
+            if self.projector.db_path.exists() and not self.projector.is_stale():
+                con = self.projector._ro()
+                try:
+                    n = con.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+                    e = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+                    by_state = dict(con.execute(
+                        "SELECT epistemic_state, COUNT(*) FROM edges GROUP BY epistemic_state"))
+                finally:
+                    con.close()
+                return {"nodes": n, "edges": e, "edges_by_epistemic_state": by_state}
+        except Exception:  # noqa: BLE001 — any index hiccup falls back to the canon parse below
+            pass
         nodes = self.canon.all_nodes()
         edges = [e for n in nodes for e in n.edges]
         by_state: dict = {}
@@ -409,10 +435,18 @@ class KGEngine:
             by_state[e.epistemic_state.value] = by_state.get(e.epistemic_state.value, 0) + 1
         return {"nodes": len(nodes), "edges": len(edges), "edges_by_epistemic_state": by_state}
 
-    def _failure_ids(self) -> set:
+    def _failure_ids(self, G=None) -> set:
         """Forward edge ids in failure memory (rejected/failed). The generators also check the reverse,
-        so forward ids suffice for invariant 5 (PLAN §13: failure memory binds generation)."""
+        so forward ids suffice for invariant 5 (PLAN §13: failure memory binds generation).
+
+        When the caller already loaded the derived graph (kg_generate/kg_operate both do, right before
+        calling this), pass it in to derive the ids from the in-memory edges instead of re-parsing the
+        whole canon (server-6). The index keeps failure memory (§1.7 never prunes it), so the set is
+        identical; EpistemicState subclasses str, so the string compare matches."""
         from .model import FAILURE_STATES
+        if G is not None:
+            fail = {s.value for s in FAILURE_STATES}
+            return {d.get("id") for _, _, d in G.edges(data=True) if d.get("epistemic_state") in fail}
         return {e.id for e in self.canon.all_edges() if e.epistemic_state in FAILURE_STATES}
 
     def kg_generate(self, mechanism: str = "bridge", k: int = 10, second_graph: str | None = None) -> dict:
@@ -425,7 +459,7 @@ class KGEngine:
         self._ensure_projected()
         G = self.projector.load_graph()
         corpus = self.projector._corpus()
-        failures = self._failure_ids()
+        failures = self._failure_ids(G)
         gate_on = int(next((G.nodes[n].get("gate_on", 0) for n in G.nodes()), 0))
         G2, note = None, ""
         if second_graph:
@@ -506,7 +540,7 @@ class KGEngine:
         elif op == "explode":
             payload, info = fn(G, target=target, k=k, label=label, body=body)
         elif op == "regroup":
-            payload, info = fn(G, failures=self._failure_ids(), k=k or 10)
+            payload, info = fn(G, failures=self._failure_ids(G), k=k or 10)
         else:  # open
             payload, info = fn(G, label=label, body=body, k=k or 2)
         if not payload or not (payload.get("nodes") or payload.get("edges")):

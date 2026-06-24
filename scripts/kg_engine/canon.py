@@ -288,6 +288,10 @@ class Canon:
     def __init__(self, project_dir: str | os.PathLike, *, ensure_layout: bool = True):
         self.root = Path(project_dir)
         self.notes_dir = self.root / CANON_SUBDIR
+        # Resolve the notes dir ONCE — node_path() runs the vault-prefix check 4-5×/node/batch and was
+        # re-running notes_dir.resolve() (a syscall) on every call. The path is fixed for this Canon's
+        # lifetime, so cache the resolved form here and reuse it (perf #17).
+        self._notes_dir_resolved = self.notes_dir.resolve()
         self.lock = LeaseLock(self.root / LOCK_NAME)
         self._lock_depth = 0  # re-entrancy guard so nested writes don't deadlock the single-writer lease
         # ensure_layout=False lets a READ-ONLY consumer (e.g. the precontext PreToolUse hook, which runs
@@ -390,7 +394,7 @@ class Canon:
         """
         if "\x00" in str(node_id):
             raise ValueError("null byte in node id")
-        notes_dir = self.notes_dir.resolve()
+        notes_dir = self._notes_dir_resolved  # cached at __init__ (perf #17) — fixed for this Canon
         p = (notes_dir / f"{slug(node_id)}.md").resolve()
         if p != notes_dir and notes_dir not in p.parents:
             raise ValueError(f"path escapes canon vault: {node_id!r}")
@@ -455,10 +459,20 @@ class Canon:
                 snapshot[p] = p.read_bytes() if p.exists() else None
             try:
                 from .model import utcnow
+                # Throttle the lease heartbeat (perf #7): each heartbeat is a full durable lock rewrite
+                # (mkstemp+fsync+replace+dir-fsync), and the old code did one PER NODE. Lease correctness
+                # comes from the TTL + CAS acquire/reclaim, NOT cadence — refreshing once per ~ttl/3 keeps
+                # the lease comfortably fresh inside the TTL window. A sub-(ttl/3) batch heartbeats once.
+                hb_interval = self.lock.ttl / 3.0
+                last_hb = time.monotonic()
+                self.lock.heartbeat()  # one refresh up front, then only when hb_interval has elapsed
                 for node in nodes:
-                    # refresh the lease while a long batch is in flight so a concurrent session can't
-                    # judge it stale (TTL) and steal the lock mid-write, breaking single-writer.
-                    self.lock.heartbeat()
+                    now_mono = time.monotonic()
+                    if (now_mono - last_hb) > hb_interval:
+                        # refresh the lease while a long batch is in flight so a concurrent session can't
+                        # judge it stale (TTL) and steal the lock mid-write, breaking single-writer.
+                        self.lock.heartbeat()
+                        last_hb = now_mono
                     merged = self._merge_into_existing(node) if merge else node
                     merged.updated_at = utcnow()
                     _atomic_write(self.node_path(merged.id), node_to_markdown(merged))
@@ -468,7 +482,11 @@ class Canon:
             # not revert fsynced canon (F2). check=False so a commit failure is non-fatal and never
             # leaves content staged-but-reverted — same posture as kg_rename's success-path commit.
             if commit and _git_ok(repo):
-                _git(repo, "add", "-A", check=False)
+                # Stage ONLY the files this batch touched (perf #9): `git add -A` rescans the entire
+                # working tree per boundary batch, but `snapshot` already knows the exact paths. Still
+                # best-effort (check=False) — outside the rollback scope, must stay fail-open.
+                if snapshot:
+                    _git(repo, "add", "--", *[str(p) for p in snapshot], check=False)
                 # allow empty so a no-op batch still succeeds
                 _git(repo, "commit", "-m", message, "--allow-empty", check=False)
             return RollbackInfo(False)
@@ -477,10 +495,22 @@ class Canon:
 
     def _merge_into_existing(self, node: Node) -> Node:
         """Apply the single-canonical-edge rule: merge incoming edges into an existing note."""
-        if not self.exists(node.id):
+        p = self.node_path(node.id)
+        if not p.exists():
             return node
-        self._check_slug_collision(node)
-        cur = self.read_node(node.id)
+        # Read+parse the existing note ONCE (perf #10): the old code parsed it twice — once in
+        # _check_slug_collision and again in read_node. Fold the slug-collision check into this single
+        # parse. Semantics are identical: an unreadable existing note is backed up and the parse error
+        # re-raised (the merge path then rolls back the batch, exactly as before, since read_node used to
+        # raise here too); a readable note whose id differs raises the slug-collision ValueError.
+        try:
+            cur = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=node.id)
+        except Exception:
+            self._backup_unreadable(p)  # preserve foreign/corrupt bytes before anything overwrites them
+            raise
+        if cur.id != node.id:
+            raise ValueError(
+                f"node id slug collision: {node.id!r} and {cur.id!r} both map to {p.name}")
         # key by the canonical edge id (the slug) — the same key the boundary dedup and disk use, so
         # all three layers agree on what "one edge" is (boundary-1 / §1.4).
         by_id = {e.id: e for e in cur.edges}

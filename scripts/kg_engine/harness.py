@@ -81,25 +81,32 @@ def _node_specificity(label: str, seeds: dict[str, float], default: float) -> fl
     return sum(seeds.get(t, default) for t in terms) / len(terms)
 
 
-def specificity(graph_data: dict, corpus: list[str]) -> dict:
+def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness: dict | None = None,
+                precomputed_seeds: dict | None = None, precomputed_undirected=None) -> dict:
     """Compare specificity-weighted betweenness vs raw degree vs raw betweenness.
 
     Verdict: does specificity-weighting separate real bridges from vague high-traffic nodes beyond a
     churn band? If yes, the gated metric (§1.4/§1.6) earns its place (`gate_on=True`).
+
+    The optional `precomputed_*` inputs let the projector pass the betweenness, RAW idf seeds, and the
+    already-built undirected graph it computed in `_ranks` (projector-2/projector-3): without them this
+    function re-ran `nx.betweenness_centrality` (a second O(V·E) pass) and `idf_seeds` (a second corpus
+    scan) and round-tripped the graph through node-link. The seeds MUST be the raw corpus IDF (NOT the
+    pack-merged seeds the projector uses for its own specificity) so the gate verdict is unchanged.
     """
     import networkx as nx
     from .projector import node_link_graph
 
-    G = node_link_graph(graph_data).to_undirected()
+    G = precomputed_undirected if precomputed_undirected is not None else node_link_graph(graph_data).to_undirected()
     if G.number_of_nodes() < 3:
         return {"gate_on": False, "reason": "graph too small", "n": G.number_of_nodes()}
 
-    seeds = idf_seeds(corpus) if corpus else {}
+    seeds = precomputed_seeds if precomputed_seeds is not None else (idf_seeds(corpus) if corpus else {})
     default = (sum(seeds.values()) / len(seeds)) if seeds else 1.0
     labels = {n: (G.nodes[n].get("label") or n) for n in G.nodes()}
     spec = {n: _node_specificity(labels[n], seeds, default) for n in G.nodes()}
 
-    btw = nx.betweenness_centrality(G)
+    btw = precomputed_betweenness if precomputed_betweenness is not None else nx.betweenness_centrality(G)
     deg = dict(G.degree())
     weighted = {n: btw[n] * spec[n] for n in G.nodes()}
 

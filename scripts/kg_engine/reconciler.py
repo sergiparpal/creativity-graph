@@ -40,10 +40,26 @@ class OrphanReport:
 
 
 class Reconciler:
+    # Size of the bounded prefix-tail window hashed as an anchor for the incremental audit fold below.
+    _AUDIT_ANCHOR_WINDOW = 4096
+
     def __init__(self, canon: Canon, state_path: str | Path | None = None):
         self.canon = canon
         self.state_path = Path(state_path) if state_path else (canon.root / ".kg-reconcile-state.json")
         self.audit_path = canon.root / GROUND_AUDIT
+        # In-process incremental-fold cache for the append-only audit log (reconciler-18). The audit log
+        # is read+parsed in full on every sweep and grows unbounded; folding only the NEW bytes since the
+        # last sweep avoids re-parsing the whole log when scan() runs more than once in this process. This
+        # cache is per-INSTANCE and deliberately NOT persisted: a fresh process reloads `consumed` from
+        # the state file fresh, so binding the fold's lifetime to the process keeps it in lockstep with
+        # `consumed` — a persisted-but-stale-high fold could let an already-consumed record look available
+        # again (a MISSED forgery), the one direction §1.8 must never allow. The per-pair fold is a pure
+        # additive count (no cross-line/global state), so an incremental fold yields counts byte-identical
+        # to a full re-parse. Any inability to PROVE the cache matches the current file falls back to a
+        # full re-read from offset 0 (truncation/rotation/in-place rewrite), which equals the old behavior.
+        self._audit_offset = 0                       # bytes of the log already folded into the cache
+        self._audit_counts_cache: dict[str, int] = {}
+        self._audit_anchor = b""                     # sha256 of the prefix-tail window at _audit_offset
 
     # ---- state
     def _load_state(self) -> dict:
@@ -63,20 +79,13 @@ class Reconciler:
         from .canon import _atomic_write
         _atomic_write(self.state_path, json.dumps(state, indent=0))
 
-    def _audit_counts(self) -> dict[str, int]:
-        """How many kg_ground audit records justify each `key -> state` transition. Counting (rather
-        than set-membership) is what defeats a *replay*: each legitimate transition consumes exactly
-        one record, so re-applying a previously-audited verdict out-of-band has no record left to
-        justify it and is caught as a forgery."""
-        counts: dict[str, int] = {}
-        try:
-            # engine-written log: pin utf-8 so non-ASCII keys round-trip regardless of locale. A
-            # locale-mismatched read (undefined bytes -> UnicodeError) must degrade to "no audit" and
-            # fail-open rather than crash the whole reconcile (§1.8).
-            lines = self.audit_path.read_text(encoding="utf-8").splitlines()
-        except (FileNotFoundError, OSError, UnicodeError):
-            return counts
-        for line in lines:
+    @staticmethod
+    def _fold_audit_lines(blob: bytes, counts: dict[str, int]) -> None:
+        """Fold a byte blob of complete audit lines into `counts` in place (one increment per record).
+        `blob` MUST end on a record boundary (caller trims any partial trailing line). A locale-clean
+        utf-8 decode is required; an undefined-byte read raises UnicodeError, which the caller degrades
+        to "no audit" and fails open rather than crashing the whole reconcile (§1.8)."""
+        for line in blob.decode("utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -84,8 +93,68 @@ class Reconciler:
                 rec = json.loads(line)
             except ValueError:
                 continue  # one corrupt audit line must not blind the reconciler to the rest
-            counts[f"{rec.get('key', '')}||{rec.get('to', '')}"] = (
-                counts.get(f"{rec.get('key', '')}||{rec.get('to', '')}", 0) + 1)
+            pair = f"{rec.get('key', '')}||{rec.get('to', '')}"
+            counts[pair] = counts.get(pair, 0) + 1
+
+    def _audit_counts(self) -> dict[str, int]:
+        """How many kg_ground audit records justify each `key -> state` transition. Counting (rather
+        than set-membership) is what defeats a *replay*: each legitimate transition consumes exactly
+        one record, so re-applying a previously-audited verdict out-of-band has no record left to
+        justify it and is caught as a forgery.
+
+        The log is append-only, so on a repeat sweep in THIS process we fold only the bytes appended
+        since the last sweep (reconciler-18) instead of re-parsing the whole (unbounded) log. We commit
+        to the cache only after the new bytes are fully folded (so a mid-fold error never leaves a
+        half-advanced offset), and we PROVE the cached prefix is still valid before trusting it:
+          - file shorter than the cached offset  -> truncation/rotation: full re-read from 0;
+          - the prefix-tail window changed         -> in-place rewrite/rotation: full re-read from 0.
+        Either fallback recomputes ground truth exactly as the old full read did, so the optimization
+        can only ever lose the SPEEDUP, never miss a record (and a stale-high count is impossible: a
+        shrink or rewrite forces the full recompute)."""
+        try:
+            # Read as BYTES so the fold offset is an exact file position (a text read would re-encode and
+            # break the offset under multibyte ids). FileNotFoundError/OSError -> "no audit", fail open.
+            blob = self.audit_path.read_bytes()
+        except (FileNotFoundError, OSError):
+            # A vanished/unreadable log resets the fold so a later recreated log re-folds from scratch.
+            self._audit_offset, self._audit_counts_cache, self._audit_anchor = 0, {}, b""
+            return {}
+
+        size = len(blob)
+        w = self._AUDIT_ANCHOR_WINDOW
+        # Decide whether the cached prefix [0, _audit_offset) is still a valid prefix of the current
+        # file. It is iff the file is at least that long AND the tail window ending at the offset is
+        # byte-identical to what we hashed last time. Any mismatch -> recompute from scratch.
+        reuse = (
+            self._audit_offset > 0
+            and size >= self._audit_offset
+            and hashlib.sha256(blob[max(0, self._audit_offset - w):self._audit_offset]).digest()
+            == self._audit_anchor
+        )
+        if reuse:
+            counts = dict(self._audit_counts_cache)
+            new_start = self._audit_offset
+        else:
+            counts = {}
+            new_start = 0
+
+        # Fold only up to the last COMPLETE record: a trailing partial line (an append in progress, e.g.
+        # a kg_ground that has written bytes but not yet the newline) must not be counted or folded into
+        # the offset, so the next sweep re-reads it whole.
+        nl = blob.rfind(b"\n")
+        fold_end = nl + 1 if nl >= new_start else new_start
+        try:
+            self._fold_audit_lines(blob[new_start:fold_end], counts)
+        except UnicodeError:
+            # locale-mismatched / undefined bytes: degrade to "no audit" and fail open (§1.8). Leave the
+            # cache untouched (do NOT advance the offset) so a later clean read can re-fold.
+            return {}
+
+        # Commit the cache ONLY after the new bytes folded cleanly: the offset advances to the boundary
+        # we actually parsed, and the anchor pins the new prefix tail for the next sweep's prefix check.
+        self._audit_offset = fold_end
+        self._audit_counts_cache = dict(counts)
+        self._audit_anchor = hashlib.sha256(blob[max(0, fold_end - w):fold_end]).digest()
         return counts
 
     @staticmethod

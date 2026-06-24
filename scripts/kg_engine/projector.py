@@ -124,6 +124,10 @@ class Ranks:
     spec_betweenness: dict = field(default_factory=dict)
     specificity: dict = field(default_factory=dict)
     gate_on: int = 0
+    # signature of the live (failure-filtered) undirected topology these ranks were computed over;
+    # persisted so the next projection can skip the O(V·E) betweenness pass when the topology is
+    # unchanged (projector-1). "" when not computed (degenerate/empty graph).
+    topo_sig: str = ""
 
 
 # --------------------------------------------------------------------------- projector
@@ -153,6 +157,10 @@ class Projector:
         # callable. Merged OVER the corpus IDF in _ranks so an author can boost/pin a term's specificity
         # — previously validated but never consumed (review-low: specificity_seeds unused).
         self._specificity_seeds = specificity_seeds
+        # The parse is_stale() did for the content-hash check, stashed (keyed by cheap_sig) so the very
+        # next project() reuses it instead of re-parsing the whole canon a second time (projector-5/-11).
+        # Consumed once; the cheap_sig key guarantees a writer touching the vault in between invalidates it.
+        self._parse_cache: "tuple[str, list, dict] | None" = None
 
     def _spec_seeds(self) -> dict:
         s = self._specificity_seeds() if callable(self._specificity_seeds) else self._specificity_seeds
@@ -216,8 +224,24 @@ class Projector:
                            confidence_score=e.confidence_score)
         return G
 
+    @staticmethod
+    def _topo_sig(und: nx.Graph) -> str:
+        """A content hash of the live undirected TOPOLOGY (node set + deduped edge endpoint pairs) that
+        betweenness depends on. Unweighted betweenness is a pure function of this structure, so an equal
+        signature ⇒ provably-identical betweenness — the projector reuses the prior pass instead of
+        recomputing it (projector-1). A verdict that flips an edge into/out of FAILURE_STATES changes the
+        live subgraph (§1.7) and therefore this signature, forcing a recompute (the §1.7-correct gate)."""
+        h = hashlib.sha256()
+        for n in sorted(map(str, und.nodes())):
+            h.update(n.encode()); h.update(b"\x00")
+        h.update(b"\x01")
+        for u, v in sorted({tuple(sorted((str(u), str(v)))) for u, v in und.edges()}):
+            h.update(u.encode()); h.update(b"\x00"); h.update(v.encode()); h.update(b"\x00")
+        return h.hexdigest()
+
     # ---- ranks (off the hot path)
-    def _ranks(self, G: nx.DiGraph) -> Ranks:
+    def _ranks(self, G: nx.DiGraph, *, prior_topo_sig: str | None = None,
+               prior_betweenness: dict | None = None) -> Ranks:
         # The advisory ranks (degree/communities/betweenness/spec_betweenness) are computed over the
         # NON-FAILED subgraph (§1.7). graph.json and the edges table stay COMPLETE — failure memory is
         # never pruned — but a `failed`/`rejected` edge must not inflate centrality: the adversarial
@@ -243,15 +267,29 @@ class Projector:
         #    on many shortest paths for empty reasons).
         #  - specificity: IDF rarity of a node's label terms over the source corpus (the confound control).
         #  - spec_betweenness = betweenness * specificity: down-weights vague high-traffic hubs.
-        betweenness = nx.betweenness_centrality(und) if und.number_of_nodes() > 2 else {n: 0.0 for n in und}
+        # betweenness (the natural bridge metric) is a pure function of the live undirected topology, so
+        # when that topology is unchanged since the last projection we REUSE the prior pass instead of
+        # paying another O(V·E) computation on every reproject (projector-1) — the dominant cost of a
+        # /kg-ground drain or any non-topological canon edit. A topology change (an added/removed edge,
+        # or a verdict flipping an edge in/out of FAILURE_STATES per §1.7) moves topo_sig → recompute.
+        topo_sig = self._topo_sig(und)
+        if und.number_of_nodes() <= 2:
+            betweenness = {n: 0.0 for n in und}
+        elif prior_betweenness is not None and prior_topo_sig and prior_topo_sig == topo_sig:
+            betweenness = {n: float(prior_betweenness.get(n, 0.0)) for n in und.nodes()}
+        else:
+            betweenness = nx.betweenness_centrality(und)
         corpus = self._corpus()
-        seeds = idf_seeds(corpus) if corpus else {}
+        # the RAW corpus IDF seeds — computed ONCE and shared with the gate below (projector-low: idf_seeds
+        # was previously computed a second time inside harness.specificity).
+        raw_seeds = idf_seeds(corpus) if corpus else {}
         # merge the pack's author-pinned specificity_seeds OVER the corpus IDF (lowercased to match
         # idf_seeds' tokenization). An explicit pack seed wins, making the validated config actually
-        # drive specificity / spec_betweenness (review-low: specificity_seeds was never consumed).
+        # drive specificity / spec_betweenness (review-low: specificity_seeds was never consumed). The
+        # gate keeps using raw_seeds (corpus-only), so this pack merge never perturbs the gate verdict.
         pack_seeds = self._spec_seeds()
-        if pack_seeds:
-            seeds = {**seeds, **{str(k).lower(): float(v) for k, v in pack_seeds.items()}}
+        seeds = ({**raw_seeds, **{str(k).lower(): float(v) for k, v in pack_seeds.items()}}
+                 if pack_seeds else raw_seeds)
         default = (sum(seeds.values()) / len(seeds)) if seeds else 1.0
         specificity = {n: _node_specificity(G.nodes[n].get("label") or n, seeds, default) for n in G.nodes()}
         spec_betweenness = {n: betweenness.get(n, 0.0) * specificity.get(n, default) for n in G.nodes()}
@@ -266,12 +304,15 @@ class Projector:
             # computed on — NOT the full graph G. Passing G let the adversarial grounder's `failed`
             # counter-edges (the exact edges §1.7 excludes from centrality) flip the gate that then
             # governs ranking of a live-subgraph spec_betweenness the gate never measured (review-M2).
-            # `live` carries node attrs (incl. label) via add_nodes_from above, so _node_specificity works.
-            verdict = _specificity_gate(_node_link_data(live), corpus)
+            # `und` carries node attrs (incl. label) via to_undirected of `live`, so _node_specificity
+            # works. Hand the gate the already-built undirected graph + betweenness + raw seeds so it
+            # neither rebuilds the graph nor recomputes betweenness/idf (projector-2/projector-3).
+            verdict = _specificity_gate(None, corpus, precomputed_betweenness=betweenness,
+                                        precomputed_seeds=raw_seeds, precomputed_undirected=und)
             gate_on = 1 if verdict.get("gate_on") else 0
         except Exception:  # noqa: BLE001 — a gate-computation hiccup must never break projection
             gate_on = 0
-        return Ranks(comm, degree, bridges, betweenness, spec_betweenness, specificity, gate_on)
+        return Ranks(comm, degree, bridges, betweenness, spec_betweenness, specificity, gate_on, topo_sig)
 
     # ---- main
     def project(self, incremental: bool = True) -> ProjectReport:
@@ -298,11 +339,20 @@ class Projector:
             self.canon._release_lock()
 
     def _project_locked(self, incremental: bool) -> ProjectReport:
-        nodes = self.canon.all_nodes()
+        # Reuse the parse is_stale() just did for this same canon state (projector-5/-11): the cheap_sig
+        # match proves no file changed between is_stale() and here, so the stashed nodes/hashes are
+        # authoritative. Any writer touching the vault in the gap moves cheap_sig → cache miss → re-parse.
+        cache = self._parse_cache
+        self._parse_cache = None  # consume once, whether or not it hits
+        cur_sig = self._cheap_sig()
+        if cache and cache[0] == cur_sig:
+            nodes, cur_hashes = cache[1], cache[2]
+        else:
+            nodes = self.canon.all_nodes()
+            cur_hashes = {n.id: self._file_hash(n) for n in nodes}
         head = self._head()
         prior = self._read_meta() if self.db_path.exists() else {}
         prior_hashes = prior.get("file_hashes", {})
-        cur_hashes = {n.id: self._file_hash(n) for n in nodes}
         # R3: the stale-verdict advisory is keyed on a hash of the SOURCE payload (SourceSet concat),
         # NOT the per-node canon hash (which never sees a source edit). Computed here, off the hot path —
         # is_stale (the per-read gate) is deliberately left source-blind (Q3 one-projection-lag).
@@ -339,7 +389,12 @@ class Projector:
                                   if s["edge_id"] not in seen_ids]
 
         G = self._build_graph(nodes)
-        ranks = self._ranks(G)
+        # On an incremental reproject hand _ranks the prior topology signature + prior betweenness so it
+        # can skip the O(V·E) betweenness pass when the live topology is unchanged (projector-1). On a
+        # full rebuild we pass nothing (the table is about to be rewritten from scratch → always compute).
+        prior_topo_sig = None if do_full else prior.get("topo_sig", "")
+        prior_betweenness = None if do_full else self._read_prior_betweenness()
+        ranks = self._ranks(G, prior_topo_sig=prior_topo_sig, prior_betweenness=prior_betweenness)
 
         # graph.json is always written in full (cheap projection, must round-trip). Write atomically
         # (temp + os.replace) so a concurrent reader never observes a half-written file.
@@ -352,6 +407,7 @@ class Projector:
         else:
             self._write_incremental(nodes, changed, removed, ranks, head, cur_hashes, report,
                                     cur_source_hash, stale)
+        # ranks (cheap_sig/topo_sig/etc.) are persisted by the write methods via _save_meta.
 
         report.n_nodes = G.number_of_nodes()
         report.n_edges = G.number_of_edges()
@@ -437,7 +493,7 @@ class Projector:
             con.executemany("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", erows)
             report.touched_nodes = [n.id for n in nodes]
             report.touched_edges = [e.id for n in nodes for e in n.edges]
-            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale)
+            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig)
             con.commit()
         finally:
             con.close()
@@ -470,21 +526,24 @@ class Projector:
                         report.touched_edges.append(eid)
             # refresh ranks for unchanged nodes only when a rank value actually moved. Betweenness/
             # spec_betweenness/specificity are GLOBAL — one new edge shifts them for distant nodes — so
-            # they are diffed and refreshed here too, not just degree/community/bridge.
+            # they are diffed and refreshed here too, not just degree/community/bridge. Read every node's
+            # prior rank tuple in ONE query instead of a SELECT per node (projector-N+1: the old per-node
+            # `SELECT ... WHERE id=?` inside this loop was O(N) round-trips on every incremental reproject).
+            prior_ranks = {r[0]: r[1:] for r in con.execute(
+                "SELECT id,degree,community,bridge_communities,betweenness,spec_betweenness,specificity,"
+                "gate_on FROM nodes")}
             for n in nodes:
                 if n.id in changed_ids:
                     continue
                 row = self._node_row(n, ranks)
-                old = con.execute("SELECT degree,community,bridge_communities,betweenness,"
-                                  "spec_betweenness,specificity,gate_on FROM nodes WHERE id=?",
-                                  (n.id,)).fetchone()
+                old = prior_ranks.get(n.id)
                 new_vals = (row[7], row[8], row[9], row[11], row[12], row[13], row[14])
                 if old != new_vals:
                     con.execute("UPDATE nodes SET degree=?,community=?,bridge_communities=?,"
                                 "structural_bridge=?,betweenness=?,spec_betweenness=?,specificity=?,"
                                 "gate_on=? WHERE id=?",
                                 (row[7], row[8], row[9], row[10], row[11], row[12], row[13], row[14], n.id))
-            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale)
+            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig)
             con.commit()
         finally:
             con.close()
@@ -549,10 +608,13 @@ class Projector:
                 out.append({"edge_id": e.id, "reason": "span-no-longer-in-source"})
         return out
 
-    def _save_meta(self, con, head, hashes, gate_on=0, source_hash="", stale_verdicts=None):
+    def _save_meta(self, con, head, hashes, gate_on=0, source_hash="", stale_verdicts=None, topo_sig=""):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('built_from_commit', ?)", (head,))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('file_hashes', ?)", (json.dumps(hashes),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(self._cheap_sig()),))
+        # the live-topology signature these ranks were computed over (projector-1): lets the next
+        # projection reuse betweenness when the topology is unchanged.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('topo_sig', ?)", (topo_sig or "",))
         # the bridge-metric gate verdict for this projection (PLAN Stage 2): one value, read by
         # kg_context to decide whether spec_betweenness is the TRUSTED ranking signal this projection.
         con.execute("INSERT OR REPLACE INTO meta VALUES ('gate_on', ?)", (str(int(gate_on)),))
@@ -582,11 +644,44 @@ class Projector:
         except ValueError:
             out["cheap_sig"] = None
         out["source_hash"] = rows.get("source_hash", "")  # R3 stale-verdict recompute pre-gate
+        out["topo_sig"] = rows.get("topo_sig", "")         # projector-1 betweenness-reuse signature
         try:
             out["stale_verdicts"] = json.loads(rows.get("stale_verdicts", "[]"))
         except ValueError:
             out["stale_verdicts"] = []
         return out
+
+    def _read_prior_betweenness(self) -> dict | None:
+        """The prior projection's betweenness per node, read from the index in ONE query — fed back into
+        _ranks so a topology-unchanged reproject reuses it instead of recomputing (projector-1). None if
+        the index is unreadable (→ recompute)."""
+        if not self.db_path.exists():
+            return None
+        try:
+            con = sqlite3.connect(self.db_path)
+            try:
+                return {r[0]: r[1] for r in con.execute("SELECT id,betweenness FROM nodes")}
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return None
+
+    def _rearm_cheap_sig(self, sig: str) -> None:
+        """Persist the current cheap-signature when is_stale() proves (via the content-hash fallthrough)
+        that the canon is unchanged though its mtimes moved (projector-2/finding #2). Without this the
+        cheap pre-gate stays stuck at the pre-touch value and every later is_stale() pays a full O(N)
+        canon parse forever. Best-effort + lock-free: a single-key meta upsert is WAL-safe under
+        busy_timeout; a read-only/locked vault just keeps the slow path (never raises from a read)."""
+        try:
+            con = sqlite3.connect(self.db_path)
+            try:
+                con.execute("PRAGMA busy_timeout=5000")
+                con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(sig),))
+                con.commit()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
 
     def is_stale(self) -> bool:
         if not self.db_path.exists() or not self.graph_path.exists():
@@ -603,13 +698,26 @@ class Projector:
         # cheap pre-gate (projector-2): if the canon dir's (count, newest mtime) is unchanged since the
         # last projection, nothing on disk changed -> not stale, WITHOUT a git fork or a full YAML
         # parse. This fronts EVERY read, so it must stay O(dir-listing), not O(N parse).
-        if prior.get("cheap_sig") is not None and prior["cheap_sig"] == self._cheap_sig():
+        cur_sig = self._cheap_sig()
+        if prior.get("cheap_sig") is not None and prior["cheap_sig"] == cur_sig:
             return False
         # the cheap signal moved -> authoritative per-node content-hash comparison. This catches any
         # uncommitted canon change (a kg_ground verdict, a hand edit) regardless of HEAD; content
         # equality means the derived layer matches the canon whatever the commit is.
-        cur_hashes = {n.id: self._file_hash(n) for n in self.canon.all_nodes()}
-        return prior.get("file_hashes", {}) != cur_hashes
+        nodes = self.canon.all_nodes()
+        cur_hashes = {n.id: self._file_hash(n) for n in nodes}
+        if prior.get("file_hashes", {}) == cur_hashes:
+            # content is identical though the cheap signal moved (an mtime-only touch: a no-op checkout,
+            # an editor re-save, or an idempotent kg_write/kg_ground that rewrote a note to identical
+            # bytes — os.replace always yields a fresh mtime). Re-arm the cheap pre-gate so the NEXT
+            # is_stale() short-circuits instead of re-parsing the whole canon forever (finding #2).
+            self._rearm_cheap_sig(cur_sig)
+            return False
+        # genuinely stale -> stash this parse so the project() that follows reuses it rather than parsing
+        # the whole canon a second time (projector-5/-11). cur_sig keys the cache so a concurrent write
+        # in the gap invalidates it.
+        self._parse_cache = (cur_sig, nodes, cur_hashes)
+        return True
 
     # ---- query surface (read precomputed ranks O(1); NO centrality in-request)
     def _ro(self) -> sqlite3.Connection:

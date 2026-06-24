@@ -14,6 +14,19 @@ from typing import Any
 
 import yaml
 
+# libyaml's C SafeLoader is ~8x faster than the pure-Python SafeLoader and is hit on every canon PARSE
+# (all_nodes / reproject / kg_write baseline) — the dominant read-path cost (model-1). The fallback is
+# MANDATORY: pyyaml>=6 does not guarantee the C extension on every platform/wheel (musl, some ARM, sdist).
+# CSafeLoader is semantically identical to SafeLoader for our scalar/list/map frontmatter, so spans/
+# verdicts/edge_id/epistemic_state parse identically. The DUMP side deliberately stays on pure-Python
+# safe_dump: CSafeDumper escapes non-BMP scalars (emoji / supplementary-plane CJK, e.g. inside a span)
+# that safe_dump emits literally — lossless but byte-different — and the write path is far less hot than
+# the parse path, so we keep canon bytes identical (clean git diffs, canonmerge byte-stability).
+try:
+    from yaml import CSafeLoader as _YamlLoader
+except ImportError:  # pragma: no cover - exercised only on a libyaml-less build
+    from yaml import SafeLoader as _YamlLoader
+
 # --------------------------------------------------------------------------- axes (§1.3)
 
 
@@ -250,7 +263,7 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise ValueError("note has no YAML frontmatter")
-    fm = yaml.safe_load(m.group(1)) or {}
+    fm = yaml.load(m.group(1), Loader=_YamlLoader) or {}
     body = m.group(2).strip("\n")
     # Skip a malformed edge entry (e.g. a hand-edited `- just a string` scalar instead of a mapping)
     # rather than letting it raise and take the whole node — including its failed/rejected counter-

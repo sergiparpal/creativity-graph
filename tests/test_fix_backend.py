@@ -53,7 +53,7 @@ def test_rolled_back_section_is_not_counted_as_written(engine, monkeypatch):
     accumulated into dispositions or counted in `sections` — before the fix run() did both."""
     # Stub the boundary to report a rollback: per the server contract, written_nodes is [] and the
     # accepted/demoted counts never landed even though `dispositions` still reports what was *validated*.
-    def _rolled_back(payload, *, message="kg_write"):
+    def _rolled_back(payload, *, message="kg_write", existing_nodes=None):
         return {
             "dispositions": {"ACCEPTED": 2, "DEMOTED": 0, "QUARANTINED": 0, "REJECTED": 0},
             "details": [],
@@ -120,7 +120,7 @@ def test_mixed_rolled_back_and_clean_sections_only_count_clean(engine, tmp_path,
 
     real_write = engine.kg_write
 
-    def _write_first_rolls_back(payload, *, message="kg_write"):
+    def _write_first_rolls_back(payload, *, message="kg_write", existing_nodes=None):
         # roll back only the first section (its message carries the section title "One")
         if "One" in message:
             return {"dispositions": {"ACCEPTED": 2}, "details": [], "written_nodes": [],

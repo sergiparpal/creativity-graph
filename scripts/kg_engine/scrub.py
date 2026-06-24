@@ -133,6 +133,18 @@ class Scrubber:
         self._counters: dict[str, int] = {}
         self._value_to_ph: dict[tuple[str, str], str] = {}
         self._mapping: dict[str, str] = {}
+        # Precompile caller-supplied literal terms ONCE per instance instead of re.compile-per-term
+        # per scrub() call (perf-#21). Each term becomes re.compile(re.escape(term)) — byte-identical
+        # match semantics to the old `re.sub(re.escape(term), ...)` — and the longest-first ordering
+        # (sorted by len, descending) plus the per-category iteration order are preserved exactly, so
+        # WHICH spans get redacted, and their precedence, are unchanged. Empty terms are dropped (same
+        # as the old `if not term: continue`).
+        self._extra_term_pats: list[tuple[str, re.Pattern]] = [
+            (cat, re.compile(re.escape(term)))
+            for cat, terms in self.extra_terms.items()
+            for term in sorted(terms, key=len, reverse=True)
+            if term
+        ]
 
     def reset(self) -> None:
         """Clear the accumulated placeholder namespace (start a fresh scrubbing session)."""
@@ -177,11 +189,10 @@ class Scrubber:
         # caller-supplied literal terms first (e.g. a names list for this corpus). These are an EXPLICIT
         # redaction request, so honor them at EVERY tier — a lower sensitivity must not silently drop a
         # caller's own term list (review-low). Pattern-based categories below still respect `active`.
-        for cat, terms in self.extra_terms.items():
-            for term in sorted(terms, key=len, reverse=True):
-                if not term:
-                    continue
-                out = re.sub(re.escape(term), lambda m, c=cat: placeholder(c, m.group(0)), out)
+        # Patterns are precompiled once in __post_init__ (longest-first, same category order); this loop
+        # only runs .sub() so nothing is recompiled per call (perf-#21).
+        for cat, pat in self._extra_term_pats:
+            out = pat.sub(lambda m, c=cat: placeholder(c, m.group(0)), out)
 
         for cat, pat in _PATTERNS:
             if cat not in active:

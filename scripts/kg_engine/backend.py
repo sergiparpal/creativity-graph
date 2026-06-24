@@ -310,6 +310,10 @@ class BackendExtractor:
         totals: Counter = Counter()
         n_written = 0
         failed_sections: list[dict] = []
+        # Parse the canon baseline ONCE here and thread it through every section's kg_write, refreshing
+        # only the nodes each section touched (read back from the authoritative post-merge canon). This
+        # replaces the per-section full-canon re-parse inside kg_write — O(S·N) → O(N + S·K) (backend-1).
+        baseline = {n.id: n for n in self.engine.canon.all_nodes()}
         try:
             for fname, ftext in sources.texts.items():
                 for title, body in self.split_sections(ftext):
@@ -323,15 +327,24 @@ class BackendExtractor:
                         scrubbed = self.engine.kg_scrub(body)["scrubbed"]
                         raw = self.extract_section(scrubbed, title)
                         result = self.engine.kg_write(self._stamp(raw, source_file=fname),
-                                                      message=f"backend:{fname}:{title or 'preamble'}")
+                                                      message=f"backend:{fname}:{title or 'preamble'}",
+                                                      existing_nodes=list(baseline.values()))
                         if result.get("rolled_back"):
                             # The boundary rolled the whole section's write back (write_nodes raised):
                             # its `written_nodes` is [] and the accepted/demoted counts never landed, so
                             # they must NOT be accumulated. Record it as a failed section instead of
-                            # over-reporting.
+                            # over-reporting. The baseline is untouched (nothing persisted).
                             failed_sections.append({"title": title or "preamble",
                                                     "error": result.get("error") or "kg_write rolled back"})
                             continue
+                        # refresh ONLY the nodes this section wrote from the canon (their exact post-merge
+                        # state) so the threaded baseline stays authoritative for the next section without
+                        # an O(N) re-parse. On any read hiccup, fall back to a full re-parse (correctness).
+                        try:
+                            for nid in result.get("written_nodes", []):
+                                baseline[nid] = self.engine.canon.read_node(nid)
+                        except Exception:  # noqa: BLE001 — never let baseline maintenance corrupt a run
+                            baseline = {n.id: n for n in self.engine.canon.all_nodes()}
                         for k, v in result["dispositions"].items():
                             totals[k] += v
                         n_written += 1
