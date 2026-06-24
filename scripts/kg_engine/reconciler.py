@@ -202,11 +202,25 @@ class Reconciler:
                 # window at worst drops an already-forged note (re-corrected next sweep), never a grounded one.
                 canonical_name = f"{slug(node.id)}.md"
                 if p.name != canonical_name:
+                    try:
+                        # Would the canonical write collide with a DISTINCT existing note (a real id≠
+                        # owning slug(id).md on a case-sensitive FS)? Detect BEFORE the destructive
+                        # unlink: the old code unlinked first, then write_one -> _check_slug_collision
+                        # raised, and the UNCAUGHT ValueError aborted the ENTIRE sweep with the original
+                        # already deleted — a vault-wide reconcile outage plus note loss (review-M1).
+                        self.canon._check_slug_collision(node)
+                    except ValueError:
+                        live_files.add(rel)  # keep the original; retry next sweep, don't abort the sweep
+                        continue
                     p.unlink(missing_ok=True)  # drop the non-canonical original before the canonical write
                     files_state.pop(rel, None)
                     rel = canonical_name
                     p = self.canon.notes_dir / canonical_name
-                self.canon.write_one(node)
+                try:
+                    self.canon.write_one(node)
+                except Exception:  # noqa: BLE001 — one unwritable/colliding note must not abort the sweep
+                    live_files.add(rel)
+                    continue
                 st = p.stat()
                 digest = _sha256(p)
             keys = [f"node:{node.id}", *(e.id for e in node.edges)]

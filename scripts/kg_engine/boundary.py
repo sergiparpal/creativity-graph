@@ -25,6 +25,7 @@ from .model import (
     Edge,
     EpistemicState,
     FAILURE_STATES,
+    GROUNDABLE_STATES,
     Node,
     Provenance,
     UNDECLARED_TYPE,
@@ -166,6 +167,13 @@ def validate_payload(
     written_nodes = 0
     for nin in wp.nodes:
         node = _canon_node(nin)
+        # restore the egress-scrubbed placeholders in the HUMAN-FACING fields so the canon stores the
+        # ORIGINAL text (§1.9), exactly as the edge span is restored below. Scoped to label/body (free
+        # text); the node id and edge endpoints stay on the form the subagent emitted so identity
+        # linkage (id == slug it was attached by) is preserved (review-low: restore-only-span).
+        if restore is not None:
+            node.label = restore(node.label)
+            node.body = restore(node.body)
         disp, reason = Disposition.ACCEPTED, ""
         # never-forge-a-state: a write may assert only `unverified`. grounded/rejected/failed/obsolete
         # all flow ONLY through kg_ground; reset any other claimed state.
@@ -215,12 +223,20 @@ def validate_payload(
     # claim that collapses into a known failure, and is quarantined on sight so generation can't re-propose
     # what was already refuted. Failure memory binds generation.
     failure_ids = {e.id for e in existing_list if e.epistemic_state in FAILURE_STATES}
+    # verdict-durability (review-C1, §1.8): the POSITIVE half of the kg_ground-owned state space
+    # (grounded / obsolete — GROUNDABLE_STATES minus the failure half). A re-emit of an edge already in
+    # one of these must be quarantined exactly like the failure half, or the canon's "incoming wins"
+    # merge (canon._merge_into_existing) silently overwrites the verdict with this fresh `unverified`
+    # edge on a normal idempotent /kg-build re-run. failure_ids was already protected; this closes the
+    # symmetric grounded/obsolete gap on EVERY lane.
+    verdict_ids = {e.id for e in existing_list
+                   if e.epistemic_state in GROUNDABLE_STATES and e.epistemic_state not in FAILURE_STATES}
     written = 0
     # single-blob fallback: normalize the source ONCE (skipped when a SourceSet drives verification,
     # which keeps its own per-file normalized cache).
     norm_source = "" if sources is not None else normalize_text(source_text)
     for ein in wp.edges:
-        r = _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids, sources)
+        r = _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids, verdict_ids, sources)
         # rate limit: once the canon-wide writable-edge budget is exhausted, reject the overflow as a
         # flood rather than letting it grow the graph unbounded (§Stage 9). Only NET-NEW edges are
         # charged: a deduped edge (already in the canon or repeated in this payload) grows the canon by
@@ -250,7 +266,8 @@ def _slug_label(label: str) -> str:
     return slug(label)
 
 
-def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids, sources=None) -> ValidationResult:
+def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids, verdict_ids=frozenset(),
+                   sources=None) -> ValidationResult:
     edge = Edge(
         source=ein.source, target=ein.target, relation=ein.relation,
         provenance=ein.provenance, authored_by=ein.authored_by,
@@ -336,6 +353,15 @@ def _validate_edge(ein, edge_types, norm_source, restore, seen, failure_ids, sou
         # honest claim, not a re-proposal of the refuted one.
         if ident in failure_ids:
             return _ok("edge", edge, Disposition.QUARANTINED, "collapses-into-known-failure", False, ident)
+        # verdict-durability (review-C1, §1.8): the symmetric guard for the POSITIVE half. Re-emitting a
+        # span-present/inferred edge whose id already carries a `grounded`/`obsolete` verdict would
+        # otherwise dedup-and-accept, then the canon's "incoming wins" merge resets the verdict to this
+        # fresh `unverified` edge on a routine idempotent /kg-build re-run. Quarantine so the verdict can
+        # never be reset by a re-build. Scoped to the NON-hypothesized lane only: on the generation lane
+        # a grounded edge is live structure that must not block a re-proposal (failure memory binds
+        # generation, a positive verdict does not), and the merge-layer guard protects it there instead.
+        if ident in verdict_ids:
+            return _ok("edge", edge, Disposition.QUARANTINED, "collapses-into-known-verdict", False, ident)
 
     # undeclared edge type -> quarantine (never silently accepted) — applies to every lane
     if edge_types is not None and edge.relation not in edge_types:
@@ -357,13 +383,21 @@ def merge_results_into_nodes(results: list[ValidationResult]) -> dict[str, Node]
     for r in results:
         if r.kind == "node" and r.written:
             nodes.setdefault(r.item.id, r.item)
-    # single-canonical-edge rule: dedup by edge id within a source node (last write wins)
+    # single-canonical-edge rule: dedup by edge id within a source node (last write wins). Key the
+    # attachment on the SLUG of edge.source — the same canonical key node ids, edge_id, node files, and
+    # dedup all use — NOT the raw source string. Keying on the raw label (e.g. 'Free Energy Principle')
+    # while nodes are keyed by slug ('free-energy-principle') fabricates a phantom Node(id=<raw label>)
+    # that slug-collides with the real node onto one file, tripping _check_slug_collision and rolling
+    # back the ENTIRE kg_write batch — silent total data loss (review-C2).
     edges_by_node: dict[str, dict[str, Edge]] = {}
+    labels: dict[str, str] = {}
     for r in results:
         if r.kind == "edge" and r.written:
-            edges_by_node.setdefault(r.item.source, {})[r.item.id] = r.item
+            src = _slug_label(r.item.source)
+            edges_by_node.setdefault(src, {})[r.item.id] = r.item
+            labels.setdefault(src, r.item.source)  # a readable label for an auto-created placeholder
     for src, ebyid in edges_by_node.items():
         if src not in nodes:
-            nodes[src] = Node(id=src, label=src)
+            nodes[src] = Node(id=src, label=labels.get(src, src))  # id == slug, matching its filename
         nodes[src].edges = list(ebyid.values())
     return nodes

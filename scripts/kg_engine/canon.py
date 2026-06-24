@@ -17,7 +17,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import Edge, Node, node_from_markdown, node_to_markdown, slug
+from .model import (
+    Edge,
+    EpistemicState,
+    GROUNDABLE_STATES,
+    Node,
+    node_from_markdown,
+    node_to_markdown,
+    slug,
+)
 
 LOCK_NAME = ".kg-session-lock"
 CANON_SUBDIR = "canon"
@@ -477,6 +485,18 @@ class Canon:
         # all three layers agree on what "one edge" is (boundary-1 / §1.4).
         by_id = {e.id: e for e in cur.edges}
         for e in node.edges:
+            prev = by_id.get(e.id)
+            # verdict-durability defense-in-depth (review-C1, §1.8): never silently downgrade a
+            # verdict-bearing edge back to `unverified` on a merge. The write boundary already
+            # quarantines such re-emits, so in normal flow this never fires; it protects any direct
+            # write_nodes(merge=True) caller. The reconciler's LEGITIMATE demote-to-unverified goes
+            # through write_one (no merge), so it is unaffected; kg_ground stamps a non-`unverified`
+            # state, so its merges don't trip this either.
+            if (prev is not None and prev.epistemic_state in GROUNDABLE_STATES
+                    and e.epistemic_state == EpistemicState.UNVERIFIED):
+                e.epistemic_state = prev.epistemic_state
+                e.verdict_by = prev.verdict_by
+                e.verdict_at = prev.verdict_at
             by_id[e.id] = e  # incoming wins (already validated)
         cur.edges = list(by_id.values())
         if node.body:
@@ -500,5 +520,7 @@ class Canon:
                 if original is None:
                     p.unlink(missing_ok=True)  # file was newly created by this batch -> remove it
                 else:
-                    p.write_bytes(original)
+                    # atomic + fsynced restore, consistent with the rest of the module — a crash mid
+                    # rollback must not leave a half-written note (review-low: rollback non-atomic).
+                    _atomic_write_bytes(p, original)
         return RollbackInfo(True, error)

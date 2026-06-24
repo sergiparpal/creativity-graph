@@ -108,9 +108,14 @@ def normalize_text(s: str) -> str:
 
 def span_verifies(span: str, source_text: str) -> bool:
     """True iff `span` appears (normalized substring) in `source_text`. The span-present check (§1.5)."""
-    if not span or not span.strip():
+    # Guard on the NORMALIZED span, not the raw one: a span of only zero-width / format (Cf) characters
+    # survives `str.strip()` (it is non-whitespace) but normalize_text() drops all Cf, leaving '' — and
+    # '' is a substring of every string, so the raw guard would fail OPEN. Mirror sources.verifies (the
+    # production sibling) which already guards on the normalized form (review-low: span_verifies Cf-only).
+    ns = normalize_text(span)
+    if not ns:
         return False
-    return normalize_text(span) in normalize_text(source_text)
+    return ns in normalize_text(source_text)
 
 
 def slug(s: str) -> str:

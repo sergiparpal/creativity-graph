@@ -11,11 +11,12 @@ guarantee the docstring now states, so the doc can't drift back to overclaiming.
 """
 from __future__ import annotations
 
-from kg_engine.boundary import validate_payload
+from kg_engine.boundary import merge_results_into_nodes, validate_payload
 from kg_engine.model import (
     Disposition,
     Edge,
     EpistemicState,
+    Node,
     edge_id,
     slug,
 )
@@ -109,9 +110,11 @@ def test_non_hypothesized_lane_does_not_reverse_collapse(pack):
     assert r.reason == ""  # a clean, net-new, span-present edge
 
 
-def test_reemit_non_failed_existing_edge_still_deduped(pack):
-    """A normal re-emit of an existing edge that is NOT in FAILURE_STATES must still ACCEPT as
-    `deduped` — only failed/rejected identities are quarantined."""
+def test_reemit_grounded_edge_quarantined_and_verdict_protected(pack):
+    """review-C1 (§1.8): a re-emit of an existing GROUNDED edge must be QUARANTINED
+    `collapses-into-known-verdict`, NOT deduped+accepted — otherwise the canon's "incoming wins" merge
+    overwrites the verdict with a fresh `unverified` edge on a normal idempotent re-build. The positive
+    half (grounded/obsolete) gets the same protection the failure half already had."""
     src = "Degree approximates importance"
     live = Edge(source="degree", target="importance", relation="approximates", span=src,
                 epistemic_state=EpistemicState.GROUNDED)
@@ -120,9 +123,103 @@ def test_reemit_non_failed_existing_edge_still_deduped(pack):
                     "span": src, "authored_by": "agent"}]},
         pack=pack, source_text=src, existing=[live])
     r = _edge_result(results)
+    assert r.disposition == Disposition.QUARANTINED
+    assert r.reason == "collapses-into-known-verdict"
+
+
+def test_reemit_obsolete_edge_also_quarantined(pack):
+    """`obsolete` is in GROUNDABLE_STATES but not FAILURE_STATES — it takes the same protected path."""
+    src = "Degree approximates importance"
+    live = Edge(source="degree", target="importance", relation="approximates", span=src,
+                epistemic_state=EpistemicState.OBSOLETE)
+    results = validate_payload(
+        {"edges": [{"source": "degree", "target": "importance", "relation": "approximates",
+                    "span": src, "authored_by": "agent"}]},
+        pack=pack, source_text=src, existing=[live])
+    assert _edge_result(results).disposition == Disposition.QUARANTINED
+
+
+def test_reemit_unverified_existing_edge_still_deduped(pack):
+    """Idempotency preserved: a re-emit of an existing UNVERIFIED edge (the only non-protected state) is
+    still ACCEPTED as `deduped` — re-running /kg-build before grounding must remain a no-op, not a flood."""
+    src = "Degree approximates importance"
+    live = Edge(source="degree", target="importance", relation="approximates", span=src,
+                epistemic_state=EpistemicState.UNVERIFIED)
+    results = validate_payload(
+        {"edges": [{"source": "degree", "target": "importance", "relation": "approximates",
+                    "span": src, "authored_by": "agent"}]},
+        pack=pack, source_text=src, existing=[live])
+    r = _edge_result(results)
     assert r.disposition == Disposition.ACCEPTED
     assert "deduped" in r.reason
-    assert "collapses-into-known-failure" not in r.reason
+
+
+def test_reemit_grounded_edge_end_to_end_verdict_survives(engine):
+    """End-to-end mirror of the `failed` survival test, for the POSITIVE verdict half (review-C1):
+    write -> ground to `grounded` -> re-emit the SAME edge. The grounding verdict must still stand."""
+    payload = {"edges": [
+        {"source": "degree", "target": "importance", "relation": "approximates",
+         "span": "Degree approximates importance", "authored_by": "agent"}]}
+    out = engine.kg_write(payload)
+    assert out["dispositions"]["ACCEPTED"] >= 1, out
+    eid = edge_id("degree", "approximates", "importance")
+    engine.kg_ground(eid, "grounded", by="agent", note="verified for the regression test")
+    assert next(x for x in engine.canon.all_edges() if x.id == eid).epistemic_state == EpistemicState.GROUNDED
+
+    again = engine.kg_write(payload)
+    assert again["dispositions"]["ACCEPTED"] == 0  # nothing written back over the verdict
+    assert again["dispositions"]["QUARANTINED"] >= 1
+    after = next(x for x in engine.canon.all_edges() if x.id == eid)
+    assert after.epistemic_state == EpistemicState.GROUNDED  # verdict durability (§1.8) held
+
+
+# --------------------------------------------------------------------------- C2 (slug attachment key)
+
+
+def test_edge_attaches_to_slugged_source_not_phantom_node():
+    """review-C2: an edge whose `source` is a human LABEL ('Free Energy Principle') must attach to the
+    SLUG-keyed node ('free-energy-principle'), not fabricate a phantom Node(id='Free Energy Principle')
+    that slug-collides onto the same file and rolls back the whole kg_write batch. (pack=None so the
+    hypothesized label-source edge is written without a source span or type gate.)"""
+    payload = {
+        "nodes": [{"label": "Free Energy Principle", "provenance": "hypothesized"}],
+        "edges": [{"source": "Free Energy Principle", "target": "active-inference",
+                   "relation": "relates_to", "provenance": "hypothesized"}],
+    }
+    nodes = merge_results_into_nodes(validate_payload(payload, pack=None))
+    assert "Free Energy Principle" not in nodes          # no phantom raw-label node
+    assert len(nodes) == 1                                 # exactly the one slug node, no collision pair
+    fe = nodes[slug("Free Energy Principle")]
+    assert [e.source for e in fe.edges] == ["Free Energy Principle"]  # edge attached to the slug node
+
+
+def test_placeholder_source_node_id_matches_its_filename_slug():
+    """The auto-created placeholder for an edge with no supplied node gets id == slug, so its frontmatter
+    id matches its slug(id).md filename (no divergence that a later slug-keyed write would split)."""
+    payload = {"edges": [{"source": "Active Inference", "target": "x", "relation": "relates_to",
+                          "provenance": "hypothesized"}]}
+    nodes = merge_results_into_nodes(validate_payload(payload, pack=None))
+    assert set(nodes) == {slug("Active Inference")}
+    node = nodes[slug("Active Inference")]
+    assert node.id == slug(node.id)  # id is already canonical → matches its filename
+
+
+# --------------------------------------------------------------------------- C1 (merge-layer guard)
+
+
+def test_merge_preserves_verdict_against_unverified_reemit(canon):
+    """review-C1 defense-in-depth: _merge_into_existing must never downgrade a verdict-bearing edge to
+    `unverified`. A direct write_nodes(merge=True) re-emit of a grounded edge as `unverified` keeps the
+    grounded verdict — the durable last line of defense that also covers the hypothesized lane (where the
+    boundary deliberately lets a grounded re-proposal through as live structure)."""
+    e = Edge(source="a", target="b", relation="bridges", span="x", epistemic_state=EpistemicState.GROUNDED,
+             verdict_by="agent", verdict_at="2026-01-01T00:00:00+00:00")
+    canon.write_nodes([Node(id="a", label="a", edges=[e])], message="seed")
+    e2 = Edge(source="a", target="b", relation="bridges", span="x", epistemic_state=EpistemicState.UNVERIFIED)
+    canon.write_nodes([Node(id="a", label="a", edges=[e2])], message="reemit")
+    after = next(x for x in canon.all_edges() if x.id == e.id)
+    assert after.epistemic_state == EpistemicState.GROUNDED
+    assert after.verdict_by == "agent"
 
 
 # --------------------------------------------------------------------------- F33 (slug guarantee)
