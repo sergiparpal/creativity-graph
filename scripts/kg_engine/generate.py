@@ -29,7 +29,7 @@ from pathlib import Path
 
 import networkx as nx
 
-from .graphio import node_link_graph
+from .graphio import node_attr, node_link_graph
 from .model import edge_id
 
 # The mechanism vocabulary. The DEFAULT_SET is what `/kg-generate` runs unless the user opts into all
@@ -90,8 +90,10 @@ class Candidate:
 # --------------------------------------------------------------------------- shared helpers
 
 
-def _attr(G, n, key, default):
-    return G.nodes.get(n, {}).get(key, default)
+# The node-attr accessor now lives in the graphio leaf, so operations.py imports it there instead of
+# reaching into this module's privates (it used to `from .generate import _attr`). Kept as a local alias
+# for this module's own internal call sites.
+_attr = node_attr
 
 
 def _gate_on(G) -> int:

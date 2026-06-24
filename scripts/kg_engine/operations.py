@@ -19,13 +19,16 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 
-from .generate import _attr, regroup
+from .generate import regroup
+from .graphio import node_attr
 from .model import slug
 
 HYP = "hypothesized"
 
-# Per-operation default fan-out knobs. server.py's kg_operate mirrors these defaults (`k or 10` /
-# `k or 2`); keep the two in sync when tuning.
+# Per-operation default fan-out knobs. server.py's kg_operate imports these (`k or ops.DEFAULT_REGROUP_K`
+# / `k or ops.DEFAULT_OPEN_POINTS`) instead of re-literalizing, so each default lives in exactly one place.
+# The `k or` coercion is deliberate: k=0/None falls back to the default for regroup/open (explode honors
+# k=0 as "zero facets" via its own _as_int path).
 DEFAULT_REGROUP_K = 10
 DEFAULT_OPEN_POINTS = 2
 
@@ -54,7 +57,7 @@ def _compression_id(members) -> str:
 
 
 def _community_members(G, cid) -> list:
-    return [n for n in G.nodes() if _attr(G, n, "community", -1) == cid]
+    return [n for n in G.nodes() if node_attr(G, n, "community", -1) == cid]
 
 
 def _resolve_cluster(G, target, members):
@@ -70,11 +73,11 @@ def _resolve_cluster(G, target, members):
     if target is not None:
         if target not in G:
             return _NO_SUCH_TARGET
-        cid = _attr(G, target, "community", -1)
+        cid = node_attr(G, target, "community", -1)
         return _community_members(G, cid) if cid != -1 else []
     by_comm: dict = defaultdict(list)
     for n in G.nodes():
-        by_comm[_attr(G, n, "community", -1)].append(n)
+        by_comm[node_attr(G, n, "community", -1)].append(n)
     real = [(c, ms) for c, ms in by_comm.items() if c != -1 and len(ms) >= 2]
     if not real:
         return []
@@ -102,7 +105,7 @@ def collapse_payload(G, *, target=None, members=None, label="", body=""):
 def explode_payload(G, *, target=None, k=None, label="", body=""):
     node = target
     if node is None or node not in G:
-        node = max(G.nodes(), key=lambda n: (float(_attr(G, n, "degree", 0)), n), default=None)
+        node = max(G.nodes(), key=lambda n: (float(node_attr(G, n, "degree", 0)), n), default=None)
     if node is None:
         return None, "no node to explode"
     rels = sorted({d.get("relation") for _, _, d in G.out_edges(node, data=True) if d.get("relation")})
@@ -136,7 +139,7 @@ def regroup_payload(G, *, failures=None, k=DEFAULT_REGROUP_K):
 def open_payload(G, *, label="", body="", k=DEFAULT_OPEN_POINTS):
     # attachment points: the highest-degree nodes — where the current vocabulary is most loaded and a
     # new primitive would most need to connect to open further territory (§8 open).
-    pts = sorted(G.nodes(), key=lambda n: (-float(_attr(G, n, "degree", 0)), n))[
+    pts = sorted(G.nodes(), key=lambda n: (-float(node_attr(G, n, "degree", 0)), n))[
         : max(1, _as_int(k, DEFAULT_OPEN_POINTS))]
     if not pts:
         return None, "empty graph — nothing to open against"

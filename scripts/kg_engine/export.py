@@ -18,7 +18,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from .canon import _atomic_write
+from .atomicio import atomic_write_text as _atomic_write
 from .templates.graph_html import HTML_TEMPLATE
 
 _FAILURE = ("failed", "rejected")

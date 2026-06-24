@@ -669,9 +669,9 @@ class KGEngine:
         elif op == "explode":
             payload, info = fn(G, target=target, k=k, label=label, body=body)
         elif op == "regroup":
-            payload, info = fn(G, failures=self._failure_ids(G), k=k or 10)
+            payload, info = fn(G, failures=self._failure_ids(G), k=k or ops.DEFAULT_REGROUP_K)
         else:  # open
-            payload, info = fn(G, label=label, body=body, k=k or 2)
+            payload, info = fn(G, label=label, body=body, k=k or ops.DEFAULT_OPEN_POINTS)
         if not payload or not (payload.get("nodes") or payload.get("edges")):
             return {"ok": False, "op": op, "error": "no structure to operate on", "info": info}
         result = self.kg_propose(payload, message=f"kg_operate:{op}")

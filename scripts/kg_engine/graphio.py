@@ -1,4 +1,4 @@
-"""Version-robust NetworkX node-link (de)serialization — the leaf graph-IO adapters.
+"""Leaf NetworkX helpers — version-robust node-link (de)serialization + a safe node-attr accessor.
 
 `node_link_graph` / `_node_link_data` are the on-disk shape of the derived `graph.json` (§1.2). They
 are shared by three modules: the projector *writes* the derived graph, while the harness (`specificity`,
@@ -33,3 +33,11 @@ def node_link_graph(data: dict):
         return nx.node_link_graph(data, edges="links", directed=data.get("directed", True))
     except TypeError:
         return nx.node_link_graph(data, directed=data.get("directed", True))
+
+
+def node_attr(G, n, key, default=None):
+    """Safe read of a precomputed node-rank attribute off the in-memory derived graph (degree,
+    community, specificity, spec_betweenness, ...). Shared by the generators and the §8 operations so the
+    accessor has ONE home, instead of operations.py reaching across the module boundary into a generate.py
+    private (it used to `from .generate import _attr`)."""
+    return G.nodes.get(n, {}).get(key, default)
