@@ -39,6 +39,46 @@ VALID_VERDICTS = {s.value for s in GROUNDABLE_STATES}
 VALID_ACTORS = {a.value for a in AuthoredBy}
 
 
+class _SourceResolver:
+    """Resolves the configured source path to a SourceSet, memoized on the aggregate
+    (resolved-file-list, mtime) signature so an added/removed/edited file is picked up while the
+    resolve+read stays off the hot path. Held by KGEngine (kg_scrub/kg_write span verification + the
+    projector wiring) and constructed afresh for the read-only PreToolUse-hook projector, so both read
+    the IDENTICAL source bytes. A single configured file is a one-entry SourceSet, byte-identical to the
+    prior single-blob path."""
+
+    def __init__(self, source_path=None):
+        self.source_path = Path(source_path) if source_path else None
+        self._cache: "tuple[tuple, SourceSet] | None" = None  # (signature, SourceSet) memo
+
+    def set(self) -> SourceSet:
+        sig = SourceSet.signature(self.source_path)
+        if self._cache is None or self._cache[0] != sig:
+            self._cache = (sig, SourceSet(self.source_path))
+        return self._cache[1]
+
+    def text(self) -> str:
+        return self.set().concat
+
+    def set_path(self, source_path) -> None:
+        """Re-point at a new source (and drop the memo) IN PLACE, so a holder of .set/.text — e.g. the
+        already-wired projector — sees the change without being reconstructed."""
+        self.source_path = Path(source_path) if source_path else None
+        self._cache = None
+
+
+def _wire_projector(canon, derived_dir, *, sources, pack, metrics_mode) -> Projector:
+    """The SINGLE construction site for a Projector's source-corpus + specificity-seed + metrics wiring,
+    shared by the writer engine (KGEngine.__init__) and the read-only PreToolUse hook
+    (KGEngine.read_only_projector). Routing both through here means a hook-triggered projection computes
+    the SAME IDF/specificity gate, spec_betweenness, and R3 stale-verdict scan as the server — it can
+    never write a degraded empty-corpus derived layer the server then serves as fresh (finding:
+    precontext-bypasses-facade). `sources` is a _SourceResolver; `pack` may be None."""
+    return Projector(canon, derived_dir, metrics_mode=metrics_mode,
+                     source_text=sources.text, source_set=sources.set,
+                     specificity_seeds=lambda: dict(getattr(pack, "specificity_seeds", {}) or {}))
+
+
 class KGEngine:
     """Stateful facade over canon + boundary + projector + reconciler + scrubber."""
 
@@ -50,43 +90,67 @@ class KGEngine:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.canon = Canon(self.project_dir)
         self.reconciler = Reconciler(self.canon)
-        # pass the bound source reader so the projector can IDF-weight specificity off the source corpus
-        # (PLAN Stage 2). It is read lazily, once per real reprojection, off the hot path.
-        self.projector = Projector(self.canon, self.data_dir / "derived", metrics_mode=metrics_mode,
-                                   source_text=self.source_text, source_set=self.source_set,
-                                   specificity_seeds=lambda: dict(getattr(self.pack, "specificity_seeds", {}) or {}))
-        self.scrubber = Scrubber(sensitivity)
-        self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
-        self.sensitivity = sensitivity
-        self.metrics_mode = metrics_mode
-        self.max_edges_per_kb = max_edges_per_kb
         # The configured source: a single file (back-compat), or a DIRECTORY / GLOB of .md/.txt (R4).
-        # Stays a single Path; SourceSet does the multi-file resolution behind source_set().
-        self.source_path = Path(source_path) if source_path else None
-        self._source_set_cache: tuple[tuple, SourceSet] | None = None  # (signature, SourceSet) memo
+        # Resolution + memo live in _SourceResolver, shared verbatim with the read-only PreToolUse hook.
+        self._sources = _SourceResolver(source_path)
+        # Load the pack BEFORE constructing the projector so its specificity_seeds are wired through the
+        # SAME _wire_projector seam the read-only hook uses — no construction-site drift between the two
+        # (finding: precontext-bypasses-facade).
         self.pack = None
         if pack_path and Path(pack_path).exists():
             try:
                 self.pack = load_pack(pack_path)
             except Exception:  # noqa: BLE001 — a bad pack must not crash the server
                 self.pack = None
+        # The projector reads source/specificity lazily, once per real reprojection, off the hot path.
+        self.projector = _wire_projector(self.canon, self.data_dir / "derived",
+                                         sources=self._sources, pack=self.pack, metrics_mode=metrics_mode)
+        self.scrubber = Scrubber(sensitivity)
+        self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
+        self.sensitivity = sensitivity
+        self.metrics_mode = metrics_mode
+        self.max_edges_per_kb = max_edges_per_kb
 
-    # ---- source set (for span verification)
+    # ---- source set (for span verification) — delegate to the shared resolver
     def source_set(self) -> SourceSet:
-        """The resolved {basename → text} view over the configured source(s) (R4). Memoized on the
-        aggregate (resolved-file-list, mtime) signature so an added/removed/edited file is picked up
-        while the resolve+read stays off the hot path — generalizing the old per-file mtime memo. A
-        single configured file is a one-entry SourceSet, byte-identical to the prior single-blob path."""
-        sig = SourceSet.signature(self.source_path)
-        if self._source_set_cache is None or self._source_set_cache[0] != sig:
-            self._source_set_cache = (sig, SourceSet(self.source_path))
-        return self._source_set_cache[1]
+        """The resolved {basename → text} view over the configured source(s) (R4), memoized off the hot
+        path. A single configured file is a one-entry SourceSet, byte-identical to the prior path."""
+        return self._sources.set()
 
     def source_text(self) -> str:
-        """The configured source(s) concatenated: a single file is its own text; a dir/glob is every
-        .md/.txt member joined. Feeds the flood-budget size and the projector's IDF corpus. Span
-        verification itself is source-aware via source_set().verifies (per-file), not this blob."""
-        return self.source_set().concat
+        """The configured source(s) concatenated — feeds the flood-budget size and the projector's IDF
+        corpus. Span verification itself is per-file via source_set().verifies, not this blob."""
+        return self._sources.text()
+
+    @property
+    def source_path(self):
+        """The configured source Path (or None), backed by the shared resolver. Kept as a settable
+        attribute for back-compat: the headless backend reads `.name`, and a test re-points it — the
+        setter mutates the resolver in place so the already-wired projector follows."""
+        return self._sources.source_path
+
+    @source_path.setter
+    def source_path(self, value) -> None:
+        self._sources.set_path(value)
+
+    @classmethod
+    def read_only_projector(cls, project_dir, data_dir, *, source_path=None, pack_path=None,
+                            metrics_mode="structure_only") -> Projector:
+        """A Projector wired IDENTICALLY to a live engine's (same source corpus + specificity seeds +
+        metrics_mode) but over a no-side-effect Canon(ensure_layout=False) — for the read-only PreToolUse
+        hook. Goes through the SAME _wire_projector seam as __init__, so the hook can never project a
+        degraded (empty-corpus) derived layer the server then serves as fresh (finding:
+        precontext-bypasses-facade). The pack is loaded eagerly (the hook holds no engine); a missing or
+        bad pack degrades to no specificity seeds, exactly as __init__ does."""
+        canon = Canon(project_dir, ensure_layout=False)
+        pack = None
+        if pack_path and Path(pack_path).exists():
+            try:
+                pack = load_pack(pack_path)
+            except Exception:  # noqa: BLE001 — a bad pack must not break the read hook
+                pack = None
+        return _wire_projector(canon, Path(data_dir) / "derived",
+                               sources=_SourceResolver(source_path), pack=pack, metrics_mode=metrics_mode)
 
     # ---- tools -----------------------------------------------------------
     def kg_ping(self) -> dict:

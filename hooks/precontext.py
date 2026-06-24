@@ -49,20 +49,33 @@ def main() -> int:
     # don't build context (or touch the derived tree) when nothing has been projected yet.
     if not (pathlib.Path(data) / "derived" / "index.sqlite").exists():
         return 0
+    # Resolve source / pack / metrics_mode with the SAME precedence + project-relative defaults the
+    # server uses (build_engine_from_env), so the hook's projection wires the IDENTICAL IDF corpus,
+    # specificity seeds, and metrics_mode — never a degraded empty-corpus derived layer the server would
+    # then serve as fresh (finding: precontext-bypasses-facade). KG_* live only in the MCP server's
+    # .mcp.json env; in the hook env these resolve via CLAUDE_PLUGIN_OPTION_* + the documented defaults.
+    source = _clean(os.environ.get("CLAUDE_PLUGIN_OPTION_SOURCE_PATH")) or _clean(os.environ.get("KG_SOURCE_PATH"))
+    if not source:
+        guess = pathlib.Path(project) / "examples" / "source.md"
+        source = str(guess) if guess.exists() else None
+    pack_path = _clean(os.environ.get("KG_PACK_PATH"))
+    if not pack_path:
+        guess = pathlib.Path(project) / "pack" / "pack.yaml"
+        pack_path = str(guess) if guess.exists() else None
+    metrics_mode = (os.environ.get("CLAUDE_PLUGIN_OPTION_METRICS_MODE") or "").strip() or "structure_only"
     try:
-        from kg_engine.canon import Canon
-        from kg_engine.projector import Projector
-        # ensure_layout=False: this is a pure read path, so don't let Canon() mkdir the canon dir or
-        # rewrite .git/info/exclude on every single Grep/Glob/Read (the writer-side server already
-        # maintains those). The derived dir is guaranteed to exist (index.sqlite checked above), so
-        # Projector's own derived mkdir is a no-op here too.
-        proj = Projector(Canon(project, ensure_layout=False), pathlib.Path(data) / "derived")
+        from kg_engine.server import KGEngine
+        # read_only_projector wires source/pack/metrics through the SAME seam as the server AND keeps a
+        # no-side-effect Canon(ensure_layout=False): a pure read path that never mkdir's the canon dir or
+        # rewrites .git/info/exclude on a plain Grep/Glob/Read (the writer-side server maintains those).
+        # The derived dir exists (index.sqlite checked above), so the projector's own mkdir is a no-op.
+        proj = KGEngine.read_only_projector(project, data, source_path=source, pack_path=pack_path,
+                                            metrics_mode=metrics_mode)
         if not proj.db_path.exists():
             return 0  # nothing projected yet
-        # Mirror the server's lazy-reproject gate (server._ensure_projected): a raw
-        # kg_context read off a stale projection would inject obsolete provenance /
-        # epistemic labels. The index already exists (guarded above), so this is a cheap
-        # incremental reproject, never a side-effecting cold build. Best-effort.
+        # Mirror the server's lazy-reproject gate (server._ensure_projected): a raw kg_context read off a
+        # stale projection would inject obsolete provenance / epistemic labels. The index already exists
+        # (guarded above), so this is a cheap incremental reproject, never a side-effecting cold build.
         if proj.is_stale():
             proj.project()
         ti = payload.get("tool_input", {})

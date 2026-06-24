@@ -141,6 +141,29 @@ def test_precontext_no_index_is_silent_no_side_effects(tmp_path):
     assert not (data / "derived").exists()
 
 
+# --------------------------------------------------------------------------- #
+# (2b) the read path the hook now uses wires the SAME source corpus as the server
+# --------------------------------------------------------------------------- #
+def test_read_only_projector_wires_source_like_engine(engine, source_path):
+    """KGEngine.read_only_projector (the seam the PreToolUse hook now goes through) must wire the SAME
+    source corpus + pack specificity seeds as a full engine, so a hook-triggered projection is identical
+    to the server's — not the degraded empty-corpus derived layer the old hand-built Projector produced
+    and the server then served as fresh (finding: precontext-bypasses-facade)."""
+    from kg_engine.canon import Canon
+    from kg_engine.projector import Projector
+    from kg_engine.server import KGEngine
+
+    pack_path = Path(__file__).resolve().parents[1] / "pack" / "pack.yaml"
+    ro = KGEngine.read_only_projector(engine.project_dir, engine.data_dir,
+                                      source_path=source_path, pack_path=pack_path)
+    # parity with the full engine's projector wiring (the bug was the hook wiring NEITHER of these):
+    assert ro._corpus() and ro._corpus() == engine.projector._corpus()   # IDF corpus is wired
+    assert ro._spec_seeds() == engine.projector._spec_seeds()            # pack specificity seeds wired
+    # and the degraded construction the fix replaces really does read an EMPTY corpus:
+    bare = Projector(Canon(engine.project_dir, ensure_layout=False), engine.data_dir / "derived")
+    assert bare._corpus() == []
+
+
 # precontext.py reads stdin with an explicit UTF-8 decode (line ~20) rather than
 # json.load(sys.stdin): under a non-UTF-8 locale (Windows cp1252, UTF-8 mode off) the
 # latter decodes the UTF-8 hook payload through the wrong text codec, mojibaking the
