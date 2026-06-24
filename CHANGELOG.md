@@ -14,6 +14,26 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+### Added
+
+- **Semantic git merge driver for the canon (the safe half of multi-machine support).** Two machines or
+  branches editing the *same* node previously handed `git` a line-based 3-way merge that mangled the
+  `edges:` block and could silently keep one side's grounding verdict. `scripts/kg_engine/canonmerge.py`
+  is now a git merge driver — the out-of-process mirror of `Canon._merge_into_existing` — that unions
+  edges by their deterministic `edge_id` and, for an edge present on both sides at a **different**
+  `epistemic_state`, resolves the merged edge to **`unverified`** (clearing `verdict_by`/`verdict_at`),
+  never to either side's verdict. It is **structurally incapable of forging a verdict** (the only
+  `epistemic_state` it can write on a conflict is `unverified`), so it needs no audit log; a verdict that
+  survives a clean merge with no local audit record is re-quarantined by the reconciler's full sweep
+  (§1.8). Shipped as `scripts/canon_merge_driver.mjs` (cross-platform Node launcher → resolved engine
+  python, never bash) routed by a new `.gitattributes` (`canon/*.md merge=kgcanon`). It is **not**
+  auto-installed — a clone opts in once with `git config merge.kgcanon.driver …` (pure git plumbing, no
+  per-session git-config writes); after a merge, conflicting verdicts demote to `unverified` and the
+  edges are re-grounded. Cross-machine verdict *preservation* (a syncable, replay-safe audit log) is a
+  deliberately deferred spike. Coverage in `tests/test_canonmerge.py` (edge union, equal-verdict
+  preservation, verdict-conflict demotion forge-proof over every cross-state pair, body 3-way merge,
+  malformed fail-open, and a git end-to-end merge).
+
 ## [0.3.3] — 2026-06-23
 
 ### Fixed

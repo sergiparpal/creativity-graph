@@ -26,6 +26,7 @@ _BOOT_PATH = REPO / "scripts" / "bootstrap.py"
 _LAUNCH_MJS = REPO / "scripts" / "launch_server.mjs"
 _PRECONTEXT_MJS = REPO / "hooks" / "precontext.mjs"
 _PROVISION_MJS = REPO / "hooks" / "provision.mjs"
+_CANON_MERGE_MJS = REPO / "scripts" / "canon_merge_driver.mjs"
 _PRECONTEXT_PY = REPO / "hooks" / "precontext.py"
 
 NODE = shutil.which("node")
@@ -254,7 +255,7 @@ def test_pythonpath_dedup_is_separator_canonical(mjs):
 # (4) every shipped .mjs parses under `node --check`
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-@pytest.mark.parametrize("mjs", [_LAUNCH_MJS, _PRECONTEXT_MJS, _PROVISION_MJS])
+@pytest.mark.parametrize("mjs", [_LAUNCH_MJS, _PRECONTEXT_MJS, _PROVISION_MJS, _CANON_MERGE_MJS])
 def test_mjs_parses(mjs):
     r = subprocess.run([NODE, "--check", str(mjs)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

@@ -140,6 +140,32 @@ scripts/launch_server.mjs`) self-heals the venv in the foreground if it is spawn
 finishes, so it starts cleanly on a fresh machine. See *Installation system* in `CLAUDE.md` for the
 full chain.
 
+### Multi-machine / multi-branch canon merges (optional)
+
+The canon is one Markdown file per node, so two machines (or two branches) editing the **same** node
+hand `git` a textual 3-way merge that mangles the `edges:` list and — worse — can silently keep one
+side's grounding verdict. A semantic merge driver ships for this: it unions edges by their deterministic
+`edge_id` and, when both sides carry the same edge at a **different** `epistemic_state`, resolves the
+merged edge to **`unverified`** (clearing `verdict_by`/`verdict_at`) — never to either side's verdict. It
+is the out-of-process mirror of the in-engine `Canon._merge_into_existing`.
+
+It is **not** auto-installed (pure git plumbing; the plugin never writes to your repo's git config).
+Opt in once per canon-vault clone — add the routing line to the vault's `.gitattributes` (this repo
+already ships one) and register the driver:
+
+```sh
+echo 'canon/*.md merge=kgcanon' >> .gitattributes
+git config merge.kgcanon.name   "creativity-graph canon merge"
+git config merge.kgcanon.driver "node ${CLAUDE_PLUGIN_ROOT}/scripts/canon_merge_driver.mjs %O %A %B"
+# (substitute the absolute path to the plugin checkout if ${CLAUDE_PLUGIN_ROOT} isn't exported in your shell)
+```
+
+After a merge: edges are preserved, conflicting verdicts are demoted to `unverified` — **re-ground the
+demoted edges** (`/kg-ground`) to re-earn the verdict. The driver can only ever *write* `unverified` on
+a conflict, so it cannot forge a verdict; a verdict that survives a clean merge with no local audit
+record is re-quarantined by the per-session reconciler anyway. (Sharing verdicts *across* machines — a
+syncable audit log — is a deliberately deferred follow-up; see `CHANGELOG.md`.)
+
 ### userConfig (`.claude-plugin/plugin.json`)
 
 | option | values | default | effect |

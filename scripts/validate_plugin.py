@@ -98,7 +98,11 @@ def main() -> int:
                 # PreToolUse precontext launcher (all referenced by .mcp.json/hooks.json).
                 "scripts/bootstrap.py", "scripts/launch_server.mjs",
                 "hooks/provision.mjs", "hooks/provision.sh", "hooks/provision.ps1",
-                "hooks/precontext.mjs", "hooks/precontext.py"):
+                "hooks/precontext.mjs", "hooks/precontext.py",
+                # semantic canon merge driver (R5): the engine module, its Node launcher, and the
+                # .gitattributes that routes canon/*.md through it.
+                "scripts/kg_engine/canonmerge.py", "scripts/canon_merge_driver.mjs",
+                ".gitattributes"):
         if not (ROOT / rel).exists():
             errors.append(f"missing file: {rel}")
 

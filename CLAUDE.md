@@ -173,6 +173,21 @@ it works on Windows, macOS, Linux, and WSL/Git-Bash alike, with or without `uv`.
 Hermetic coverage in `tests/test_bootstrap.py` (path resolution, stamp, readiness, lock, failure
 cleanup); `scripts/validate_plugin.py` asserts every entrypoint file is present.
 
+**Semantic canon merge driver (optional git plumbing).** `scripts/kg_engine/canonmerge.py` is a git
+merge driver for per-node canon Markdown — the out-of-process mirror of `Canon._merge_into_existing`:
+it unions edges by the deterministic `edge_id` and demotes an edge present on both sides at a
+*different* `epistemic_state` to `unverified` (clearing the verdict), never resolving to either side's
+verdict (the same rule the reconciler applies to an out-of-band state change, §1.8). It is launched via
+`scripts/canon_merge_driver.mjs` (Node → resolved engine python, same venv resolution as
+`launch_server.mjs`) and routed by the shipped `.gitattributes` (`canon/*.md merge=kgcanon`). It is
+**not** auto-installed — a clone opts in once with `git config merge.kgcanon.driver …` (per Stage-0 Q2;
+no per-session git-config writes). It is structurally incapable of forging a verdict (the only
+`epistemic_state` it can write on a conflict is `unverified`), so it needs no audit log; a verdict that
+survives a clean cross-machine merge is re-quarantined by the reconciler's full sweep. The cross-machine
+verdict-sharing half (a syncable audit log) is a deferred spike. Coverage in `tests/test_canonmerge.py`
+(edge union, verdict-conflict demotion forge-proof over every cross-state pair, body 3-way, fail-open,
+git end-to-end).
+
 ## Configuration
 
 `plugin.json` `userConfig` → engine env (read in `server.py:build_engine_from_env`):
