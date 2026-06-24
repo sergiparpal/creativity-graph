@@ -12,7 +12,8 @@ import pytest
 
 from kg_engine.canon import Canon
 from kg_engine.model import Edge, EpistemicState, Node
-from kg_engine.projector import Projector, node_link_graph
+from kg_engine.graphio import node_link_graph
+from kg_engine.projector import Projector
 
 
 def _seed(canon: Canon):
@@ -51,7 +52,7 @@ def test_graph_json_roundtrips_through_networkx(canon: Canon):
     ab = G.get_edge_data("a", "b")
     assert len(ab) == 2 and {d["relation"] for d in ab.values()} == {"grounds", "contradicts"}
     # re-serialize and reload -> stable, parallel edges preserved
-    from kg_engine.projector import _node_link_data
+    from kg_engine.graphio import _node_link_data
     G2 = node_link_graph(_node_link_data(G))
     assert set(G2.nodes()) == set(G.nodes()) and G2.number_of_edges() == 4
 

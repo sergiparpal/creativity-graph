@@ -12,6 +12,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from .graphio import node_link_graph
+
 # --------------------------------------------------------------------------- Krippendorff's alpha
 
 
@@ -58,9 +60,9 @@ def agreement(label_sets: list[dict]) -> float:
 # --------------------------------------------------------------------------- IDF / specificity
 
 # floor of {1,} (2-char minimum) so short alpha labels like "AI"/"ML"/"OS" still match a term and
-# carry their IDF rarity into _node_specificity, instead of matching nothing and silently falling back
+# carry their IDF rarity into node_specificity, instead of matching nothing and silently falling back
 # to the corpus default (finding harness-f4-4). Single-char tokens stay excluded as noise. Determinism
-# is unaffected — the same regex drives idf_seeds, _ngrams, _key_terms, and _node_specificity alike.
+# is unaffected — the same regex drives idf_seeds, _ngrams, _key_terms, and node_specificity alike.
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{1,}")
 
 
@@ -74,7 +76,7 @@ def idf_seeds(documents: list[str]) -> dict[str, float]:
     return {t: math.log(n / (1 + d)) + 1.0 for t, d in df.items()}
 
 
-def _node_specificity(label: str, seeds: dict[str, float], default: float) -> float:
+def node_specificity(label: str, seeds: dict[str, float], default: float) -> float:
     terms = [w.lower() for w in _WORD.findall(label or "")]
     if not terms:
         return default
@@ -100,7 +102,6 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
     pack-merged seeds the projector uses for its own specificity) so the gate verdict is unchanged.
     """
     import networkx as nx
-    from .projector import node_link_graph
 
     G = precomputed_undirected if precomputed_undirected is not None else node_link_graph(graph_data).to_undirected()
     if G.number_of_nodes() < 3:
@@ -109,7 +110,7 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
     seeds = precomputed_seeds if precomputed_seeds is not None else (idf_seeds(corpus) if corpus else {})
     default = (sum(seeds.values()) / len(seeds)) if seeds else 1.0
     labels = {n: (G.nodes[n].get("label") or n) for n in G.nodes()}
-    spec = {n: _node_specificity(labels[n], seeds, default) for n in G.nodes()}
+    spec = {n: node_specificity(labels[n], seeds, default) for n in G.nodes()}
 
     btw = precomputed_betweenness if precomputed_betweenness is not None else nx.betweenness_centrality(G)
     deg = dict(G.degree())
@@ -165,8 +166,6 @@ def absorption(graph_data: dict, history: dict, *, now=None, absorb_growth: int 
     Returns per-node {half_life, status ∈ fertile|absorbed|isolated, ...}. The fertile middle is the
     productive zone: neither trivially absorbed nor isolated.
     """
-    from .projector import node_link_graph
-
     G = node_link_graph(graph_data).to_undirected()
     deg = dict(G.degree())
     # `history` comes straight from generations.json, which the server passes UNVALIDATED — a record may

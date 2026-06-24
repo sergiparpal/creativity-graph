@@ -29,6 +29,7 @@ from pathlib import Path
 
 import networkx as nx
 
+from .graphio import node_link_graph
 from .model import edge_id
 
 # The mechanism vocabulary. The DEFAULT_SET is what `/kg-generate` runs unless the user opts into all
@@ -480,7 +481,6 @@ def _repartition(und, resolution=4.0, seed=7) -> "dict | None":
 
 def load_second_graph(path: str | Path) -> nx.MultiDiGraph:
     """Load a second construction's graph.json into a MultiDiGraph (PLAN Stage 7 — the ensemble path)."""
-    from .projector import node_link_graph
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return node_link_graph(data)
 

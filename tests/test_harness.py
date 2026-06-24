@@ -9,8 +9,8 @@ import pytest
 
 from kg_engine.harness import (
     _key_terms,
-    _node_specificity,
     _score_condition,
+    node_specificity,
     absorption,
     agreement,
     idf_seeds,
@@ -120,8 +120,8 @@ def test_short_alpha_labels_reflect_rarity():
     assert seeds["ml"] > seeds["ai"]        # the rarer label is more specific
     default = sum(seeds.values()) / len(seeds)
     # a short-label node reflects its term's specificity, not the undifferentiated default
-    assert _node_specificity("ML", seeds, default) == seeds["ml"]
-    assert _node_specificity("AI", seeds, default) != _node_specificity("ML", seeds, default)
+    assert node_specificity("ML", seeds, default) == seeds["ml"]
+    assert node_specificity("AI", seeds, default) != node_specificity("ML", seeds, default)
 
 
 # --------------------------------------------------------------------------- absorption window (§14)

@@ -23,7 +23,8 @@ import networkx as nx
 
 from .atomicio import atomic_write_text as _atomic_write
 from .canon import Canon
-from .harness import _node_specificity, idf_seeds
+from .graphio import _node_link_data
+from .harness import idf_seeds, node_specificity
 from .harness import specificity as _specificity_gate
 from .model import EpistemicState, FAILURE_STATES, Provenance
 
@@ -93,26 +94,6 @@ def gate_ranking(gate_on: bool) -> "tuple[str, tuple[str, ...]]":
     if gate_on:
         return "spec_betweenness", ("spec_betweenness", "degree")
     return "structural_bridge", ("structural_bridge", "betweenness", "degree")
-
-
-# --------------------------------------------------------------------------- node-link (version-robust)
-
-
-def _node_link_data(G) -> dict:
-    try:
-        return nx.node_link_data(G, edges="links")
-    except TypeError:
-        d = nx.node_link_data(G)
-        if "links" not in d and "edges" in d:
-            d["links"] = d.pop("edges")
-        return d
-
-
-def node_link_graph(data: dict):
-    try:
-        return nx.node_link_graph(data, edges="links", directed=data.get("directed", True))
-    except TypeError:
-        return nx.node_link_graph(data, directed=data.get("directed", True))
 
 
 # --------------------------------------------------------------------------- communities
@@ -336,7 +317,7 @@ class Projector:
         seeds = ({**raw_seeds, **{str(k).lower(): float(v) for k, v in pack_seeds.items()}}
                  if pack_seeds else raw_seeds)
         default = (sum(seeds.values()) / len(seeds)) if seeds else 1.0
-        specificity = {n: _node_specificity(G.nodes[n].get("label") or n, seeds, default) for n in G.nodes()}
+        specificity = {n: node_specificity(G.nodes[n].get("label") or n, seeds, default) for n in G.nodes()}
         spec_betweenness = {n: betweenness.get(n, 0.0) * specificity.get(n, default) for n in G.nodes()}
 
         # the gate (one value per projection): does specificity-weighting separate real bridges from
@@ -350,7 +331,7 @@ class Projector:
             # counter-edges (the exact edges §1.7 excludes from centrality) flip the gate that then
             # governs ranking of a live-subgraph spec_betweenness the gate never measured (review-M2).
             # `und` carries node attrs (incl. label) via `_live_subgraph`'s to_undirected, so
-            # _node_specificity works. Hand the gate the already-built undirected graph + betweenness +
+            # node_specificity works. Hand the gate the already-built undirected graph + betweenness +
             # raw seeds so it
             # neither rebuilds the graph nor recomputes betweenness/idf (projector-2/projector-3).
             verdict = _specificity_gate(None, corpus, precomputed_betweenness=betweenness,

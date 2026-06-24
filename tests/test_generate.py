@@ -167,7 +167,7 @@ def test_ensemble_with_second_graph_surfaces_cross_construction_bridge(canon: Ca
     import networkx as nx
 
     from kg_engine.generate import load_second_graph
-    from kg_engine.projector import _node_link_data
+    from kg_engine.graphio import _node_link_data
     # our construction: a-b, b-c (so a and c are NON-adjacent here)
     G = _ranked(canon, [("a", "b"), ("b", "c")])
     # a SECOND construction where a-c IS adjacent — external structure our dynamics resisted
@@ -192,7 +192,7 @@ def test_kg_ensemble_graph_summary_and_missing(engine, tmp_path):
 
     import networkx as nx
 
-    from kg_engine.projector import _node_link_data
+    from kg_engine.graphio import _node_link_data
     g = nx.MultiDiGraph()
     g.add_edge("x", "y", key="e1")
     p = tmp_path / "g.json"
