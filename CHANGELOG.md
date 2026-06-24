@@ -96,6 +96,52 @@ JSON back across the MCP boundary.
   kg_engine.export html|report|all`, the `kg_export` MCP tool, and the `/kg-view` command. MCP tool surface
   grows **16 → 17**. Coverage in `tests/test_export.py`.
 
+### Fixed — second exhaustive review (48 findings)
+
+A full-codebase review of the R1–R6 additions (which landed after the v0.3.0 review) plus a regression
+sweep. All findings adversarially verified; the high-severity ones reproduced by hand. 20 new regression
+tests; the full suite is green (392).
+
+- **Verdict durability on idempotent re-build (critical, §1.8).** A normal `/kg-build` re-run that
+  re-emitted an already-`grounded` (or `obsolete`) edge was `ACCEPTED`/`deduped`, and the canon's
+  "incoming wins" merge then overwrote the verdict with a fresh `unverified` edge — silently destroying a
+  `kg_ground` verdict the reconciler could not restore. The boundary's re-emit protection was scoped to
+  `FAILURE_STATES` only; it now covers the full `GROUNDABLE_STATES` on the extraction lane
+  (`collapses-into-known-verdict`), the generation lane is deliberately left free to re-propose grounded
+  structure, and `Canon._merge_into_existing` carries a verdict forward rather than downgrading it to
+  `unverified` (defense-in-depth; the reconciler's legitimate demote goes through `write_one`, unaffected).
+- **`kg_write` batch loss on a label-form edge source (critical).** `merge_results_into_nodes` attached
+  edges keyed on the raw `edge.source` while nodes were keyed by slug, fabricating a phantom node that
+  slug-collided onto one file and rolled back the **entire** batch (silent total data loss). Attachment now
+  keys on the slug, matching `edge_id`/node files/dedup; an auto-created placeholder gets `id == slug`.
+- **HTML inlining hardened (high).** `export.py` escaped only `</`, which the `<!--<script>`
+  script-data-double-escape state defeats; every `<`/`>`/`&` is now `\uXXXX`-escaped. The Markdown report
+  neutralizes backticks/angle brackets too.
+- **Post-upgrade read crash (high).** `is_stale()` now consults `_schema_outdated()`, so a derived
+  `index.sqlite` built before the Stage-2 node columns reprojects instead of crashing every read with
+  `no such column: betweenness` (permanently, on a read-only vault).
+- **Non-UTF-8 source no longer disables the tool surface (high).** `SourceSet` caught only `OSError`, but
+  `UnicodeDecodeError` is a `ValueError`; a binary/UTF-16 file among an R4 directory now skips instead of
+  propagating out of the constructor (uncached) and crashing `kg_write`/`kg_ground`/projection/export.
+- **Mediums:** reconcile sweep no longer aborts vault-wide (and deletes a note) on a slug collision with a
+  distinct canonical note; the specificity gate is decided over the same live (failure-excluded) subgraph
+  it ranks; `kg_ground` no longer triggers a full betweenness reproject per call (drain is back to ~O(1)
+  per edge); the backend clamps `max_tokens` to the SDK's non-streaming time floor (~21 333) so a moderate
+  override no longer fails every section pre-flight; `collapse` on a community-less/dangling target no
+  longer sweeps all danglers into one bogus compression; `regroup` short-circuits a degenerate
+  all-singleton repartition instead of an O(n²) explosion; the canon merge driver's system-python fallback
+  now requires PyYAML.
+- **Lows/nits:** pack `specificity_seeds` are now actually consumed (merged over the corpus IDF);
+  `span_verifies` no longer fails open on a zero-width-only span; the content-staleness hash ignores
+  timestamps; `kg_context` caps the R3 stale-verdict list; `absorption()` tolerates a malformed
+  `generations.json`; egress `extra_terms` are honored at every tier; `**` globs recurse; the bootstrap
+  stamp tracks the **venv** interpreter (no spurious cross-interpreter rebuilds) and a past-deadline wait
+  no longer reports "ready"; `precontext.py` resolves `KG_PROJECT_DIR`/`KG_DATA` like the server and strips
+  `${…}` sentinels; `validate_plugin.py` accepts single-quoted versions and fails on a missing version
+  line; the canon merge driver writes atomically and fails open; `source_path` userConfig is `string`
+  (so a directory/glob is selectable); igraph/leidenalg gain upper bounds; plus assorted comment/docstring
+  corrections.
+
 ## [0.3.3] — 2026-06-23
 
 ### Fixed
