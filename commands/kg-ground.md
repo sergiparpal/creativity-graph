@@ -31,6 +31,25 @@ Find what is actually pending before spending any subagent budget.
 If the `unverified` count is 0 and there are no hub candidates, stop and report "queue empty — nothing to
 ground". Otherwise proceed.
 
+## Stage 0b — Drain stale verdicts (source-staleness advisory, R3)
+
+A grounded/`failed` **span-present** edge's stored `span` is a snapshot taken when it was verdicted. If the
+source was later edited so that span no longer appears, the verdict is now resting on text that is gone. The
+projector recomputes this off the hot path and surfaces it (read-only — it **never** mutates the verdict):
+
+1. `mcp__plugin_creativity-graph_creativity-graph__kg_context(query="$ARGUMENTS")` → read
+   `advisory.stale_verdicts[]`. Each entry is `{edge_id, reason: "span-no-longer-in-source"}`: a grounded or
+   `failed` edge whose stored span no longer verifies against its source file. (Empty when nothing diverged —
+   the common case; if so, skip to Stage 1.)
+2. For each `edge_id`, route it to the `kg-grounder` (same Task as Stage 1) to **re-verify against the current
+   source** and re-apply a verdict via `kg_ground`:
+   - if the claim still holds at a new location in the source → `kg_ground(edge_id, verdict="grounded",
+     support_span="<the new verbatim span>")` (re-earns the verdict against the live text);
+   - if the source no longer supports it → `kg_ground(edge_id, verdict="rejected", note="source no longer
+     supports this span")`.
+   The advisory is a **heuristic, not a verdict**: re-grounding (the only thing that changes the state) clears
+   the flag on the next projection. Never edit `epistemic_state` directly to silence it (§1.4/§1.8).
+
 ## Stage 1 — Verdict the unverified edges (kg-grounder)
 
 Launch the `kg-grounder` subagent via the Task tool to drain the `unverified` queue. It walks each pending

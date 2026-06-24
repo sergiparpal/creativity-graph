@@ -16,7 +16,7 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import networkx as nx
 
@@ -24,6 +24,9 @@ from .canon import Canon, _atomic_write
 from .harness import _node_specificity, idf_seeds
 from .harness import specificity as _specificity_gate
 from .model import EpistemicState, FAILURE_STATES, Provenance
+
+if TYPE_CHECKING:  # type-only; the projector duck-types .verifies/.concat at runtime
+    from .sources import SourceSet
 
 GRAPH_JSON = "graph.json"
 INDEX_DB = "index.sqlite"
@@ -121,7 +124,8 @@ class Ranks:
 
 class Projector:
     def __init__(self, canon: Canon, derived_dir: str | Path | None = None, *,
-                 metrics_mode: str = "structure_only", source_text: "str | Callable[[], str] | None" = None):
+                 metrics_mode: str = "structure_only", source_text: "str | Callable[[], str] | None" = None,
+                 source_set: "Callable[[], SourceSet] | None" = None):
         self.canon = canon
         self.derived = Path(derived_dir) if derived_dir else (canon.root / "derived")
         self.derived.mkdir(parents=True, exist_ok=True)
@@ -133,11 +137,19 @@ class Projector:
         # reprojection — off the hot path). Absent -> an empty corpus, so specificity is uniform and the
         # bridge-metric gate stays closed (spec_betweenness degrades to raw betweenness).
         self._source_text = source_text
+        # The resolved SourceSet (R4), as a zero-arg callable, for the R3 source-staleness advisory: it
+        # re-verifies each grounded/failed span-present edge against its OWN source_file (per-file, never
+        # a global concat). Absent -> no staleness is ever flagged (can't diverge from a missing source).
+        self._source_set = source_set
+
+    def _src_text(self) -> str:
+        src = self._source_text() if callable(self._source_text) else self._source_text
+        return src or ""
 
     def _corpus(self) -> list[str]:
         """The source split into sections (on `\\n## `) for IDF — the corpus `harness.idf_seeds`
         consumes. Empty when no source is configured."""
-        src = self._source_text() if callable(self._source_text) else self._source_text
+        src = self._src_text()
         if not src:
             return []
         return [s for s in src.split("\n## ") if s.strip()]
@@ -250,16 +262,40 @@ class Projector:
         prior = self._read_meta() if self.db_path.exists() else {}
         prior_hashes = prior.get("file_hashes", {})
         cur_hashes = {n.id: self._file_hash(n) for n in nodes}
+        # R3: the stale-verdict advisory is keyed on a hash of the SOURCE payload (SourceSet concat),
+        # NOT the per-node canon hash (which never sees a source edit). Computed here, off the hot path —
+        # is_stale (the per-read gate) is deliberately left source-blind (Q3 one-projection-lag).
+        cur_source_hash = self._source_hash()
 
         do_full = (not incremental) or (not self.db_path.exists()) or (not prior_hashes) \
             or (not self.graph_path.exists()) or self._schema_outdated()
         report = ProjectReport(full_rebuild=do_full, built_from_commit=head)
 
-        if not do_full and prior.get("built_from_commit") == head and prior_hashes == cur_hashes:
+        # Up-to-date requires the canon AND the source unchanged: a source edit alone (canon byte-
+        # identical) must still fall through so the stale-verdict advisory refreshes — otherwise the flag
+        # could never appear once a projection is actually invoked.
+        if not do_full and prior.get("built_from_commit") == head and prior_hashes == cur_hashes \
+                and prior.get("source_hash", "") == cur_source_hash:
             report.up_to_date = True
             report.n_nodes = len(nodes)
             report.n_edges = sum(len(n.edges) for n in nodes)
             return report
+
+        # R3: stale-verdict advisory (READ-ONLY). On a full rebuild OR a source change, re-scan ALL
+        # grounded/failed span-present edges. Otherwise (canon-only change, source unchanged) re-check the
+        # already-flagged edges (so a re-grounded/deleted one CLEARS) AND scan the edges on THIS
+        # projection's `changed` notes — so a divergence introduced via the CANON (a hand-edited span on
+        # an already-grounded edge) is caught too, without a full O(N) source scan.
+        sources = self._source_set() if self._source_set else None
+        changed = [] if do_full else [n for n in nodes if cur_hashes.get(n.id) != prior_hashes.get(n.id)]
+        removed = [] if do_full else [nid for nid in prior_hashes if nid not in cur_hashes]
+        if do_full or cur_source_hash != prior.get("source_hash", ""):
+            stale = self._stale_verdicts(nodes, sources)
+        else:
+            refiltered = self._refilter_stale(prior.get("stale_verdicts") or [], nodes, sources)
+            seen_ids = {s["edge_id"] for s in refiltered}
+            stale = refiltered + [s for s in self._stale_verdicts(changed, sources)
+                                  if s["edge_id"] not in seen_ids]
 
         G = self._build_graph(nodes)
         ranks = self._ranks(G)
@@ -271,11 +307,10 @@ class Projector:
         _atomic_write(self.graph_path, json.dumps(data, indent=2))
 
         if do_full:
-            self._write_full(nodes, ranks, head, cur_hashes, report)
+            self._write_full(nodes, ranks, head, cur_hashes, report, cur_source_hash, stale)
         else:
-            changed = [n for n in nodes if cur_hashes.get(n.id) != prior_hashes.get(n.id)]
-            removed = [nid for nid in prior_hashes if nid not in cur_hashes]
-            self._write_incremental(nodes, changed, removed, ranks, head, cur_hashes, report)
+            self._write_incremental(nodes, changed, removed, ranks, head, cur_hashes, report,
+                                    cur_source_hash, stale)
 
         report.n_nodes = G.number_of_nodes()
         report.n_edges = G.number_of_edges()
@@ -349,7 +384,7 @@ class Projector:
         return (e.id, e.source, e.target, e.relation, e.provenance.value, e.authored_by.value,
                 e.epistemic_state.value, e.span, e.source_file, e.confidence.value, e.confidence_score)
 
-    def _write_full(self, nodes, ranks: Ranks, head, hashes, report):
+    def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash="", stale=None):
         con = self._connect()
         try:
             con.execute("DELETE FROM nodes")
@@ -361,12 +396,13 @@ class Projector:
             con.executemany("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", erows)
             report.touched_nodes = [n.id for n in nodes]
             report.touched_edges = [e.id for n in nodes for e in n.edges]
-            self._save_meta(con, head, hashes, ranks.gate_on)
+            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale)
             con.commit()
         finally:
             con.close()
 
-    def _write_incremental(self, nodes, changed, removed, ranks: Ranks, head, hashes, report):
+    def _write_incremental(self, nodes, changed, removed, ranks: Ranks, head, hashes, report,
+                           source_hash="", stale=None):
         con = self._connect()
         try:
             changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
@@ -407,7 +443,7 @@ class Projector:
                                 "structural_bridge=?,betweenness=?,spec_betweenness=?,specificity=?,"
                                 "gate_on=? WHERE id=?",
                                 (row[7], row[8], row[9], row[10], row[11], row[12], row[13], row[14], n.id))
-            self._save_meta(con, head, hashes, ranks.gate_on)
+            self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale)
             con.commit()
         finally:
             con.close()
@@ -427,13 +463,62 @@ class Projector:
             h.update(f"{p.name}\x00{st.st_size}\x00{st.st_mtime_ns}\x00".encode())
         return h.hexdigest()
 
-    def _save_meta(self, con, head, hashes, gate_on=0):
+    def _source_hash(self) -> str:
+        """sha256 of the source payload (the SourceSet concat); '' when no source. R3's stale-verdict
+        recompute pre-gate — moves on any add/remove/edit of any source file. Computed only inside a
+        projection (off the hot path); is_stale is left source-blind (Q3 one-projection-lag)."""
+        sources = self._source_set() if self._source_set else None
+        payload = sources.concat if sources is not None else self._src_text()
+        return hashlib.sha256(payload.encode()).hexdigest() if payload else ""
+
+    def _stale_verdicts(self, nodes, sources) -> list[dict]:
+        """R3 — the source-staleness advisory (READ-ONLY). A grounded/failed span-present edge's stored
+        span was verified at verdict time; if the source is later edited so it no longer appears, re-flag
+        it as `span-no-longer-in-source`. Source-aware: each edge is checked against its OWN `source_file`
+        (lenient any-source fallback), never a global concat — so a multi-file vault never false-flags an
+        edge whose span lives in a non-default file. It NEVER mutates a verdict (re-grounding stays a
+        kg_ground decision). Empty when no source is configured (no divergence without a source)."""
+        if not sources:
+            return []
+        out = []
+        for n in nodes:
+            for e in n.edges:
+                if (e.epistemic_state in (EpistemicState.GROUNDED, EpistemicState.FAILED)
+                        and e.provenance == Provenance.SPAN_PRESENT
+                        and not sources.verifies(e.span, source_file=e.source_file)):
+                    out.append({"edge_id": e.id, "reason": "span-no-longer-in-source"})
+        return out
+
+    def _refilter_stale(self, prior, nodes, sources) -> list[dict]:
+        """Re-verify ONLY the already-flagged edges against the current canon+source (the full re-scan is
+        gated on do_full/source-moved). Drops a prior flag whose edge was deleted, re-grounded out of the
+        grounded/failed set, or whose span verifies again — so a re-grounding clears its flag on the next
+        projection even with an unchanged source. New staleness can only come from a source change (which
+        moves the hash → full recompute), so this loses nothing."""
+        if not prior or not sources:
+            return []
+        edges = {e.id: e for n in nodes for e in n.edges}
+        out = []
+        for entry in prior:
+            e = edges.get(entry.get("edge_id"))
+            if (e is not None
+                    and e.epistemic_state in (EpistemicState.GROUNDED, EpistemicState.FAILED)
+                    and e.provenance == Provenance.SPAN_PRESENT
+                    and not sources.verifies(e.span, source_file=e.source_file)):
+                out.append({"edge_id": e.id, "reason": "span-no-longer-in-source"})
+        return out
+
+    def _save_meta(self, con, head, hashes, gate_on=0, source_hash="", stale_verdicts=None):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('built_from_commit', ?)", (head,))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('file_hashes', ?)", (json.dumps(hashes),))
         con.execute("INSERT OR REPLACE INTO meta VALUES ('cheap_sig', ?)", (json.dumps(self._cheap_sig()),))
         # the bridge-metric gate verdict for this projection (PLAN Stage 2): one value, read by
         # kg_context to decide whether spec_betweenness is the TRUSTED ranking signal this projection.
         con.execute("INSERT OR REPLACE INTO meta VALUES ('gate_on', ?)", (str(int(gate_on)),))
+        # R3 source-staleness advisory: the source-payload hash (recompute pre-gate) + the flagged ids.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('source_hash', ?)", (source_hash or "",))
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('stale_verdicts', ?)",
+                    (json.dumps(stale_verdicts or []),))
 
     def _read_meta(self) -> dict:
         try:
@@ -455,6 +540,11 @@ class Projector:
             out["cheap_sig"] = json.loads(rows.get("cheap_sig", "null"))
         except ValueError:
             out["cheap_sig"] = None
+        out["source_hash"] = rows.get("source_hash", "")  # R3 stale-verdict recompute pre-gate
+        try:
+            out["stale_verdicts"] = json.loads(rows.get("stale_verdicts", "[]"))
+        except ValueError:
+            out["stale_verdicts"] = []
         return out
 
     def is_stale(self) -> bool:
@@ -659,6 +749,13 @@ class Projector:
             # so a reader can see the correction. Read precomputed columns only — no centrality here.
             grow = con.execute("SELECT value FROM meta WHERE key='gate_on'").fetchone()
             gate_on = int(grow[0]) if grow and grow[0] is not None and str(grow[0]).isdigit() else 0
+            # R3 source-staleness advisory: grounded/failed span-present edges whose span no longer
+            # appears in the source (read-only; the verdict itself is untouched until /kg-ground re-runs).
+            srow = con.execute("SELECT value FROM meta WHERE key='stale_verdicts'").fetchone()
+            try:
+                stale_verdicts = json.loads(srow[0]) if srow and srow[0] else []
+            except (ValueError, TypeError):
+                stale_verdicts = []
             if gate_on:
                 bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes "
                           "ORDER BY spec_betweenness DESC, degree DESC LIMIT 10")
@@ -682,7 +779,8 @@ class Projector:
                 "budget": budget,
                 "falsification_counters": counters,
                 "advisory": {"signal": "structural-bridge", "note": "advisory heuristic, not a guarantee",
-                             "nodes": bridges, "bridge_metric": bridge_metric},
+                             "nodes": bridges, "bridge_metric": bridge_metric,
+                             "stale_verdicts": stale_verdicts},
             }
         finally:
             con.close()

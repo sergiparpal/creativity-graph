@@ -253,6 +253,42 @@ def test_multi_source_kg_write_verifies_per_file(vault, tmp_path):
     assert edge_id("gamma", "bridges", "delta") in {e.id for e in eng.canon.all_edges()}  # b.md one landed
 
 
+# --------------------------------------------------------------------------- R3: re-grounding clears stale
+
+
+def test_re_grounding_clears_the_stale_flag(vault, tmp_path):
+    """The only way the stale advisory changes is a re-grounding (it never mutates a verdict itself):
+    a grounded edge whose span the source lost is flagged; re-grounding it to `rejected` (the claim no
+    longer holds) drops it from the grounded/failed set, so the next projection clears the flag."""
+    import os
+    from pathlib import Path
+    from kg_engine.server import KGEngine
+
+    src = tmp_path / "s.md"
+    src.write_text("A compression grounds the claims beneath it.\n", encoding="utf-8")
+    pack_path = Path(__file__).resolve().parents[1] / "pack" / "pack.yaml"
+    eng = KGEngine(vault, source_path=src, pack_path=pack_path)
+
+    eng.kg_write({"edges": [{"source": "compression", "target": "claim", "relation": "grounds",
+                             "span": "A compression grounds the claims beneath it",
+                             "provenance": "span-present", "authored_by": "agent"}]})
+    eid = edge_id("compression", "grounds", "claim")
+    eng.kg_ground(eid, "grounded")
+
+    # diverge the source so the grounded span no longer appears -> flagged on the next projection
+    src.write_text("The source has been rewritten and no longer says that.\n", encoding="utf-8")
+    st = src.stat()
+    os.utime(src, (st.st_atime, st.st_mtime + 100))
+    eng.projector.project()
+    stale = eng.projector.kg_context()["advisory"]["stale_verdicts"]
+    assert {s["edge_id"] for s in stale} == {eid}
+
+    # re-ground it to rejected; the next projection (source unchanged) re-filters it out -> cleared
+    eng.kg_ground(eid, "rejected", note="source no longer supports this")
+    eng.projector.project()
+    assert eng.projector.kg_context()["advisory"]["stale_verdicts"] == []
+
+
 def test_failed_edge_not_pruned_and_surfaced(engine):
     _seed_queue(engine)
     eid = edge_id("betweenness", "confounded_by", "generality-confound")

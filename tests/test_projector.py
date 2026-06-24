@@ -262,3 +262,150 @@ def test_derived_contains_nothing_canon_does_not(canon: Canon):
     assert {n["id"] for n in data["nodes"]} <= canon_ids
     canon_edge_ids = {e.id for e in canon.all_edges()}
     assert {e["id"] for e in data["links"]} <= canon_edge_ids
+
+
+# --------------------------------------------------------------------------- R3: source-staleness advisory
+
+import os  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from kg_engine.model import Provenance, edge_id  # noqa: E402
+from kg_engine.server import KGEngine  # noqa: E402
+
+_PACK = Path(__file__).resolve().parents[1] / "pack" / "pack.yaml"
+
+
+def _engine(vault, source_path):
+    return KGEngine(vault, source_path=source_path, pack_path=_PACK)
+
+
+def _rewrite(path: Path, text: str) -> None:
+    """Rewrite a source file AND push its mtime forward, so the SourceSet (signature-cached on mtime)
+    is guaranteed to re-resolve even within the same filesystem mtime tick."""
+    path.write_text(text, encoding="utf-8")
+    st = path.stat()
+    os.utime(path, (st.st_atime, st.st_mtime + 100))
+
+
+def _stale_ids(eng) -> set:
+    return {s["edge_id"] for s in eng.projector.kg_context()["advisory"]["stale_verdicts"]}
+
+
+def _ground_span_edge(eng, *, src="compression", rel="grounds", tgt="claim", span, verdict="grounded",
+                      source_file=""):
+    # provenance MUST be span-present (the staleness detector only checks span-present edges); an
+    # under-claimed `inferred` is left as-is by the boundary, so declare it explicitly.
+    eng.kg_write({"edges": [{"source": src, "target": tgt, "relation": rel, "span": span,
+                             "provenance": "span-present", "source_file": source_file,
+                             "authored_by": "agent"}]})
+    eid = edge_id(src, rel, tgt)
+    eng.kg_ground(eid, verdict)
+    eng.projector.project()  # sync the verdict into the derived layer
+    return eid
+
+
+def test_stale_verdict_flagged_when_source_diverges_and_never_mutates_verdict(vault, tmp_path):
+    src = tmp_path / "s.md"
+    src.write_text("A compression grounds the claims beneath it.\n", encoding="utf-8")
+    eng = _engine(vault, src)
+    eid = _ground_span_edge(eng, span="A compression grounds the claims beneath it")
+    assert _stale_ids(eng) == set()                      # span present -> not flagged
+
+    _rewrite(src, "Totally different prose with no such relation.\n")
+    eng.projector.project()                              # the NEXT projection picks up the divergence
+    assert eng.projector.kg_context()["advisory"]["stale_verdicts"] == \
+        [{"edge_id": eid, "reason": "span-no-longer-in-source"}]
+    # READ-ONLY advisory: the verdict itself is untouched (never-forge-a-verdict / measure-never-gate)
+    e = next(x for x in eng.canon.all_edges() if x.id == eid)
+    assert e.epistemic_state == EpistemicState.GROUNDED and e.verdict_by == "agent"
+
+
+def test_multifile_no_false_flag_for_span_in_its_own_file(vault, tmp_path):
+    d = tmp_path / "src"
+    d.mkdir()
+    (d / "a.md").write_text("Alpha grounds beta in the first file.\n", encoding="utf-8")
+    (d / "b.md").write_text("Gamma bridges delta in the second file.\n", encoding="utf-8")
+    eng = _engine(vault, d)
+    eid = _ground_span_edge(eng, src="alpha", tgt="beta", span="Alpha grounds beta", source_file="a.md")
+    # b.md lacks the span, but the per-file check verifies against a.md (the edge's source_file) -> clean
+    assert _stale_ids(eng) == set()
+    # editing a.md to remove it DOES flag it (the positive control — per-file detection works)
+    _rewrite(d / "a.md", "Alpha is unrelated to beta now.\n")
+    eng.projector.project()
+    assert _stale_ids(eng) == {eid}
+
+
+def test_unverified_and_inferred_are_never_flagged(vault, tmp_path):
+    src = tmp_path / "s.md"
+    src.write_text("A compression grounds the claims beneath it.\n", encoding="utf-8")
+    eng = _engine(vault, src)
+    # an UNVERIFIED span-present edge (never grounded)
+    eng.kg_write({"edges": [{"source": "compression", "target": "claim", "relation": "grounds",
+                             "span": "A compression grounds the claims beneath it",
+                             "provenance": "span-present", "authored_by": "agent"}]})
+    # an INFERRED grounded edge (promoted from a hypothesis by support_note -> provenance inferred)
+    eng.kg_propose({"edges": [{"source": "degree", "target": "importance", "relation": "approximates"}]})
+    eng.kg_ground(edge_id("degree", "approximates", "importance"), "grounded", support_note="citation")
+    eng.projector.project()
+    _rewrite(src, "Nothing here matches any prior span at all.\n")
+    eng.projector.project()
+    assert _stale_ids(eng) == set()   # not a verdict (unverified) / no span claim (inferred) -> never flagged
+
+
+def test_failed_edge_with_missing_span_is_flagged(vault, tmp_path):
+    src = tmp_path / "s.md"
+    src.write_text("Betweenness is confounded by the generality confound.\n", encoding="utf-8")
+    eng = _engine(vault, src)
+    eid = _ground_span_edge(eng, src="betweenness", rel="confounded_by", tgt="gc",
+                            span="Betweenness is confounded by the generality confound", verdict="failed")
+    assert _stale_ids(eng) == set()
+    _rewrite(src, "An unrelated sentence, no confound here.\n")
+    eng.projector.project()
+    assert _stale_ids(eng) == {eid}   # FAILED span-present edges are checked too (§1.7 evidence)
+
+
+def test_stale_advisory_persisted_and_reused_without_a_source_change(vault, tmp_path):
+    src = tmp_path / "s.md"
+    src.write_text("A compression grounds the claims beneath it.\n", encoding="utf-8")
+    eng = _engine(vault, src)
+    eid = _ground_span_edge(eng, span="A compression grounds the claims beneath it")
+    _rewrite(src, "Different text entirely.\n")
+    eng.projector.project()
+    assert _stale_ids(eng) == {eid}
+    # a no-op projection (canon + source unchanged) short-circuits AND serves the SAME flag from meta
+    rep = eng.projector.project()
+    assert rep.up_to_date
+    assert _stale_ids(eng) == {eid}
+
+
+def test_canon_edited_span_under_unchanged_source_is_flagged(vault, tmp_path):
+    """The canon-edit path (not just source edits): a grounded span-present edge whose SPAN is hand-edited
+    to text absent from the source — with the source itself UNCHANGED — is still flagged on the next
+    projection (the incremental pass scans the changed notes, not only the already-flagged set)."""
+    src = tmp_path / "s.md"
+    src.write_text("A compression grounds the claims beneath it.\n", encoding="utf-8")
+    eng = _engine(vault, src)
+    eid = _ground_span_edge(eng, span="A compression grounds the claims beneath it")
+    assert _stale_ids(eng) == set()
+    # hand-edit the canon note: swap the span to text NOT in the source (source untouched)
+    node = eng.canon.read_node("compression")
+    for e in node.edges:
+        if e.id == eid:
+            e.span = "a span that is nowhere in the source"
+    eng.canon.write_one(node)
+    eng.projector.project()
+    assert _stale_ids(eng) == {eid}
+    # still grounded — the advisory only reports, never mutates the verdict
+    e = next(x for x in eng.canon.all_edges() if x.id == eid)
+    assert e.epistemic_state == EpistemicState.GROUNDED
+
+
+def test_no_source_yields_empty_stale_list(vault):
+    eng = _engine(vault, None)  # no source configured at all
+    # seed a grounded span-present edge directly (the boundary would reject it with no source)
+    node = Node(id="compression", label="Compression", node_type="compression", edges=[
+        Edge(source="compression", target="claim", relation="grounds", span="some span",
+             provenance=Provenance.SPAN_PRESENT, epistemic_state=EpistemicState.GROUNDED)])
+    eng.canon.write_nodes([node], message="seed grounded")
+    eng.projector.project()
+    assert eng.projector.kg_context()["advisory"]["stale_verdicts"] == []  # no source -> no divergence

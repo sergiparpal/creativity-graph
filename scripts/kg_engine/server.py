@@ -49,7 +49,7 @@ class KGEngine:
         # pass the bound source reader so the projector can IDF-weight specificity off the source corpus
         # (PLAN Stage 2). It is read lazily, once per real reprojection, off the hot path.
         self.projector = Projector(self.canon, self.data_dir / "derived", metrics_mode=metrics_mode,
-                                   source_text=self.source_text)
+                                   source_text=self.source_text, source_set=self.source_set)
         self.scrubber = Scrubber(sensitivity)
         self._scrub_map: dict[str, str] = {}  # accumulated egress placeholder -> original (§1.9)
         self.sensitivity = sensitivity

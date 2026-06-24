@@ -47,6 +47,20 @@ JSON back across the MCP boundary.
   `validate_payload` callers without a `SourceSet` keep the exact single-blob behavior. **Markdown/text
   only — no PDF/media** (a lossy transcript as a "verbatim" span would break span-present). Coverage in
   `tests/test_sources.py` plus extensions to `test_invariants.py` / `test_grounding.py`.
+- **Source-staleness advisory for verdicts (span-divergence only).** A grounded/`failed` span-present
+  edge's stored `span` is a snapshot taken at verdict time; if the source is later edited so that span no
+  longer appears, nothing previously re-flagged the verdict. The projector now recomputes a purely
+  **read-only** advisory off the hot path — re-verifying each grounded/`failed` span-present edge against
+  its **own** `source_file` via the R4 `SourceSet` (per-file, never a global concat, so a multi-file vault
+  never false-flags an edge whose span lives in a non-default file) — and surfaces the divergent ids as
+  `kg_context.advisory.stale_verdicts = [{edge_id, reason: "span-no-longer-in-source"}]`. It **never**
+  mutates a verdict (re-grounding stays a `kg_ground` decision — never-forge-a-verdict, measure-never-gate);
+  the binary advisory carries no decaying "trust erodes with time" scalar. The recompute is gated behind a
+  persisted source-content hash (a pure source edit is **one-projection-lagged** — `is_stale`, which fronts
+  every read, is deliberately left source-blind), and a re-grounding clears the flag on the next projection.
+  `/kg-ground` gains a **Stage 0b — Drain stale verdicts** step. Coverage extends `tests/test_projector.py`
+  (single- and multi-file divergence, unverified/inferred never flagged, failed-with-missing-span, no-mutate,
+  persisted-and-reused, no-source) and `tests/test_grounding.py` (re-grounding clears).
 
 ## [0.3.3] — 2026-06-23
 

@@ -79,15 +79,18 @@ class SourceSet:
 
     @classmethod
     def signature(cls, path: "str | Path | None") -> tuple:
-        """A cheap ``(basename, mtime)`` tuple over the resolved files (no content reads). KGEngine keys
-        its SourceSet cache on this so an added/removed/edited source is picked up, else the cache is
-        served — keeping the resolve+read off the hot path (mirrors the old per-file mtime memo)."""
+        """A cheap ``(basename, size, mtime_ns)`` tuple over the resolved files (no content reads).
+        KGEngine keys its SourceSet cache on this so an added/removed/edited source is picked up, else the
+        cache is served — keeping the resolve+read off the hot path. Uses ``st_mtime_ns`` + ``st_size``
+        (not float ``st_mtime``) to match ``projector._cheap_sig``, so a same-second in-place edit
+        reliably invalidates the cache rather than serving stale text past the one-projection-lag (R3)."""
         sig = []
         for p in cls.resolve(path):
             try:
-                sig.append((p.name, p.stat().st_mtime))
+                st = p.stat()
+                sig.append((p.name, st.st_size, st.st_mtime_ns))
             except OSError:
-                sig.append((p.name, None))
+                sig.append((p.name, None, None))
         return tuple(sig)
 
     # ---- views
