@@ -11,10 +11,10 @@ field is missing, grep the engine source, don't guess.
 
 A plugin-bundled MCP server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>` — here both the
 plugin and the server are named `creativity-graph`, so every tool is `mcp__plugin_creativity-graph_creativity-graph__<tool>`
-(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **sixteen** are the **only**
+(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **seventeen** are the **only**
 graph tools — the eleven verify/read tools (§1.1–§1.11) plus the four generative-layer tools (§1.12–§1.15)
-plus the read-only `kg_agenda` (§1.16). There is no `kg_build` / `kg_query` / `kg_project` MCP tool — those
-are slash commands (`/kg-build`, …) that *orchestrate* these tools.
+plus the read-only `kg_agenda` (§1.16) and `kg_export` (§1.17). There is no `kg_build` / `kg_query` /
+`kg_project` MCP tool — those are slash commands (`/kg-build`, …) that *orchestrate* these tools.
 
 Mutation tools (`kg_write`, `kg_propose`, `kg_ground`, `kg_rename`) write the **canon** (human-editable Markdown,
 the single source of truth) — `kg_propose` (§1.12) is the hypothesized write lane and `kg_operate` (§1.14) writes
@@ -394,6 +394,31 @@ edge provenance/state) and returns ~`limit` structural gaps, split into two lane
 - **Read-only / measure-never-gate**: it asserts no edges, copies no spans, stamps no verdicts; the question
   text is session-time only and never written to the canon. It is a **heuristic, not a guarantee** — it
   suggests where to look or what to ground next; it never answers or acts. `limit` is clamped to `[1, 50]`.
+
+### 1.17 `mcp__plugin_creativity-graph_creativity-graph__kg_export(kind="all")`
+
+**Read-only human-facing render** (R1). Projects-if-stale, then consumes ONLY the derived layer (through the
+shared `_agenda_reader()` seam) plus `kg_metrics`, and writes two **disposable** artifacts under the derived
+dir. `kind ∈ {html, report, all}` (default `all`).
+
+```json
+{"ok": true, "kind": "all",
+ "html_path": "…/derived/graph.html", "report_path": "…/derived/GRAPH_REPORT.md"}
+```
+
+- **`graph.html`** — a self-contained, fully-offline canvas force layout (no network, no `<script src>`, data
+  inlined). The **three axes are on INDEPENDENT visual channels** (never one "confidence" colour):
+  `epistemic_state`→edge line (solid grounded · dashed unverified · **red failed/rejected** · dotted
+  hypothesized; failed/rejected are **drawn, never filtered** — §1.7), `authored_by`→node border,
+  `provenance`→node fill opacity. **Node size = degree** (the honest advisory); the bridge highlight is
+  gate-aware (`spec_betweenness` only when `gate_on=1`, else the structural-bridge advisory — size is never
+  the bridge metric).
+- **`GRAPH_REPORT.md`** — headline counts from `kg_metrics` (cannot drift), per-community axis breakdowns, the
+  never-pruned falsification list, R3 stale verdicts, and R4 per-source-file edge counts.
+- **Read-only / measure-never-gate**: consumes only the derived layer, writes only its two artifacts; never
+  reads prose, never writes through `kg_write`/`kg_ground`, never `_atomic_write`s `graph.json`/`index.sqlite`
+  (`projector.py` stays their sole writer). Cannot forge a verdict or bypass span-present. Also: CLI
+  `python -m kg_engine.export html|report|all` and the `/kg-view` command.
 
 ---
 

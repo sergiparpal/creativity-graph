@@ -200,6 +200,7 @@ creativity-graph/
 │   ├── kg-generate.md             # /kg-generate — discovery mechanisms → hypothesized lane
 │   ├── kg-perturb.md              # /kg-perturb — external structure + ensemble cross-generation
 │   ├── kg-query.md                # /kg-query   — answer with provenance + counters
+│   ├── kg-view.md                 # /kg-view    — render graph.html + GRAPH_REPORT.md (read-only)
 │   ├── kg-eval.md                 # /kg-eval    — extractor precision + α reliability (Stages 4/7)
 │   └── kg-experiment.md           # /kg-experiment — blind ideation eval (Stage 8)
 ├── agents/                        # subagents (the language layer)
@@ -286,6 +287,15 @@ counters to every supporting edge. Uses `kg_context`, `query_graph`, `get_node`,
 `get_neighbors`, and `shortest_path`. An ungrounded edge is reported as such, not laundered into
 a confident answer.
 
+### `/kg-view [html|report|all]` — eyeball the graph (read-only)
+Renders two **disposable, human-facing** artifacts under the derived dir via `kg_export`: a
+self-contained, fully-offline **`graph.html`** (vanilla-JS force layout encoding the three axes on
+**independent** visual channels — `epistemic_state`→edge line, `authored_by`→node border,
+`provenance`→fill opacity; **size = degree**; failed/rejected edges **drawn**, never filtered; a
+gate-aware bridge highlight) and **`GRAPH_REPORT.md`** (counts straight from `kg_metrics`, per-community
+axis breakdowns, the never-pruned falsification memory, R3 stale verdicts, R4 per-file edge counts). A
+*view*, never a write — it cannot forge a verdict or touch the canon.
+
 ### `/kg-eval [graph.json]` — is it accurate? (Stages 4 & 7)
 Measures the two things that must be true before you trust the graph: **extraction precision**
 and **grounding reliability**. The **kg-annotator** labels extracted edges into a `f4_probe`
@@ -306,11 +316,11 @@ measurement rather than a slogan.
 ## The MCP tool surface
 
 Server name `creativity-graph` ⇒ tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`. The
-**twelve** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
-`query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`) plus the **four**
-generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
+**thirteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
+`query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`, `kg_export`) plus the
+**four** generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
 mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) are the
-**sixteen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
+**seventeen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
 commands).
 
 | tool | purpose |
@@ -327,6 +337,7 @@ commands).
 | `shortest_path(source, target)` | `{path: [node_ids] | null}`. |
 | `kg_context(query, budget)` | budgeted context pack: `{items[]` (grounded), `hypotheses[]` (the separate hypothesized lane), `approx_tokens, budget, falsification_counters:{failed_or_rejected_edges}, advisory:{signal:"structural-bridge", note, nodes[], bridge_metric, stale_verdicts[]}}`. |
 | `kg_agenda(limit=5)` | **read-only** structural "suggested questions" (R6) → `{answerable_now[]` (well-grounded), `blocked_on_grounding[]` (orphans / hypothesized-only / under-grounded hubs / disconnected clusters)`, ranked_by, gate_on, count, note}`. Suggests, never acts; heuristic, not a guarantee. |
+| `kg_export(kind="all")` | **read-only** human-facing render (R1) → `{ok, kind, html_path, report_path}`; writes a self-contained offline `graph.html` (three axes on independent visual channels; failed/rejected edges drawn) + `GRAPH_REPORT.md` under the derived dir. `kind ∈ {html, report, all}`. Disposable view, never a write to the canon. |
 | `kg_propose(payload)` | the **hypothesized** write lane → the `kg_write` shape `+ {propose_lane, refused_text_claims}`; forces `provenance=hypothesized`, refuses text claims. |
 | `kg_generate(mechanism, k, second_graph)` | **read-only** discovery → `{mechanism, k, gate_on, count, candidates[], note}`; `bridge\|seed\|compression\|regroup\|transplant\|ensemble`. |
 | `kg_operate(op, …)` | the four §8 endo ops (`collapse\|explode\|regroup\|open`) — write via the propose lane → the `kg_propose` shape `+ {ok, op, info}`. |

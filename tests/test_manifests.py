@@ -149,3 +149,14 @@ def test_kg_agenda_registered():
     kg-query.md / kg-ground.md grant it, and test_all_commands_and_agents_declare_only_existing_tools
     requires declared ⊆ registered)."""
     assert "kg_agenda" in _registered_mcp_tools()
+
+
+def test_kg_export_registered_and_kg_view_command_valid():
+    """R1: the read-only exporter is registered as the 17th @mcp.tool(), and /kg-view declares only it."""
+    pytest.importorskip("yaml")
+    assert "kg_export" in _registered_mcp_tools()
+    fm = _frontmatter(ROOT / "commands" / "kg-view.md")
+    assert fm.get("description")
+    declared = _declared_mcp_tools(fm)
+    assert declared == {"kg_export"}            # /kg-view grants ONLY the read-only export tool
+    assert declared <= _registered_mcp_tools()

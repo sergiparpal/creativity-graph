@@ -528,6 +528,14 @@ class KGEngine:
     def kg_agenda(self, *, limit: int = 5) -> dict:
         self._ensure_projected(); return self.projector.kg_agenda(limit=limit)
 
+    def kg_export(self, kind: str = "all") -> dict:
+        """Render the human-facing artifacts (R1): a self-contained `graph.html` + `GRAPH_REPORT.md` under
+        the derived dir. Read-only — projects-if-stale, then consumes only the derived layer; never writes
+        the canon and never `_atomic_write`s graph.json/index.sqlite."""
+        self._ensure_projected()
+        from . import export as _export
+        return _export.export(self, kind=kind)
+
 
 # --------------------------------------------------------------------------- MCP wiring
 
@@ -676,6 +684,15 @@ def _register(mcp, engine: KGEngine) -> None:
         never acts — asserts no edges, copies no spans, stamps no verdicts (measure-never-gate); a
         hypothesized-only neighbourhood surfaces as BLOCKED, never as answerable. Heuristic, not a guarantee."""
         return engine.kg_agenda(limit=limit)
+
+    @mcp.tool()
+    def kg_export(kind: str = "all") -> dict:
+        """Render the human-facing artifacts (R1): a self-contained, offline `graph.html` (vanilla-JS force
+        layout encoding the three axes on independent channels — epistemic_state→line, authored_by→border,
+        provenance→fill; size=degree; failed/rejected edges drawn, never filtered) and a `GRAPH_REPORT.md`,
+        under the derived dir. `kind ∈ {html, report, all}`. READ-ONLY — projects-if-stale, consumes only the
+        derived layer, writes only its two disposable artifacts; never forges a verdict or touches the canon."""
+        return engine.kg_export(kind)
 
 
 def main() -> None:

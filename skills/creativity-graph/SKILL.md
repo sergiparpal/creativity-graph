@@ -73,16 +73,17 @@ afterward. The portico moved from the door of imagination to after generation.
 | `/kg-generate` | `kg-generator` | `kg_generate`, `kg_propose`, `kg_operate`, `kg_absorption`, `kg_context` |
 | `/kg-perturb` | `kg-generator` | `kg_generate` (ensemble), `kg_propose` |
 | `/kg-query` | (none; direct reads) | `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` |
+| `/kg-view` | (none; direct render) | `kg_export` |
 | `/kg-eval` | `kg-annotator` | `f4_probe.py`, `kg_engine.harness`, `query_graph` |
 | `/kg-experiment` | `kg-evaluator` | `kg_engine.harness ideation` |
 
 The MCP server is named `creativity-graph`; tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`.
-The twelve read/write/ground tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`,
+The thirteen read/write/ground tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`,
 `kg_metrics`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda` — the
-read-only structural agenda) plus the four **generative-layer** tools (`kg_propose` — the hypothesized write
-lane; `kg_generate` — the discovery mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the
-§14 absorption window) make **sixteen** tools. These are the ONLY graph tools — `kg-build`, `kg-generate`,
-etc. are slash commands.
+read-only structural agenda, `kg_export` — the read-only human-facing render) plus the four
+**generative-layer** tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
+mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) make
+**seventeen** tools. These are the ONLY graph tools — `kg-build`, `kg-generate`, etc. are slash commands.
 
 ## Core invariants — non-negotiable, enforced by the boundary
 

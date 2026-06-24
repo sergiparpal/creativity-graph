@@ -76,6 +76,25 @@ JSON back across the MCP boundary.
   alternative prioritization read). MCP tool surface grows **15 → 16**. Coverage in `tests/test_agenda.py`
   (every detector, the two-lane split, gate-aware ranking, specificity down-weight, read-only invariance,
   limit clamp, empty graph) plus `tests/test_manifests.py::test_kg_agenda_registered`.
+- **`kg_export` — human-facing HTML viz + `GRAPH_REPORT.md` (17th MCP tool, zero-dependency).** A new
+  read-only exporter (`scripts/kg_engine/export.py`) that projects-if-stale, then consumes **only** the
+  derived layer (through R6's shared `Projector._agenda_reader()` seam) plus `kg_metrics`, and writes two
+  **fresh, disposable** artifacts under `${KG_DATA}/derived/`: a self-contained, fully-offline `graph.html`
+  (vanilla-JS canvas force layout, data inlined, no network, no `<script src>`, no new package — the template
+  is a Python module constant in `kg_engine/templates/`) and `GRAPH_REPORT.md`. **The differentiator:** the
+  three orthogonal axes are encoded on **independent visual channels**, never one "confidence" colour —
+  `epistemic_state`→edge line (solid grounded · dashed unverified · **red failed/rejected** · dotted
+  hypothesized), `authored_by`→node border, `provenance`→node fill opacity. **Node size = degree** (the honest
+  advisory); the bridge highlight is **gate-aware** (`spec_betweenness` only when `gate_on=1`, else the
+  structural-bridge advisory — size is never the bridge metric, so the generality confound is never smuggled
+  into the most prominent channel). **Failed/rejected edges are drawn, never filtered** — falsification memory
+  made eyeball-able (§1.7). The report's headline counts come straight from `kg_metrics` (cannot drift) and it
+  surfaces per-community axis breakdowns, the falsification list, R3's stale verdicts, and R4's per-source-file
+  edge counts. **Read-only / measure-never-gate**: it never reads prose, never writes through
+  `kg_write`/`kg_ground`, and never `_atomic_write`s `graph.json`/`index.sqlite` (`projector.py` stays their
+  sole writer) — it cannot forge a verdict or bypass span-present. Shipped three ways: `python -m
+  kg_engine.export html|report|all`, the `kg_export` MCP tool, and the `/kg-view` command. MCP tool surface
+  grows **16 → 17**. Coverage in `tests/test_export.py`.
 
 ## [0.3.3] — 2026-06-23
 
