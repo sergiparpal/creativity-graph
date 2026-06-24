@@ -15,6 +15,8 @@ from __future__ import annotations
 import inspect
 import typing
 
+import pytest
+
 from kg_engine.canon import RollbackInfo
 from kg_engine.model import Node, Provenance
 from kg_engine.server import _register, build_engine_from_env
@@ -96,6 +98,47 @@ def test_f5_wrappers_accept_explicit_none(engine):
     assert isinstance(tools["kg_context"](None, 2000), dict)
     # get_neighbors with relation=None on an absent node is an empty list, not an exception
     assert tools["get_neighbors"]("nope", None) == []
+
+
+# ---- mixed-error-architecture: one transport envelope + a logging seam --------------------------
+def test_tool_result_envelopes_raised_exceptions(engine, monkeypatch):
+    """A tool whose underlying engine call RAISES (e.g. a mid-read index error escaping a pure read)
+    returns the uniform transport envelope {ok:False, error, error_kind} instead of crashing the MCP
+    call (finding: mixed-error-architecture)."""
+    tools = _wrappers(engine)
+
+    def boom(*a, **k):
+        raise RuntimeError("index exploded")
+
+    monkeypatch.setattr(engine, "query_graph", boom)
+    out = tools["query_graph"](None, None, None)
+    assert out == {"ok": False, "error": "index exploded", "error_kind": "RuntimeError"}
+
+
+def test_tool_result_passes_domain_disposition_through(engine):
+    """The envelope must NOT collapse a deliberate {ok:False} DOMAIN result (a refused verdict) into a
+    transport error — transport ok/error and domain disposition are orthogonal axes, so a domain failure
+    carries no transport `error_kind`."""
+    tools = _wrappers(engine)
+    dom = tools["kg_ground"]("does-not-exist", "bogus_verdict")
+    assert dom["ok"] is False and "error_kind" not in dom
+
+
+def test_real_fastmcp_registers_every_tool_with_schema(engine):
+    """The @_tool_result envelope must not break FastMCP schema generation: register through a REAL
+    FastMCP (the FakeMCP above can't catch a schema-gen regression) and assert every tool is exposed
+    with its parameters intact through the functools.wraps wrapper."""
+    import asyncio
+
+    pytest.importorskip("mcp.server.fastmcp")
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP("creativity-graph-test")
+    _register(mcp, engine)
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    assert {"kg_ping", "kg_write", "kg_ground", "query_graph", "kg_context", "kg_export"} <= set(tools)
+    props = set((tools["query_graph"].inputSchema.get("properties") or {}).keys())
+    assert {"node_type", "relation", "epistemic_state", "limit"} <= props
 
 
 # ---- F10/M4: a rolled-back kg_write never contradicts itself ------------------------------------

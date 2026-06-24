@@ -94,7 +94,9 @@ _NS = "mcp__plugin_creativity-graph_creativity-graph__"
 def _registered_mcp_tools() -> set:
     """The set of MCP tool basenames the server actually registers (every @mcp.tool() in _register)."""
     src = (ROOT / "scripts" / "kg_engine" / "server.py").read_text(encoding="utf-8")
-    return set(re.findall(r"@mcp\.tool\(\)\s*\n\s*def\s+(\w+)\s*\(", src))
+    # tolerate intervening decorators between @mcp.tool() and the def (e.g. the @_tool_result transport
+    # envelope) so the scrape stays robust to wrapper decorators.
+    return set(re.findall(r"@mcp\.tool\(\)\s*\n\s*(?:@[\w.]+\s*\n\s*)*def\s+(\w+)\s*\(", src))
 
 
 def _frontmatter(path):

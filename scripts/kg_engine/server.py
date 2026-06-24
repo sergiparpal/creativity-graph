@@ -6,7 +6,9 @@ so the flow never stalls (§2.4, §4).
 """
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -30,6 +32,11 @@ from .projector import Projector
 from .reconciler import GROUND_AUDIT, Reconciler
 from .scrub import Scrubber
 from .sources import SourceSet
+
+# Module logger. The engine had no logging seam, so silent `except Exception: pass` fallbacks were
+# invisible to an operator. Stays quiet by default (no handler attached) per the library convention; an
+# operator opts in via standard logging config. The MCP tool envelope and the index fallbacks log here.
+logger = logging.getLogger("kg_engine")
 
 # Single source of truth shared with the reconciler's policed set (model.GROUNDABLE_STATES), so the
 # states kg_ground may stamp and the states the reconciler re-quarantines can never drift apart.
@@ -408,8 +415,8 @@ class KGEngine:
                 node = self.canon.read_node(src)
                 if any(e.id == edge_id for e in node.edges):
                     return node
-        except Exception:  # noqa: BLE001 — index trouble must never break grounding; fall back
-            pass
+        except Exception as e:  # noqa: BLE001 — index trouble must never break grounding; fall back
+            logger.debug("edge-owner index lookup failed (%s); falling back to full canon scan", e)
         for n in self.canon.all_nodes():
             if any(e.id == edge_id for e in n.edges):
                 return n
@@ -548,8 +555,8 @@ class KGEngine:
                 finally:
                     con.close()
                 return {"nodes": n, "edges": e, "edges_by_epistemic_state": by_state}
-        except Exception:  # noqa: BLE001 — any index hiccup falls back to the canon parse below
-            pass
+        except Exception as e:  # noqa: BLE001 — any index hiccup falls back to the canon parse below
+            logger.debug("metrics index read failed (%s); falling back to canon parse", e)
         nodes = self.canon.all_nodes()
         edges = [e for n in nodes for e in n.edges]
         by_state: dict = {}
@@ -749,24 +756,47 @@ def build_engine_from_env(*, project=None, data=None, source=None, pack=None) ->
                     max_edges_per_kb=rate)
 
 
+def _tool_result(fn):
+    """Uniform transport-error envelope for every MCP tool (finding: mixed-error-architecture). A RAISED
+    exception (e.g. a mid-read sqlite/networkx error escaping a pure-read tool) becomes a structured
+    {ok:False, error, error_kind} result + a logged warning, instead of crashing the tool call with an
+    MCP-level exception. SUCCESS returns pass through UNCHANGED — including the deliberate {ok:False}
+    DOMAIN dispositions (a locked vault, a refused verdict) and the reads' own shapes ({path:...},
+    {error:"not found"}, lists, None): transport ok/error and domain disposition are two ORTHOGONAL axes,
+    so the envelope never collapses a domain result into a transport error (the never-stall contract,
+    §2.4/§4). functools.wraps keeps the wrapped signature so FastMCP still builds the right tool schema."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001 — uniform transport envelope; a tool must never crash the call
+            logger.warning("MCP tool %s raised %s: %s", fn.__name__, type(e).__name__, e, exc_info=True)
+            return {"ok": False, "error": str(e), "error_kind": type(e).__name__}
+    return wrapper
+
+
 def _register(mcp, engine: KGEngine) -> None:
     @mcp.tool()
+    @_tool_result
     def kg_ping() -> dict:
         """Health check: returns the engine version and configuration."""
         return engine.kg_ping()
 
     @mcp.tool()
+    @_tool_result
     def kg_scrub(text: str | None = None) -> dict:
         """Egress PII/secret scrub (§1.9): redact a snippet (or the source) with consistent placeholders
         before handing text to a subagent; the canon later restores spans to the original."""
         return engine.kg_scrub(text)
 
     @mcp.tool()
+    @_tool_result
     def kg_write(payload: dict) -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted nodes & edges."""
         return engine.kg_write(payload)
 
     @mcp.tool()
+    @_tool_result
     def kg_propose(payload: dict) -> dict:
         """Propose hypothesized candidates (PLAN Stage 1: the propose lane). Forces every item to
         provenance=hypothesized (a discovery-mechanism proposal, no span needed) and REFUSES any
@@ -775,6 +805,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_propose(payload)
 
     @mcp.tool()
+    @_tool_result
     def kg_ground(target_id: str, verdict: str, kind: str = "edge", note: str = "",
                   support_span: str = "", support_note: str = "") -> dict:
         """Apply a grounding verdict (grounded|rejected|failed|obsolete) to an edge or node. Verdicts
@@ -787,16 +818,19 @@ def _register(mcp, engine: KGEngine) -> None:
                                 support_span=support_span, support_note=support_note)
 
     @mcp.tool()
+    @_tool_result
     def kg_rename(old_id: str, new_id: str) -> dict:
         """Rename a node and rewrite every edge endpoint referencing it."""
         return engine.kg_rename(old_id, new_id)
 
     @mcp.tool()
+    @_tool_result
     def kg_metrics() -> dict:
         """Summary counts: nodes, edges, edges by epistemic state."""
         return engine.kg_metrics()
 
     @mcp.tool()
+    @_tool_result
     def kg_generate(mechanism: str = "bridge", k: int = 10, second_graph: str | None = None) -> dict:
         """Generate hypothesized idea candidates from the graph's structure (PLAN Stage 3). Mechanisms:
         bridge (§2/§4), seed (§3 residual), compression (§7 new nodes), regroup (§8), transplant (§5),
@@ -805,6 +839,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_generate(mechanism=mechanism, k=k, second_graph=second_graph)
 
     @mcp.tool()
+    @_tool_result
     def kg_absorption() -> dict:
         """Absorption window (§14): for each grounded-from-hypothesized node, how long it stayed
         perturbing before the graph renormalised — {half_life, status ∈ fertile|absorbed|isolated}.
@@ -812,6 +847,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_absorption()
 
     @mcp.tool()
+    @_tool_result
     def kg_operate(op: str, target: str | None = None, label: str = "", body: str = "",
                    members: list[str] | None = None, k: int | None = None) -> dict:
         """The four endo operations (§8) that WRITE hypothesized structure via the propose lane:
@@ -822,6 +858,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_operate(op, target=target, label=label, body=body, members=members, k=k)
 
     @mcp.tool()
+    @_tool_result
     def query_graph(node_type: str | None = None, relation: str | None = None,
                     epistemic_state: str | None = None, limit: int = 50) -> dict:
         """Query nodes/edges by type, relation, or epistemic state (ranked by precomputed degree)."""
@@ -829,26 +866,31 @@ def _register(mcp, engine: KGEngine) -> None:
                                   epistemic_state=epistemic_state, limit=limit)
 
     @mcp.tool()
+    @_tool_result
     def get_node(node_id: str) -> dict:
         """Fetch a node with its incident edges."""
         return engine.get_node(node_id) or {"error": "not found"}
 
     @mcp.tool()
+    @_tool_result
     def get_neighbors(node_id: str, relation: str | None = None) -> list:
         """Edges incident to a node, optionally filtered by relation."""
         return engine.get_neighbors(node_id, relation)
 
     @mcp.tool()
+    @_tool_result
     def shortest_path(source: str, target: str) -> dict:
         """Shortest path between two nodes over the derived graph."""
         return {"path": engine.shortest_path(source, target)}
 
     @mcp.tool()
+    @_tool_result
     def kg_context(query: str | None = None, budget: int = 2000) -> dict:
         """Grounding-aware, provenance-carrying, token-budgeted context for the session."""
         return engine.kg_context(query, budget)
 
     @mcp.tool()
+    @_tool_result
     def kg_agenda(limit: int = 5) -> dict:
         """Read-only structural "suggested questions" (R6). Reads ONLY precomputed derived columns and
         returns ~limit structural gaps split into answerable_now[] (well-grounded neighbourhoods) vs
@@ -859,6 +901,7 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_agenda(limit=limit)
 
     @mcp.tool()
+    @_tool_result
     def kg_export(kind: str = "all") -> dict:
         """Render the human-facing artifacts (R1): a self-contained, offline `graph.html` (vanilla-JS force
         layout encoding the three axes on independent channels — epistemic_state→line, authored_by→border,
