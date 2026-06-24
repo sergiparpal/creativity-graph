@@ -16,6 +16,7 @@ from pathlib import Path
 from . import __version__
 from .boundary import DEFAULT_MAX_EDGES_PER_KB, MIN_SPAN_CHARS, merge_results_into_nodes, validate_payload
 from .canon import Canon
+from .groundaudit import GroundAuditLog
 from .model import (
     AuthoredBy,
     Disposition,
@@ -97,6 +98,9 @@ class KGEngine:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.canon = Canon(self.project_dir)
         self.reconciler = Reconciler(self.canon)
+        # §1.8 grounding-audit log — the forge-detection WRITER half (the reconciler is the reader). A
+        # collaborator, not inline, so the crash-safe append/truncate protocol is unit-testable.
+        self._audit_log = GroundAuditLog(self.canon.root / GROUND_AUDIT)
         # The configured source: a single file (back-compat), or a DIRECTORY / GLOB of .md/.txt (R4).
         # Resolution + memo live in _SourceResolver, shared verbatim with the read-only PreToolUse hook.
         self._sources = _SourceResolver(source_path)
@@ -334,7 +338,7 @@ class KGEngine:
             # audit record with no state change — harmless, unconsumed — rather than a verdict with no
             # audit record, which the reconciler would re-quarantine), and truncate it back on a caught
             # write failure so an orphan record can't inflate _forged's count (server-3). The crash-safe
-            # offset/truncate dance lives in _audited_write, shared with kg_rename.
+            # offset/truncate dance lives in GroundAuditLog.audited_write, shared with kg_rename.
             err_holder: dict = {}
 
             def _attempt():
@@ -345,7 +349,7 @@ class KGEngine:
                     err_holder["error"] = f"write failed: {e}"
                     return False, None
 
-            self._audited_write([(key, frm, verdict, by)], _attempt)
+            self._audit_log.audited_write([(key, frm, verdict, by)], _attempt)
             if err_holder:  # the transition never happened; its record was truncated
                 return {"ok": False, "error": err_holder["error"]}
             out = {"ok": True, "key": key, "from": frm, "to": verdict, "by": by}
@@ -381,23 +385,6 @@ class KGEngine:
             return Provenance.INFERRED.value, None
         return None, "hypothesis-needs-support"
 
-    def _audited_write(self, records, attempt):
-        """The crash-safe audit+write dance shared by the two verdict-writing handlers (§1.8): capture
-        the audit offset BEFORE appending so an orphan record can be dropped, append the audit record(s),
-        run the caller-supplied `attempt()`, and TRUNCATE the audit back iff the write signals failure —
-        so a failed transition never leaves an orphan record that would inflate _forged's count and let a
-        genuine forgery slip past. `attempt` returns (ok, payload); the helper accepts the failure SIGNAL
-        from the closure (a caught exception in kg_ground, an info.rolled_back in kg_rename) rather than
-        assuming one, so both failure shapes route through the same truncate. `records` is an iterable of
-        (key, frm, to, by) audit tuples. Returns the payload `attempt()` produced."""
-        audit_offset = self._audit_size()
-        for key, frm, to, by in records:
-            self._audit(key, frm, to, by)
-        ok, payload = attempt()
-        if not ok:
-            self._truncate_audit(audit_offset)
-        return payload
-
     def _owner_of_edge(self, edge_id: str) -> Node | None:
         # O(1) lookup via the derived index (id -> source) instead of an O(N) full-canon scan per
         # kg_ground call, which made draining the grounding queue quadratic (server-2). The index is
@@ -423,29 +410,9 @@ class KGEngine:
         return None
 
     def _audit_path(self) -> Path:
-        return self.canon.root / GROUND_AUDIT
-
-    def _audit_size(self) -> int:
-        try:
-            return self._audit_path().stat().st_size
-        except OSError:
-            return 0
-
-    def _truncate_audit(self, offset: int) -> None:
-        try:
-            with open(self._audit_path(), "r+", encoding="utf-8") as f:
-                f.truncate(offset)
-                f.flush()
-                os.fsync(f.fileno())
-        except OSError:
-            pass
-
-    def _audit(self, key: str, frm: str, to: str, by: str) -> None:
-        rec = {"key": key, "from": frm, "to": to, "by": by, "at": utcnow()}
-        with open(self._audit_path(), "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
-            f.flush()
-            os.fsync(f.fileno())  # the audit log is tamper-evidence; make each record durable
+        """The grounding-audit log path. Thin accessor (the durability protocol lives in GroundAuditLog);
+        kept because tests read the raw audit bytes through it."""
+        return self._audit_log.path
 
     def _rewrite_endpoints(self, edge, old: str, new: str):
         """Rewrite an edge's old→new endpoints, recompute its deterministic id from the new endpoints,
@@ -510,18 +477,18 @@ class KGEngine:
             # Emit the migrating audit records (compensated by truncation if the batch rolls back, like
             # kg_ground), then write the corrected nodes VERBATIM (merge=False): merging would
             # re-introduce each note's pre-rename edges (different id -> not deduped) and leave dangling
-            # old endpoints. The offset/truncate dance lives in _audited_write, shared with kg_ground; here
-            # the failure SIGNAL is info.rolled_back from write_nodes, not a caught exception.
+            # old endpoints. The offset/truncate dance lives in GroundAuditLog.audited_write, shared with
+            # kg_ground; here the failure SIGNAL is info.rolled_back from write_nodes, not a caught exception.
             def _attempt():
                 info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
                 return (not info.rolled_back), info
 
             records = [(new_key, EpistemicState.UNVERIFIED.value, state, "agent")
                        for new_key, state in migrations]
-            info = self._audited_write(records, _attempt)
+            info = self._audit_log.audited_write(records, _attempt)
             if info.rolled_back:
                 # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
-                # (its migrating audit records were already truncated by _audited_write).
+                # (its migrating audit records were already truncated by GroundAuditLog.audited_write).
                 return {"ok": False, "error": f"rename rolled back: {info.error}", "old": old, "new": new}
             try:
                 self.canon.node_path(old).unlink(missing_ok=True)
