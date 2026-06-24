@@ -44,9 +44,13 @@ function venvDir() {
 }
 
 // The interpreter pointer (engine-python.txt) is the cross-platform source of truth; fall back to the
-// conventional venv path, then to any system Python >= 3.10 on PATH. A merge can run outside a Claude
-// Code session (a plain `git merge` in a checkout), so the system-python fallback keeps the driver
-// usable even when no engine venv was ever provisioned (kg_engine resolves off PYTHONPATH=scripts).
+// conventional venv path, then to any system Python >= 3.10 on PATH that can ALSO import the engine's
+// PyYAML runtime dependency. A merge can run outside a Claude Code session (a plain `git merge` in a
+// checkout), so the system-python fallback keeps the driver usable when no engine venv was ever
+// provisioned (kg_engine resolves off PYTHONPATH=scripts) — but only if that interpreter actually has
+// PyYAML, which kg_engine.canonmerge imports transitively (model.py `import yaml`); otherwise it would
+// crash with an opaque ModuleNotFoundError, so we reject it and fall through to the clean "no engine
+// python" conflict path instead (review-M8).
 function enginePython(dir) {
   try {
     const p = readFileSync(join(dir, "engine-python.txt"), "utf8").trim();
@@ -65,7 +69,9 @@ function enginePython(dir) {
 function systemPython() {
   const cands =
     process.platform === "win32" ? ["py", "python", "python3"] : ["python3", "python", "py"];
-  const probe = "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)";
+  // require BOTH Python >= 3.10 AND an importable PyYAML (the engine's one third-party runtime dep the
+  // merge module pulls in) — an ImportError exits non-zero, so a dep-less interpreter is rejected (M8).
+  const probe = "import sys, yaml; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)";
   for (const c of cands) {
     const r = spawnSync(c, ["-c", probe], { stdio: "ignore" });
     if (r.status === 0) return c;

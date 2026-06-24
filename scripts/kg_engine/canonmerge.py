@@ -22,6 +22,7 @@ Pure stdlib + the model layer; no network, no canon I/O, no audit log.
 from __future__ import annotations
 
 import copy
+import os
 import subprocess
 import sys
 import tempfile
@@ -188,9 +189,13 @@ def merge_note_files(base_text: str, ours_text: str, theirs_text: str) -> tuple[
     if ours is None or theirs is None or (not ours.edges and not theirs.edges):
         return _git_merge_file(base_text, ours_text, theirs_text)
 
-    base = _parse(base_text)  # may be None (file added on both sides)
+    base = _parse(base_text)  # may be None (file added on both sides, or an unparseable base)
     merged, demotions = merge_nodes(base, ours, theirs)
-    base_body = base.body if base is not None else ""
+    # If the base file existed but wasn't parseable as a node (no frontmatter), its RAW text is still the
+    # common ancestor for the body 3-way merge. Using "" instead would make a one-sided body edit look
+    # like a two-sided change against an empty base and spuriously conflict (review-low). When base is
+    # genuinely absent (added on both sides) base_text is "" anyway, so this is safe in both cases.
+    base_body = base.body if base is not None else base_text
     merged_body, body_conflicts, body_ok = _merge_body(base_body, ours.body, theirs.body)
     merged.body = merged_body
     for note in demotions:
@@ -208,6 +213,22 @@ def _eprint(msg: str) -> None:
         pass
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Atomic write (temp in the same dir + os.replace) so a crash mid-write never leaves git a
+    half-written canon note (review-low)."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent or "."), prefix=".kgmerge-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     """git merge-driver entrypoint. git invokes us with ``%O %A %B`` (base, ours, theirs); we must
     leave the merged result in the OURS path (%A) and exit 0 (clean) / 1 (conflicted, git marks it)."""
@@ -216,10 +237,20 @@ def main(argv: list[str] | None = None) -> int:
         _eprint("usage: python -m kg_engine.canonmerge <base %O> <ours %A> <theirs %B>")
         return 2
     base_path, ours_path, theirs_path = argv[0], argv[1], argv[2]
-    text, conflicts, ok = merge_note_files(_read(base_path), _read(ours_path), _read(theirs_path))
+    # FAIL OPEN (review-low): any unexpected error must leave 'ours' (%A) untouched and exit 1 so git
+    # marks the file conflicted for a human — NEVER crash after a partial write or corrupt the note.
+    try:
+        text, conflicts, ok = merge_note_files(_read(base_path), _read(ours_path), _read(theirs_path))
+    except Exception as e:  # noqa: BLE001
+        _eprint(f"[kg canon merge] merge failed; leaving 'ours' for git to conflict: {e}")
+        return 1
     for c in conflicts:
         _eprint(f"[kg canon merge] conflict: {c}")
-    Path(ours_path).write_text(text, encoding="utf-8")
+    try:
+        _write_atomic(Path(ours_path), text)
+    except OSError as e:
+        _eprint(f"[kg canon merge] could not write merged result; leaving 'ours': {e}")
+        return 1
     return 0 if ok else 1
 
 

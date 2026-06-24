@@ -194,6 +194,19 @@ def test_body_merges_through_note_files_semantic_path():
     assert node_from_markdown(text).body == "ours rewrote it"
 
 
+def test_unparseable_base_preserves_one_sided_body_edit():
+    """review-low: when the BASE is non-empty but unparseable (no frontmatter), its raw text is the body
+    ancestor — a one-sided body edit merges cleanly instead of spuriously conflicting against an empty
+    base (which would make a one-sided change look like a two-sided one)."""
+    raw_base = "Just prose, no frontmatter here."
+    e = [_edge(EpistemicState.UNVERIFIED)]
+    ours = node_to_markdown(_node(e, body=raw_base + "\nours appended a line"))
+    theirs = node_to_markdown(_node(e, body=raw_base))   # theirs left the body at the base text
+    text, conflicts, ok = merge_note_files(raw_base, ours, theirs)
+    assert ok and conflicts == []                        # one-sided edit -> no spurious conflict
+    assert "ours appended a line" in node_from_markdown(text).body
+
+
 # --------------------------------------------------------------------------- fallbacks
 
 
