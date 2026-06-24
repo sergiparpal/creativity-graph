@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import itertools
 
+import networkx as nx
+
 from kg_engine import generate as gen
 from kg_engine.canon import Canon
-from kg_engine.operations import explode_payload
+from kg_engine.operations import _resolve_cluster, collapse_payload, explode_payload
 from kg_engine.projector import Projector
 
 _UNIFORM = "## a\n## b\n## c"
@@ -40,6 +42,41 @@ def _hub_graph(canon: Canon):
     # a hub with two distinct outgoing relations -> two candidate facets unless k clamps it.
     return _ranked(canon, [("hub", "x"), ("hub", "y")],
                    rels={("hub", "x"): "bridges", ("hub", "y"): "grounds"})
+
+
+# --------------------------------------------------------------------------- M5: collapse target guards
+
+
+def test_collapse_on_community_less_target_does_not_sweep_danglers():
+    """review-M5: a collapse target sitting in no community (the -1 sentinel — e.g. a dangling,
+    attribute-less node) must NOT sweep every other community-less node into one bogus compression."""
+    G = nx.MultiDiGraph()
+    for n in ("ghost-x", "ghost-y", "ghost-z"):
+        G.add_node(n, community=-1, degree=0, specificity=1.0)
+    assert _resolve_cluster(G, "ghost-x", None) == []          # not [ghost-x, ghost-y, ghost-z]
+    payload, msg = collapse_payload(G, target="ghost-x")
+    assert payload is None and "at least 2 members" in msg
+
+
+def test_collapse_missing_target_is_signalled_not_auto_picked():
+    """review-low: an explicit target absent from the graph is a clear error, not a silent collapse of
+    the largest community as though no target had been given."""
+    G = nx.MultiDiGraph()
+    G.add_node("a", community=0)
+    G.add_node("b", community=0)
+    G.add_node("c", community=0)
+    payload, msg = collapse_payload(G, target="not-a-node")
+    assert payload is None and "not in the graph" in msg
+
+
+def test_collapse_dedups_explicit_members():
+    """review-low: duplicate explicit members collapse to one, so ['a','a'] does not pass the >=2 guard
+    as a fake two-member cluster."""
+    G = nx.MultiDiGraph()
+    G.add_node("a", community=0)
+    assert _resolve_cluster(G, None, ["a", "a"]) == ["a"]
+    payload, msg = collapse_payload(G, members=["a", "a"])
+    assert payload is None and "at least 2 members" in msg
 
 
 # --------------------------------------------------------------------------- F32: explode k clamping

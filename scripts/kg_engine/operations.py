@@ -25,6 +25,15 @@ from .model import slug
 HYP = "hypothesized"
 
 
+def _as_int(x, default=None):
+    """Coerce LLM-supplied MCP `k` to int, falling back instead of raising on a non-numeric value
+    (defense-in-depth: `k` is unvalidated tool input — review-low)."""
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return default
+
+
 def _compression_id(members) -> str:
     h = hashlib.sha1("\x00".join(sorted(members)).encode("utf-8")).hexdigest()[:8]
     lead = slug(sorted(members)[0]) if members else "cluster"
@@ -36,12 +45,18 @@ def _community_members(G, cid) -> list:
 
 
 def _resolve_cluster(G, target, members) -> list:
-    """The members to collapse: an explicit list, the community of a target node, or — with neither —
-    the largest real community (≥2 members)."""
+    """The members to collapse: an explicit list (deduped, order-preserving), the community of a target
+    node, or — with neither — the largest real community (≥2 members). A target that is not in the graph
+    OR sits in no community (the -1 sentinel) yields NO members rather than silently auto-picking the
+    largest community or sweeping every community-less dangler (review-M5 / missing-target)."""
     if members:
-        return [m for m in members if m in G]
-    if target is not None and target in G:
-        return _community_members(G, _attr(G, target, "community", -1))
+        seen: set = set()
+        return [m for m in members if m in G and not (m in seen or seen.add(m))]
+    if target is not None:
+        if target not in G:
+            return []
+        cid = _attr(G, target, "community", -1)
+        return _community_members(G, cid) if cid != -1 else []
     by_comm: dict = defaultdict(list)
     for n in G.nodes():
         by_comm[_attr(G, n, "community", -1)].append(n)
@@ -52,6 +67,10 @@ def _resolve_cluster(G, target, members) -> list:
 
 
 def collapse_payload(G, *, target=None, members=None, label="", body=""):
+    if not members and target is not None and target not in G:
+        # an explicit target that isn't a node is a caller error — signal it instead of silently
+        # collapsing the largest community as if no target was given (review-low: missing-target)
+        return None, f"collapse target {target!r} is not in the graph"
     members = _resolve_cluster(G, target, members)
     if len(members) < 2:
         return None, "collapse needs at least 2 members"
@@ -75,8 +94,11 @@ def explode_payload(G, *, target=None, k=None, label="", body=""):
     facets = rels or ["aspect-1", "aspect-2"]
     # k is unvalidated LLM-supplied MCP input: honour k=0 (zero facets, not "no limit") and guard
     # negatives (which would slice from the end), matching open_payload's max(1, int(k)) clamp discipline.
+    # A non-numeric k coerces to None (no limit) rather than raising ValueError (review-low: int(k) guard).
     if k is not None:
-        facets = facets[: max(0, int(k))]
+        kk = _as_int(k)
+        if kk is not None:
+            facets = facets[: max(0, kk)]
     nodes, edges = [], []
     for i, r in enumerate(facets, 1):
         cid = f"{slug(t)}-facet-{i}"
@@ -99,7 +121,7 @@ def regroup_payload(G, *, failures=None, k=10):
 def open_payload(G, *, label="", body="", k=2):
     # attachment points: the highest-degree nodes — where the current vocabulary is most loaded and a
     # new primitive would most need to connect to open further territory (§8 open).
-    pts = sorted(G.nodes(), key=lambda n: (-float(_attr(G, n, "degree", 0)), n))[: max(1, int(k))]
+    pts = sorted(G.nodes(), key=lambda n: (-float(_attr(G, n, "degree", 0)), n))[: max(1, _as_int(k, 2))]
     if not pts:
         return None, "empty graph — nothing to open against"
     prim_id = "opening-" + slug(pts[0])

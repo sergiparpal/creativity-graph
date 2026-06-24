@@ -121,6 +121,16 @@ def test_regroup_surfaces_pair_invisible_under_prior_partition(canon: Canon):
     assert {frozenset((c.source, c.target)) for c in cands} == {frozenset(("1", "6"))}
 
 
+def test_regroup_short_circuits_when_repartition_fails(canon: Canon, monkeypatch):
+    """review-M6: when BOTH community algorithms fail, _repartition returns None and regroup emits
+    NOTHING — never the O(n^2) explosion the all-singleton identity fallback would produce."""
+    nodes = [str(i) for i in range(1, 7)]
+    edges = [p for p in itertools.combinations(nodes, 2) if p != ("1", "6")]
+    G = _ranked(canon, edges)
+    monkeypatch.setattr(gen, "_repartition", lambda *a, **k: None)
+    assert gen.regroup(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10) == []
+
+
 # --------------------------------------------------------------------------- transplant (§5)
 
 

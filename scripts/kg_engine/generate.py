@@ -201,7 +201,7 @@ def compression(G, *, pack, corpus, failures, k=10) -> list:
     """§7 — new NODES, not new edges. Detect dense communities and propose a `compression` node that
     `collapses_into`-links the members, but only when an MDL screen shows a description-length SAVING
     (re-expressing the cluster's internal edges as a star through one new node costs fewer bits) AND the
-    cluster is not vague (mean member specificity ≥ the corpus mean). The label is left BLANK for the
+    cluster is not vague (mean member specificity ≥ the graph-wide mean specificity). The label is left BLANK for the
     language layer (Stage 6) to name. Members are carried in the rationale."""
     und = G.to_undirected()
     mean_spec = _mean_specificity(G)
@@ -230,7 +230,7 @@ def compression(G, *, pack, corpus, failures, k=10) -> list:
             kind="node", mechanism="compression", node_type="compression", label="",
             score=round(saved, 4), specificity=round(member_spec, 4), section="§7",
             rationale=(f"MDL: {e_int} internal edges among {m} members re-express as a star "
-                       f"(saves ~{saved:.0f} bits); specificity {member_spec:.2f} ≥ corpus mean "
+                       f"(saves ~{saved:.0f} bits); specificity {member_spec:.2f} ≥ graph mean "
                        f"{mean_spec:.2f}; collapses: {', '.join(sorted(members))}")))
     return _rank(cands, k)
 
@@ -242,6 +242,13 @@ def regroup(G, *, pack, corpus, failures, k=10) -> list:
     prior partition." This is the generative use of the freedom of resolution."""
     und = G.to_undirected()
     new_comm = _repartition(und, resolution=4.0, seed=7)
+    # _repartition returns None ONLY when BOTH community algorithms failed and it fell back to the
+    # identity (all-nodes-its-own-community) partition — a non-partition that would make EVERY
+    # intra-community pair "split apart", exploding into an O(n^2) slate of meaningless candidates
+    # (review-M6). A legitimate high-resolution partition that happens to be all-singletons is a real
+    # dict and still flows through (that is how regroup surfaces bridges on small graphs).
+    if new_comm is None:
+        return []
     adj = _undirected_adjacency(G)
     gate_on = _gate_on(G)
     nodes = list(G.nodes())
@@ -371,7 +378,7 @@ def ensemble(G, *, pack, corpus, failures, k=10, second_graph=None) -> list:
 # --------------------------------------------------------------------------- partition / loading helpers
 
 
-def _repartition(und, resolution=4.0, seed=7) -> dict:
+def _repartition(und, resolution=4.0, seed=7) -> "dict | None":
     """Re-run community detection at a DIFFERENT resolution than the stored projection (§8). Higher
     resolution -> more, smaller communities -> intra-community pairs surface as cross-community. Falls
     back to a different-seed label propagation when leidenalg is unavailable."""
@@ -391,8 +398,11 @@ def _repartition(und, resolution=4.0, seed=7) -> dict:
         try:
             communities = nx.community.asyn_lpa_communities(und, seed=seed)
             return {n: ci for ci, com in enumerate(communities) for n in com}
-        except Exception:  # noqa: BLE001
-            return {n: i for i, n in enumerate(und.nodes())}
+        except Exception:  # noqa: BLE001 — BOTH algorithms failed: signal "no usable repartition"
+            # Return None (not the identity {n: i} partition): the all-singleton identity makes every
+            # intra-community pair appear to "split", which regroup would explode into O(n^2) noise.
+            # The sentinel lets regroup short-circuit cleanly (review-M6).
+            return None
 
 
 def load_second_graph(path: str | Path) -> nx.MultiDiGraph:
@@ -429,4 +439,19 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
             out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, second_graph=second_graph)
         else:
             out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k)
-    return out
+    # Dedup EDGE candidates across mechanisms by (source, target, relation) — the triple the canonical
+    # edge_id derives from (review-low): with `second_graph=None`, ensemble degrades to regroup and
+    # re-emits the SAME edges under a second mechanism name; other mechanisms can also independently
+    # surface the same edge. Keep the FIRST occurrence (highest-priority mechanism by run order). NODE
+    # candidates (e.g. compressions) are left untouched — their label is blank until Stage 6 names them,
+    # so they carry no stable identity to dedup on and must not be collapsed by an empty-label key.
+    seen: set = set()
+    deduped: list = []
+    for c in out:
+        if c.kind == "edge":
+            key = (c.source, c.target, c.relation)
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(c)
+    return deduped
