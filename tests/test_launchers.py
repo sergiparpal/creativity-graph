@@ -27,6 +27,7 @@ _LAUNCH_MJS = REPO / "scripts" / "launch_server.mjs"
 _PRECONTEXT_MJS = REPO / "hooks" / "precontext.mjs"
 _PROVISION_MJS = REPO / "hooks" / "provision.mjs"
 _CANON_MERGE_MJS = REPO / "scripts" / "canon_merge_driver.mjs"
+_ENGINE_RESOLVE_MJS = REPO / "scripts" / "_engine_resolve.mjs"  # shared resolver every launcher imports
 _PRECONTEXT_PY = REPO / "hooks" / "precontext.py"
 
 NODE = shutil.which("node")
@@ -53,29 +54,20 @@ def _clean_env(monkeypatch):
 # --------------------------------------------------------------------------- #
 # (1) launch_server.mjs venv-dir precedence AGREES with bootstrap.resolve_venv_dir
 # --------------------------------------------------------------------------- #
-# Evaluate the REAL venvDir() out of launch_server.mjs (not a re-implementation) so a drift
-# in the .mjs precedence is caught. The launcher self-executes launch() at module load, so
-# we splice out only its self-contained resolution helpers (clean/expandResolve/venvDir),
-# wire ROOT from CLAUDE_PLUGIN_ROOT (which the launcher already honours), and print the
-# chosen dir as JSON.
+# Evaluate the REAL venvDir() that every launcher imports from scripts/_engine_resolve.mjs (not a
+# re-implementation) so a drift in the .mjs precedence is caught. We import the actual export and call
+# it with ROOT (which the launchers pass from CLAUDE_PLUGIN_ROOT), then print the chosen dir as JSON.
 _HARNESS = r"""
-import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { venvDir } from __MODURL__;
 const ROOT = process.env.CLAUDE_PLUGIN_ROOT;
-__BODY__
-process.stdout.write(JSON.stringify({ dir: venvDir() }));
+process.stdout.write(JSON.stringify({ dir: venvDir(ROOT) }));
 """
 
 
 def _mjs_venv_dir(root: Path, env: dict) -> Path:
-    """Run launch_server.mjs's actual venvDir() under `env` and return the resolved Path."""
-    src = _LAUNCH_MJS.read_text(encoding="utf-8")
-    # Splice the contiguous helper block: `function clean(` .. end of `function venvDir(){…}`.
-    start = src.index("function clean(")
-    end = src.index("function venvDir(")
-    end = src.index("\n}", end) + len("\n}")
-    body = src[start:end]
-    script = _HARNESS.replace("__BODY__", body)
+    """Run the shipped venvDir() (from _engine_resolve.mjs) under `env` and return the resolved Path."""
+    # Import the real module by file URL so the test binds to the SHIPPED resolver, not a copy.
+    script = _HARNESS.replace("__MODURL__", json.dumps(_ENGINE_RESOLVE_MJS.as_uri()))
     full_env = {**os.environ, **env, "CLAUDE_PLUGIN_ROOT": str(root)}
     r = subprocess.run(
         [NODE, "--input-type=module", "-e", script],
@@ -226,17 +218,17 @@ process.stdout.write(JSON.stringify({ pythonpath: env.PYTHONPATH, count: env.PYT
 
 
 def _dedup_block(mjs_path: Path) -> str:
-    """Extract the canonical-separator dedup block (the `const canon` .. includes() line)
-    from a launcher so the test asserts on the SHIPPED predicate, not a copy."""
+    """Extract the canonical-separator dedup block (the `const canon` .. PYTHONPATH-prepend line)
+    from the shipped resolver so the test asserts on the SHIPPED predicate, not a copy."""
     src = mjs_path.read_text(encoding="utf-8")
     start = src.index("const canon = (p) => p.split(sep).join")
-    end = src.index("env.PYTHONPATH = [SCRIPTS, ...parts]", start)
+    end = src.index("PYTHONPATH = [scripts, ...parts]", start)
     end = src.index("\n", end)
     return src[start:end]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-@pytest.mark.parametrize("mjs", [_LAUNCH_MJS, _PRECONTEXT_MJS])
+@pytest.mark.parametrize("mjs", [_ENGINE_RESOLVE_MJS])
 def test_pythonpath_dedup_is_separator_canonical(mjs):
     # The shipped predicate must canonicalise separators (so it survives drift).
     block = _dedup_block(mjs)
@@ -255,7 +247,9 @@ def test_pythonpath_dedup_is_separator_canonical(mjs):
 # (4) every shipped .mjs parses under `node --check`
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-@pytest.mark.parametrize("mjs", [_LAUNCH_MJS, _PRECONTEXT_MJS, _PROVISION_MJS, _CANON_MERGE_MJS])
+@pytest.mark.parametrize(
+    "mjs", [_LAUNCH_MJS, _PRECONTEXT_MJS, _PROVISION_MJS, _CANON_MERGE_MJS, _ENGINE_RESOLVE_MJS]
+)
 def test_mjs_parses(mjs):
     r = subprocess.run([NODE, "--check", str(mjs)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

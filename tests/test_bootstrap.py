@@ -207,7 +207,7 @@ def test_do_install_removes_venv_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(bootstrap, "install_with_pip", _fake_install_real_venv)
     monkeypatch.setattr(bootstrap, "verify_imports", fail_verify)
     with pytest.raises(subprocess.CalledProcessError):
-        bootstrap.do_install(venv_dir, "stamp")
+        bootstrap.do_install(venv_dir)
     assert not venv_dir.exists()
 
 
@@ -227,7 +227,7 @@ def test_do_install_keeps_preexisting_foreign_dir_on_failure(tmp_path, monkeypat
     # do_install refuses upfront (SystemExit) rather than scaffolding a venv into the populated
     # foreign dir — so the user's data is neither deleted NOR polluted with venv files.
     with pytest.raises(SystemExit):
-        bootstrap.do_install(venv_dir, "stamp")
+        bootstrap.do_install(venv_dir)
     assert venv_dir.exists()
     assert sentinel.read_text(encoding="utf-8") == "do not delete me\n"
     assert not bootstrap.venv_python(venv_dir).exists()  # nothing scaffolded into the user dir
@@ -250,7 +250,7 @@ def test_stamp_written_strictly_last(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bootstrap, "verify_imports", fail_verify)
     with pytest.raises(subprocess.CalledProcessError):
-        bootstrap.do_install(venv_dir, "stamp")
+        bootstrap.do_install(venv_dir)
     assert not (venv_dir / bootstrap.STAMP_NAME).exists()
 
 

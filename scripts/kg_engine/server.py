@@ -15,6 +15,7 @@ from . import __version__
 from .boundary import DEFAULT_MAX_EDGES_PER_KB, MIN_SPAN_CHARS, merge_results_into_nodes, validate_payload
 from .canon import Canon
 from .model import (
+    AuthoredBy,
     Disposition,
     EpistemicState,
     GROUNDABLE_STATES,
@@ -33,6 +34,9 @@ from .sources import SourceSet
 # Single source of truth shared with the reconciler's policed set (model.GROUNDABLE_STATES), so the
 # states kg_ground may stamp and the states the reconciler re-quarantines can never drift apart.
 VALID_VERDICTS = {s.value for s in GROUNDABLE_STATES}
+# The known verdict actors, derived from the AuthoredBy enum (mirroring how VALID_VERDICTS derives from
+# GROUNDABLE_STATES) so the clamp tracks the model instead of an inline literal that can drift.
+VALID_ACTORS = {a.value for a in AuthoredBy}
 
 
 class KGEngine:
@@ -102,6 +106,17 @@ class KGEngine:
         return {"scrubbed": scrubbed, "redactions": len(mapping),
                 "sensitivity": self.sensitivity, "categories": sorted({k.split(":")[0].strip("⟦") for k in mapping})}
 
+    def _restore_fn(self):
+        """The §1.9 span-restore: map placeholder spans back to the original before span verification,
+        but ONLY when a scrub happened this session (else None — verify the span as written)."""
+        return (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
+
+    @staticmethod
+    def _append_note(existing: str, addition: str) -> str:
+        """Append `addition` to a notes field with the load-bearing ` | ` separator (the field is later
+        parsed/displayed); names the separator once."""
+        return (existing + " | " if existing else "") + addition
+
     def kg_write(self, payload: dict, *, message: str = "kg_write", existing_nodes=None) -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted items.
 
@@ -111,7 +126,7 @@ class KGEngine:
         (backend-1/server-16)."""
         # if egress scrubbing happened this session, restore placeholder spans to the original before
         # span verification, and store the original in the canon (§1.9).
-        restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
+        restore = self._restore_fn()
         if existing_nodes is None:
             existing_nodes = self.canon.all_nodes()  # read once; derive edges + node baseline from it
         existing_edges = [e for n in existing_nodes for e in n.edges]
@@ -204,7 +219,7 @@ class KGEngine:
             return {"ok": False, "error": f"invalid verdict {verdict!r}"}
         # `by` is provenance, not a free-text field: clamp to the known actors so a stray value can't
         # masquerade as a verdict author (the MCP tool surface already pins this to "agent").
-        by = by if by in ("agent", "human", "deterministic") else "agent"
+        by = by if by in VALID_ACTORS else "agent"
         state = EpistemicState(verdict)
         promoted_to = None
         # Acquire the single-writer lease FIRST, then read the owning node FRESH under the lease, mutate,
@@ -234,51 +249,83 @@ class KGEngine:
                 # support, which upgrades its provenance. Decided BEFORE any state change so a refusal leaves
                 # the edge untouched (no audit record, no write).
                 if edge.provenance == Provenance.HYPOTHESIZED and state == EpistemicState.GROUNDED:
-                    restore = (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
-                    if support_span and support_span.strip():
-                        check = restore(support_span) if restore else support_span
-                        # source-aware (R4): verify against the edge's named source if it has one, else
-                        # any declared source. The not-in-ANY-source contract is unchanged
-                        # (support-span-not-in-source) — a promotion span just has to exist SOMEWHERE.
-                        if not self.source_set().verifies(check, source_file=edge.source_file):
-                            return {"ok": False, "error": "support-span-not-in-source"}
-                        if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
-                            return {"ok": False, "error": "support-span-too-short"}
-                        edge.span = check
-                        edge.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
-                        promoted_to = Provenance.SPAN_PRESENT.value
-                    elif support_note and support_note.strip():
-                        edge.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
-                        edge.notes = (edge.notes + " | " if edge.notes else "") + f"citation: {support_note.strip()}"
-                        promoted_to = Provenance.INFERRED.value
-                    else:
-                        return {"ok": False, "error": "hypothesis-needs-support"}
+                    promoted_to, err = self._promote_hypothesis(edge, support_span, support_note)
+                    if err:
+                        return {"ok": False, "error": err}
                 frm = edge.epistemic_state.value
                 edge.epistemic_state = state
                 edge.verdict_by = by
                 edge.verdict_at = utcnow()
                 if note:
-                    edge.notes = (edge.notes + " | " if edge.notes else "") + note
+                    edge.notes = self._append_note(edge.notes, note)
                 key = edge.id
-            # Append the audit record BEFORE persisting the verdict: a CRASH between the two leaves an
-            # audit record with no state change (harmless, unconsumed) rather than a verdict with no
-            # audit record (which the reconciler would re-quarantine). But a CAUGHT write failure (slug
-            # collision, disk error) must not leave that orphan record — on a later legitimate retry of
-            # the same key->state it would inflate the count and let one genuine forgery slip past
-            # _forged's count check. So we record the pre-append offset and truncate it back on failure.
-            audit_offset = self._audit_size()
-            self._audit(key, frm, verdict, by)
-            try:
-                self.canon.write_one(node)
-            except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
-                self._truncate_audit(audit_offset)  # the transition never happened; drop its record
-                return {"ok": False, "error": f"write failed: {e}"}
+            # Append the audit record BEFORE persisting the verdict (a CRASH between the two leaves an
+            # audit record with no state change — harmless, unconsumed — rather than a verdict with no
+            # audit record, which the reconciler would re-quarantine), and truncate it back on a caught
+            # write failure so an orphan record can't inflate _forged's count (server-3). The crash-safe
+            # offset/truncate dance lives in _audited_write, shared with kg_rename.
+            err_holder: dict = {}
+
+            def _attempt():
+                try:
+                    self.canon.write_one(node)
+                    return True, None
+                except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
+                    err_holder["error"] = f"write failed: {e}"
+                    return False, None
+
+            self._audited_write([(key, frm, verdict, by)], _attempt)
+            if err_holder:  # the transition never happened; its record was truncated
+                return {"ok": False, "error": err_holder["error"]}
             out = {"ok": True, "key": key, "from": frm, "to": verdict, "by": by}
             if promoted_to:  # a hypothesis was promoted — its provenance was upgraded (PLAN Stage 8)
                 out["provenance_upgraded_to"] = promoted_to
             return out
         finally:
             self.canon._release_lock()
+
+    def _promote_hypothesis(self, edge, support_span: str, support_note: str):
+        """The §1.2-3 / PLAN-Stage-8 hypothesized→grounded promotion gate: a span-less proposal earns
+        grounding only with support, which UPGRADES its provenance. Mutates `edge` in place on success
+        and returns (promoted_to, None); on a refusal it leaves the edge UNTOUCHED and returns
+        (None, error) so the caller can refuse before any state change / audit / write. `support_span`
+        (a verbatim source substring) → span-present; `support_note` (an external citation) → inferred;
+        neither → `hypothesis-needs-support`."""
+        restore = self._restore_fn()
+        if support_span and support_span.strip():
+            check = restore(support_span) if restore else support_span
+            # source-aware (R4): verify against the edge's named source if it has one, else
+            # any declared source. The not-in-ANY-source contract is unchanged
+            # (support-span-not-in-source) — a promotion span just has to exist SOMEWHERE.
+            if not self.source_set().verifies(check, source_file=edge.source_file):
+                return None, "support-span-not-in-source"
+            if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
+                return None, "support-span-too-short"
+            edge.span = check
+            edge.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
+            return Provenance.SPAN_PRESENT.value, None
+        if support_note and support_note.strip():
+            edge.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
+            edge.notes = self._append_note(edge.notes, f"citation: {support_note.strip()}")
+            return Provenance.INFERRED.value, None
+        return None, "hypothesis-needs-support"
+
+    def _audited_write(self, records, attempt):
+        """The crash-safe audit+write dance shared by the two verdict-writing handlers (§1.8): capture
+        the audit offset BEFORE appending so an orphan record can be dropped, append the audit record(s),
+        run the caller-supplied `attempt()`, and TRUNCATE the audit back iff the write signals failure —
+        so a failed transition never leaves an orphan record that would inflate _forged's count and let a
+        genuine forgery slip past. `attempt` returns (ok, payload); the helper accepts the failure SIGNAL
+        from the closure (a caught exception in kg_ground, an info.rolled_back in kg_rename) rather than
+        assuming one, so both failure shapes route through the same truncate. `records` is an iterable of
+        (key, frm, to, by) audit tuples. Returns the payload `attempt()` produced."""
+        audit_offset = self._audit_size()
+        for key, frm, to, by in records:
+            self._audit(key, frm, to, by)
+        ok, payload = attempt()
+        if not ok:
+            self._truncate_audit(audit_offset)
+        return payload
 
     def _owner_of_edge(self, edge_id: str) -> Node | None:
         # O(1) lookup via the derived index (id -> source) instead of an O(N) full-canon scan per
@@ -329,9 +376,26 @@ class KGEngine:
             f.flush()
             os.fsync(f.fileno())  # the audit log is tamper-evidence; make each record durable
 
+    def _rewrite_endpoints(self, edge, old: str, new: str):
+        """Rewrite an edge's old→new endpoints, recompute its deterministic id from the new endpoints,
+        and report the integration-1 migration. Returns (changed, migration | None) where migration =
+        (new_id, state_value) iff the id actually CHANGED and the edge is in a policed (verdict-or-
+        obsolete) state — the load-bearing record that preserves grounding/failure memory across a
+        rename, kept in ONE place so the two rename loops can never drift apart."""
+        from .model import edge_id
+        old_eid = edge.id
+        if edge.source == old:
+            edge.source = new
+        if edge.target == old:
+            edge.target = new
+        edge.id = edge_id(edge.source, edge.relation, edge.target)  # keep id consistent with endpoints
+        changed = edge.id != old_eid
+        migration = ((edge.id, edge.epistemic_state.value)
+                     if changed and edge.epistemic_state in GROUNDABLE_STATES else None)
+        return changed, migration
+
     def kg_rename(self, old_id: str, new_id: str, *, message: str = "kg_rename") -> dict:
         """Rename a node and rewrite every edge endpoint referencing it (single-canonical-edge safe)."""
-        from .model import edge_id
         old, new = slug(old_id), slug(new_id)
         if not self.canon.exists(old):
             return {"ok": False, "error": "node not found"}
@@ -351,30 +415,20 @@ class KGEngine:
             migrations.append((f"node:{new}", node.epistemic_state.value))
         node.id = new
         for e in node.edges:
-            old_eid = e.id
-            if e.source == old:
-                e.source = new
-            e.id = edge_id(e.source, e.relation, e.target)  # keep edge id consistent with endpoints
-            if e.id != old_eid and e.epistemic_state in GROUNDABLE_STATES:
-                migrations.append((e.id, e.epistemic_state.value))
+            _, mig = self._rewrite_endpoints(e, old, new)
+            if mig:
+                migrations.append(mig)
         touched = [node]
         for other in self.canon.all_nodes():
             if other.id == old:
                 continue
-            changed = False
+            node_changed = False
             for e in other.edges:
-                old_eid = e.id
-                ec = False
-                if e.target == old:
-                    e.target = new; ec = True
-                if e.source == old:
-                    e.source = new; ec = True
-                if ec:
-                    e.id = edge_id(e.source, e.relation, e.target)
-                    changed = True
-                    if e.id != old_eid and e.epistemic_state in GROUNDABLE_STATES:
-                        migrations.append((e.id, e.epistemic_state.value))
-            if changed:
+                changed, mig = self._rewrite_endpoints(e, old, new)
+                node_changed |= changed
+                if mig:
+                    migrations.append(mig)
+            if node_changed:
                 touched.append(other)
         # Hold the lease across the whole audit + write + unlink + commit sequence so the migrating
         # audit records and their compensating truncate are atomic w.r.t. other writers (server-3).
@@ -385,14 +439,18 @@ class KGEngine:
             # Emit the migrating audit records (compensated by truncation if the batch rolls back, like
             # kg_ground), then write the corrected nodes VERBATIM (merge=False): merging would
             # re-introduce each note's pre-rename edges (different id -> not deduped) and leave dangling
-            # old endpoints.
-            audit_offset = self._audit_size()
-            for new_key, state in migrations:
-                self._audit(new_key, EpistemicState.UNVERIFIED.value, state, "agent")
-            info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
+            # old endpoints. The offset/truncate dance lives in _audited_write, shared with kg_ground; here
+            # the failure SIGNAL is info.rolled_back from write_nodes, not a caught exception.
+            def _attempt():
+                info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
+                return (not info.rolled_back), info
+
+            records = [(new_key, EpistemicState.UNVERIFIED.value, state, "agent")
+                       for new_key, state in migrations]
+            info = self._audited_write(records, _attempt)
             if info.rolled_back:
                 # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
-                self._truncate_audit(audit_offset)
+                # (its migrating audit records were already truncated by _audited_write).
                 return {"ok": False, "error": f"rename rolled back: {info.error}", "old": old, "new": new}
             try:
                 self.canon.node_path(old).unlink(missing_ok=True)
@@ -554,23 +612,30 @@ class KGEngine:
         if not self.projector.db_path.exists() or self.projector.is_stale():
             self.projector.project()
 
+    @property
+    def _proj(self) -> Projector:
+        """The lazy-projection read seam: ensure the derived layer is fresh, then return the projector.
+        The single edit point for the projection trigger every pure read delegate goes through."""
+        self._ensure_projected()
+        return self.projector
+
     def get_node(self, node_id: str) -> dict | None:
-        self._ensure_projected(); return self.projector.get_node(node_id)
+        return self._proj.get_node(node_id)
 
     def get_neighbors(self, node_id: str, relation: str | None = None) -> list:
-        self._ensure_projected(); return self.projector.get_neighbors(node_id, relation=relation)
+        return self._proj.get_neighbors(node_id, relation=relation)
 
     def shortest_path(self, source: str, target: str):
-        self._ensure_projected(); return self.projector.shortest_path(source, target)
+        return self._proj.shortest_path(source, target)
 
     def query_graph(self, **kw) -> dict:
-        self._ensure_projected(); return self.projector.query_graph(**kw)
+        return self._proj.query_graph(**kw)
 
     def kg_context(self, query: str | None = None, budget: int = 2000) -> dict:
-        self._ensure_projected(); return self.projector.kg_context(query, budget=budget)
+        return self._proj.kg_context(query, budget=budget)
 
     def kg_agenda(self, *, limit: int = 5) -> dict:
-        self._ensure_projected(); return self.projector.kg_agenda(limit=limit)
+        return self._proj.kg_agenda(limit=limit)
 
     def kg_export(self, kind: str = "all") -> dict:
         """Render the human-facing artifacts (R1): a self-contained `graph.html` + `GRAPH_REPORT.md` under

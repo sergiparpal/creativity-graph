@@ -24,6 +24,19 @@ from .model import slug
 
 HYP = "hypothesized"
 
+# Per-operation default fan-out knobs. server.py's kg_operate mirrors these defaults (`k or 10` /
+# `k or 2`); keep the two in sync when tuning.
+DEFAULT_REGROUP_K = 10
+DEFAULT_OPEN_POINTS = 2
+
+# Every *_payload below returns a 2-tuple (payload, info): `payload` is a propose-payload dict on
+# success or None on failure, and `info` is the identifier/info string when payload is not None, else
+# the failure reason. The caller (kg_operate) disambiguates the two meanings via `if not payload`.
+
+# Sentinel marking an explicit collapse target that is not a node in the graph (vs. a target that is
+# present but sits in no community, or simply yields too few members) — see _resolve_cluster.
+_NO_SUCH_TARGET = object()
+
 
 def _as_int(x, default=None):
     """Coerce LLM-supplied MCP `k` to int, falling back instead of raising on a non-numeric value
@@ -44,17 +57,19 @@ def _community_members(G, cid) -> list:
     return [n for n in G.nodes() if _attr(G, n, "community", -1) == cid]
 
 
-def _resolve_cluster(G, target, members) -> list:
+def _resolve_cluster(G, target, members):
     """The members to collapse: an explicit list (deduped, order-preserving), the community of a target
-    node, or — with neither — the largest real community (≥2 members). A target that is not in the graph
-    OR sits in no community (the -1 sentinel) yields NO members rather than silently auto-picking the
-    largest community or sweeping every community-less dangler (review-M5 / missing-target)."""
+    node, or — with neither — the largest real community (≥2 members). A target that sits in no community
+    (the -1 sentinel) yields NO members rather than silently auto-picking the largest community or
+    sweeping every community-less dangler (review-M5 / missing-target). A target that is not in the graph
+    returns the _NO_SUCH_TARGET sentinel so the single membership test lives here (the caller translates
+    it into a specific error), not duplicated at the call site."""
     if members:
         seen: set = set()
         return [m for m in members if m in G and not (m in seen or seen.add(m))]
     if target is not None:
         if target not in G:
-            return []
+            return _NO_SUCH_TARGET
         cid = _attr(G, target, "community", -1)
         return _community_members(G, cid) if cid != -1 else []
     by_comm: dict = defaultdict(list)
@@ -67,11 +82,11 @@ def _resolve_cluster(G, target, members) -> list:
 
 
 def collapse_payload(G, *, target=None, members=None, label="", body=""):
-    if not members and target is not None and target not in G:
+    members = _resolve_cluster(G, target, members)
+    if members is _NO_SUCH_TARGET:
         # an explicit target that isn't a node is a caller error — signal it instead of silently
         # collapsing the largest community as if no target was given (review-low: missing-target)
         return None, f"collapse target {target!r} is not in the graph"
-    members = _resolve_cluster(G, target, members)
     if len(members) < 2:
         return None, "collapse needs at least 2 members"
     comp_id = _compression_id(members)
@@ -85,12 +100,12 @@ def collapse_payload(G, *, target=None, members=None, label="", body=""):
 
 
 def explode_payload(G, *, target=None, k=None, label="", body=""):
-    t = target
-    if t is None or t not in G:
-        t = max(G.nodes(), key=lambda n: (float(_attr(G, n, "degree", 0)), n), default=None)
-    if t is None:
+    node = target
+    if node is None or node not in G:
+        node = max(G.nodes(), key=lambda n: (float(_attr(G, n, "degree", 0)), n), default=None)
+    if node is None:
         return None, "no node to explode"
-    rels = sorted({d.get("relation") for _, _, d in G.out_edges(t, data=True) if d.get("relation")})
+    rels = sorted({d.get("relation") for _, _, d in G.out_edges(node, data=True) if d.get("relation")})
     facets = rels or ["aspect-1", "aspect-2"]
     # k is unvalidated LLM-supplied MCP input: honour k=0 (zero facets, not "no limit") and guard
     # negatives (which would slice from the end), matching open_payload's max(1, int(k)) clamp discipline.
@@ -101,15 +116,15 @@ def explode_payload(G, *, target=None, k=None, label="", body=""):
             facets = facets[: max(0, kk)]
     nodes, edges = [], []
     for i, r in enumerate(facets, 1):
-        cid = f"{slug(t)}-facet-{i}"
+        cid = f"{slug(node)}-facet-{i}"
         nodes.append({"id": cid, "label": label or "", "node_type": "primitive", "provenance": HYP,
-                      "body": body or f"latent facet of '{t}' along its '{r}' role (§8 explode)"})
+                      "body": body or f"latent facet of '{node}' along its '{r}' role (§8 explode)"})
         # the child collapses_into the parent: the parent is the compression of its facets (inverse shape)
-        edges.append({"source": cid, "target": t, "relation": "collapses_into", "provenance": HYP})
-    return {"nodes": nodes, "edges": edges}, t
+        edges.append({"source": cid, "target": node, "relation": "collapses_into", "provenance": HYP})
+    return {"nodes": nodes, "edges": edges}, node
 
 
-def regroup_payload(G, *, failures=None, k=10):
+def regroup_payload(G, *, failures=None, k=DEFAULT_REGROUP_K):
     cands = regroup(G, pack=None, corpus=None, failures=failures or set(), k=k)
     if not cands:
         return None, "re-partition surfaced no invisible bridges"
@@ -118,10 +133,11 @@ def regroup_payload(G, *, failures=None, k=10):
     return {"edges": edges}, f"{len(edges)} re-partition bridges"
 
 
-def open_payload(G, *, label="", body="", k=2):
+def open_payload(G, *, label="", body="", k=DEFAULT_OPEN_POINTS):
     # attachment points: the highest-degree nodes — where the current vocabulary is most loaded and a
     # new primitive would most need to connect to open further territory (§8 open).
-    pts = sorted(G.nodes(), key=lambda n: (-float(_attr(G, n, "degree", 0)), n))[: max(1, _as_int(k, 2))]
+    pts = sorted(G.nodes(), key=lambda n: (-float(_attr(G, n, "degree", 0)), n))[
+        : max(1, _as_int(k, DEFAULT_OPEN_POINTS))]
     if not pts:
         return None, "empty graph — nothing to open against"
     prim_id = "opening-" + slug(pts[0])

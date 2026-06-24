@@ -15,7 +15,7 @@ from __future__ import annotations
 import glob as _glob
 from pathlib import Path
 
-from .model import normalize_text
+from .model import normalize_text, span_present_in
 
 _EXTS = (".md", ".txt")
 _GLOB_CHARS = "*?["
@@ -23,6 +23,26 @@ _GLOB_CHARS = "*?["
 
 def _looks_like_glob(s: str) -> bool:
     return any(ch in s for ch in _GLOB_CHARS)
+
+
+def _source_order(p: Path) -> tuple:
+    """The platform-stable sort key: by basename, then full path. The full-path tiebreak is what makes
+    a cross-dir basename collision pick the same winner on every machine (filesystem iteration order is
+    not portable)."""
+    return (p.name, str(p))
+
+
+def _dedupe_stable(cands: list[Path]) -> list[Path]:
+    """The dedup pipeline: sort by ``_source_order``, skip dotfiles / non-files / wrong-suffix
+    (case-insensitive), and dedupe by basename keeping the lexicographically-first full path. The
+    case-insensitive ``.lower()`` suffix filter matches the glob branch, so ``/dir`` and ``/dir/*``
+    agree on an uppercase-extension file (``UP.MD``)."""
+    out: dict[str, Path] = {}
+    for q in sorted(cands, key=_source_order):
+        if q.name.startswith(".") or not q.is_file() or q.suffix.lower() not in _EXTS:
+            continue
+        out.setdefault(q.name, q)
+    return list(out.values())
 
 
 class SourceSet:
@@ -71,18 +91,9 @@ class SourceSet:
             cands = [Path(x) for x in _glob.glob(s, recursive=True)]
         else:
             return []  # nonexistent literal path
-        out: dict[str, Path] = {}
-        # Total, platform-stable order: by basename, then full path. glob()/iterdir() order is
-        # filesystem-dependent, so without the full-path tiebreak a cross-dir basename collision (a
-        # `*/notes.md`-style glob) would pick a winner by raw directory-iteration order and diverge
-        # across machines. Sorting by (name, str(path)) makes the lexicographically-first full path win
-        # everywhere; the dedup keeps that one. The case-insensitive `.lower()` suffix filter matches
-        # the glob branch, so `/dir` and `/dir/*` agree on an uppercase-extension file (`UP.MD`).
-        for q in sorted(cands, key=lambda x: (x.name, str(x))):
-            if q.name.startswith(".") or not q.is_file() or q.suffix.lower() not in _EXTS:
-                continue
-            out.setdefault(q.name, q)
-        return list(out.values())
+        # The dir/glob candidates run through the platform-stable dedup pipeline (sort + dotfile/suffix
+        # filter + first-path-wins by basename) so the resolved order is identical across machines.
+        return _dedupe_stable(cands)
 
     @classmethod
     def signature(cls, path: "str | Path | None") -> tuple:
@@ -121,14 +132,20 @@ class SourceSet:
         """The whitespace/case-normalized concat (whole-corpus form)."""
         return normalize_text(self.concat)
 
+    @staticmethod
+    def _key(name: str) -> str:
+        """The basename lookup key — normalized identically to the storage key (``p.name``), so a
+        lookup can never miss a stored source by forgetting to strip the directory part."""
+        return Path(name).name
+
     def for_file(self, name: str) -> str:
         """The raw text of one declared source by basename, or ``""`` if not present."""
-        return self._texts.get(Path(name).name, "")
+        return self._texts.get(self._key(name), "")
 
     def has_file(self, name: str) -> bool:
         """True iff ``name``'s basename is a declared source — lets the boundary distinguish
         ``span-not-in-named-source`` (named source known, span absent there) from ``span-not-in-source``."""
-        return bool(name) and Path(name).name in self._texts
+        return bool(name) and self._key(name) in self._texts
 
     def __len__(self) -> int:
         return len(self._texts)
@@ -144,13 +161,12 @@ class SourceSet:
         (named-source-exact); when it names an UNKNOWN basename (legacy ``source.md`` / an agent typo)
         or is empty, fall back to ANY declared source (lenient — Stage-0 Q1). The check is per-file
         (never against a cross-file concat), so a span can never "verify" by straddling a file
-        boundary. Normalization is identical to ``model.span_verifies`` (the single-blob check)."""
-        norm = normalize_text(span)
-        if not norm:
-            return False
+        boundary. Delegates the normalize + empty-guard + substring atom to ``model.span_present_in``
+        (the single primitive ``span_verifies`` also calls), so the §1.5 fail-closed gate cannot drift;
+        this method keeps ONLY the source SELECTION over the pre-normalized ``self._norm`` texts."""
         if source_file:
-            name = Path(source_file).name
+            name = self._key(source_file)
             if name in self._norm:
-                return norm in self._norm[name]
+                return span_present_in(span, self._norm[name])
             # unknown named source → lenient any-source fallback
-        return any(norm in nt for nt in self._norm.values())
+        return any(span_present_in(span, nt) for nt in self._norm.values())

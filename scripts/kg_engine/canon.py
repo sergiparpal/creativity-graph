@@ -12,11 +12,11 @@ import json
 import os
 import socket
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .atomicio import atomic_write_bytes, atomic_write_text
 from .model import (
     Edge,
     EpistemicState,
@@ -29,6 +29,9 @@ from .model import (
 
 LOCK_NAME = ".kg-session-lock"
 CANON_SUBDIR = "canon"
+# Refresh the lease this many times per TTL while a long batch is in flight (write_nodes), so the
+# lease stays comfortably fresh inside the TTL window and a concurrent session never judges it stale.
+HEARTBEAT_REFRESHES_PER_TTL = 3
 # Grounding audit log (kg_ground tamper-evidence). Defined here — the lowest layer that must keep it
 # out of git — and re-exported by reconciler so server/tests have one source of truth.
 GROUND_AUDIT = ".kg-ground-audit.jsonl"
@@ -66,10 +69,10 @@ class LeaseLock:
             self.host = socket.gethostname()
 
     def _read(self) -> dict | None:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError):
-            return None
+        # The LIVE lock: share the one reader, but fail CLOSED on an unexpected OSError (e.g.
+        # PermissionError) so an unreadable HELD lock is never misread as "no record"/free. Only
+        # FileNotFoundError (absent) and ValueError (corrupt) read as None here (tolerant defaults False).
+        return self._read_path(self.path)
 
     def _owned_by_self(self, rec: dict) -> bool:
         return rec.get("pid") == self.pid and rec.get("host") == self.host
@@ -107,42 +110,61 @@ class LeaseLock:
             return True
         if rec is not None and not self.is_stale(now):
             return False  # held by another live session
-        # stale (or vanished after our read): reclaim atomically. Rename the stale lock aside — only
-        # ONE racer can move a given inode, so exactly one wins the right to recreate; a racer whose
-        # rename fails (someone already moved/removed it) falls through and competes on the O_EXCL.
-        sidelined = self.path.with_name(f"{self.path.name}.stale-{self.pid}-{int(now * 1000)}")
-        try:
-            os.replace(self.path, sidelined)
-        except FileNotFoundError:
-            pass  # already reclaimed/removed; just try to create
-        except OSError:
+        # stale (or vanished after our read): reclaim atomically.
+        if not self._reclaim_stale(now):
             return False
-        else:
-            # Re-validate the record we actually moved: if the owner refreshed its heartbeat in the
-            # window between our is_stale() read and this move, we just sidelined a LIVE lock. Put it
-            # back and lose the race rather than steal it (closes the residual reclaim TOCTOU).
-            moved = self._read_path(sidelined)
-            if moved is not None and not self._rec_stale(moved, now):
-                try:
-                    os.replace(sidelined, self.path)
-                except OSError:
-                    pass
-                return False
-            try:
-                os.unlink(sidelined)
-            except OSError:
-                pass
         if self._try_exclusive_create(now):
             return True
         rec2 = self._read()  # lost the recreate race to a fresh acquirer; honor theirs unless it's us
         return bool(rec2 and self._owned_by_self(rec2))
 
+    def _reclaim_stale(self, now: float) -> bool:
+        """Rename the stale lock aside and clear it, so acquire() can O_EXCL-create a fresh one.
+
+        Returns True when the path is free to recreate (we moved-and-dropped the stale record, or it
+        had already vanished), False when we must abandon the acquire (a move failure, or the record
+        turned out to be LIVE after we moved it). Rename the stale lock aside — only ONE racer can move
+        a given inode, so exactly one wins the right to recreate; a racer whose rename fails (someone
+        already moved/removed it) falls through and competes on the O_EXCL.
+        """
+        sidelined = self.path.with_name(f"{self.path.name}.stale-{self.pid}-{int(now * 1000)}")
+        try:
+            os.replace(self.path, sidelined)
+        except FileNotFoundError:
+            return True  # already reclaimed/removed; just try to create
+        except OSError:
+            return False
+        # Re-validate the record we actually moved: if the owner refreshed its heartbeat in the
+        # window between our is_stale() read and this move, we just sidelined a LIVE lock. Put it
+        # back and lose the race rather than steal it (closes the residual reclaim TOCTOU).
+        moved = self._read_path(sidelined, tolerant=True)
+        if moved is not None and not self._rec_stale(moved, now):
+            try:
+                os.replace(sidelined, self.path)
+            except OSError:
+                pass
+            return False
+        try:
+            os.unlink(sidelined)
+        except OSError:
+            pass
+        return True
+
     @staticmethod
-    def _read_path(p: Path) -> dict | None:
+    def _read_path(p: Path, *, tolerant: bool = False) -> dict | None:
+        """Parse the JSON lock record at `p`; a missing (FileNotFoundError) or corrupt (ValueError) file
+        reads as "no record". The LIVE lock reader (_read) fails CLOSED on any OTHER OSError — an
+        unreadable HELD lock must never be misread as free. The SIDELINED reclaim re-read passes
+        tolerant=True: it just moved the file aside, so a transient OSError there means "treat as gone"
+        and proceed (the move already serialized racers)."""
         try:
             return json.loads(p.read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError, OSError):
+        except (FileNotFoundError, ValueError):
             return None
+        except OSError:
+            if tolerant:
+                return None
+            raise
 
     def _record(self, now: float) -> dict:
         return {"pid": self.pid, "host": self.host,
@@ -190,7 +212,7 @@ class LeaseLock:
             os.replace(self.path, sidelined)
         except (FileNotFoundError, OSError):
             return  # already gone/reclaimed — nothing of ours to release
-        moved = self._read_path(sidelined)
+        moved = self._read_path(sidelined, tolerant=True)
         if moved is not None and self._owned_by_self(moved):
             try:
                 os.unlink(sidelined)
@@ -232,40 +254,13 @@ def _pid_probe(pid: int, host: str, my_host: str) -> bool:
 
 # --------------------------------------------------------------------------- atomic write
 
-
-def _fsync_dir(directory: Path) -> None:
-    """fsync a directory so a rename into it is durable across a crash (best-effort; not all
-    platforms/filesystems support directory fds)."""
-    try:
-        fd = os.open(str(directory), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(path.parent)  # make the rename itself durable, not just the file contents
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    _atomic_write_bytes(path, text.encode("utf-8"))
+# The crash-safe write protocol (temp + fsync + os.replace + dir-fsync) lives in the stdlib-only
+# `atomicio` leaf module so the engine and the installer share one implementation. canon's old
+# mkdir + dir-fsync behavior is exactly atomicio's defaults (mkparents/fsync_dir both True). These
+# module-level names keep `canon._atomic_write` / `canon._atomic_write_bytes` available for the
+# in-package callers and tests that reference them through this module.
+_atomic_write_bytes = atomic_write_bytes
+_atomic_write = atomic_write_text
 
 
 # --------------------------------------------------------------------------- Canon
@@ -275,11 +270,6 @@ def _atomic_write(path: Path, text: str) -> None:
 class RollbackInfo:
     rolled_back: bool
     error: str = ""
-    stash_ref: str | None = None  # retained for response back-compat; rollback no longer stashes
-
-    @property
-    def stashed(self) -> bool:  # back-compat alias for callers that asked "did we roll back?"
-        return self.rolled_back
 
 
 class Canon:
@@ -350,6 +340,15 @@ class Canon:
         self._lock_depth += 1
         return True
 
+    @staticmethod
+    def _assert_no_slug_collision(node_id: str, existing: "Node", p: Path) -> None:
+        """Refuse a write whose target file already holds a DIFFERENT node id — two ids that slug to
+        the same filename would silently merge into one note. One place so write_one's check and the
+        batch merge raise the identical message."""
+        if existing.id != node_id:
+            raise ValueError(
+                f"node id slug collision: {node_id!r} and {existing.id!r} both map to {p.name}")
+
     def _check_slug_collision(self, node: "Node") -> None:
         """Two distinct ids that slug to the same filename would silently merge into one note.
         Detect and refuse rather than corrupt either node."""
@@ -366,9 +365,7 @@ class Canon:
             # lossy, then allow the write (F28). The backup is a dotfile, so note_paths() ignores it.
             self._backup_unreadable(p)
             return
-        if existing.id != node.id:
-            raise ValueError(
-                f"node id slug collision: {node.id!r} and {existing.id!r} both map to {p.name}")
+        self._assert_no_slug_collision(node.id, existing, p)
 
     @staticmethod
     def _backup_unreadable(p: Path) -> None:
@@ -459,11 +456,12 @@ class Canon:
                 snapshot[p] = p.read_bytes() if p.exists() else None
             try:
                 from .model import utcnow
-                # Throttle the lease heartbeat (perf #7): each heartbeat is a full durable lock rewrite
-                # (mkstemp+fsync+replace+dir-fsync), and the old code did one PER NODE. Lease correctness
-                # comes from the TTL + CAS acquire/reclaim, NOT cadence — refreshing once per ~ttl/3 keeps
-                # the lease comfortably fresh inside the TTL window. A sub-(ttl/3) batch heartbeats once.
-                hb_interval = self.lock.ttl / 3.0
+                # Throttle the lease heartbeat: each heartbeat is a full durable lock rewrite
+                # (mkstemp+fsync+replace+dir-fsync). Lease correctness comes from the TTL + CAS
+                # acquire/reclaim, NOT cadence — refresh at most once per ttl/HEARTBEAT_REFRESHES_PER_TTL
+                # so a long batch stays comfortably fresh inside the TTL window. A sub-interval batch
+                # heartbeats once.
+                hb_interval = self.lock.ttl / HEARTBEAT_REFRESHES_PER_TTL
                 last_hb = time.monotonic()
                 self.lock.heartbeat()  # one refresh up front, then only when hb_interval has elapsed
                 for node in nodes:
@@ -477,14 +475,14 @@ class Canon:
                     merged.updated_at = utcnow()
                     _atomic_write(self.node_path(merged.id), node_to_markdown(merged))
             except Exception as e:  # noqa: BLE001 — rollback must catch everything
-                return self._rollback(repo, str(e), snapshot)
+                return self._rollback(str(e), snapshot)
             # The writes have durably landed. Commit OUTSIDE the rollback try: a non-zero git exit must
             # not revert fsynced canon (F2). check=False so a commit failure is non-fatal and never
             # leaves content staged-but-reverted — same posture as kg_rename's success-path commit.
             if commit and _git_ok(repo):
-                # Stage ONLY the files this batch touched (perf #9): `git add -A` rescans the entire
-                # working tree per boundary batch, but `snapshot` already knows the exact paths. Still
-                # best-effort (check=False) — outside the rollback scope, must stay fail-open.
+                # Stage only this batch's paths (`snapshot` already knows them); `git add -A` would
+                # rescan the whole working tree per boundary batch. Still best-effort (check=False) —
+                # outside the rollback scope, must stay fail-open.
                 if snapshot:
                     _git(repo, "add", "--", *[str(p) for p in snapshot], check=False)
                 # allow empty so a no-op batch still succeeds
@@ -498,19 +496,16 @@ class Canon:
         p = self.node_path(node.id)
         if not p.exists():
             return node
-        # Read+parse the existing note ONCE (perf #10): the old code parsed it twice — once in
-        # _check_slug_collision and again in read_node. Fold the slug-collision check into this single
-        # parse. Semantics are identical: an unreadable existing note is backed up and the parse error
-        # re-raised (the merge path then rolls back the batch, exactly as before, since read_node used to
-        # raise here too); a readable note whose id differs raises the slug-collision ValueError.
+        # Parse the existing note once here and fold the slug-collision check in, so the batch path
+        # never double-parses. An unreadable existing note is backed up and the parse error re-raised
+        # (the merge path then rolls back the batch); a readable note whose id differs raises the
+        # slug-collision ValueError via the shared check.
         try:
             cur = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=node.id)
         except Exception:
             self._backup_unreadable(p)  # preserve foreign/corrupt bytes before anything overwrites them
             raise
-        if cur.id != node.id:
-            raise ValueError(
-                f"node id slug collision: {node.id!r} and {cur.id!r} both map to {p.name}")
+        self._assert_no_slug_collision(node.id, cur, p)
         # key by the canonical edge id (the slug) — the same key the boundary dedup and disk use, so
         # all three layers agree on what "one edge" is (boundary-1 / §1.4).
         by_id = {e.id: e for e in cur.edges}
@@ -536,7 +531,7 @@ class Canon:
             cur.node_type = node.node_type
         return cur
 
-    def _rollback(self, repo: Path, error: str, snapshot: dict | None = None) -> RollbackInfo:
+    def _rollback(self, error: str, snapshot: dict | None = None) -> RollbackInfo:
         """Undo a failed batch by restoring ONLY the files it touched, from the pre-batch snapshot.
 
         This is the same scoped restore on both git and non-git vaults. A repo-wide `git reset --hard

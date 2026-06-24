@@ -41,10 +41,17 @@ DEFAULT_MODEL = "claude-opus-4-8"
 # with --max-tokens / KG_BACKEND_MAX_TOKENS if a section needs more.
 DEFAULT_MAX_TOKENS = 16000
 # The SDK's non-streaming time guard ceiling: it requires streaming once a create()'s expected time
-# (3600 * max_tokens / 128000 s) exceeds ~10 min, i.e. max_tokens > 600 * 128000 / 3600 ≈ 21333. We
-# clamp to this in _effective_max_tokens so a large --max-tokens override can't fail every section
-# pre-flight (review-M4). Stable across the anthropic>=0.77 floor and current releases.
-_NONSTREAMING_TIME_FLOOR = 600 * 128000 // 3600  # 21333
+# (3600 * max_tokens / _SDK_TOKENS_PER_HOUR s) exceeds the _SDK_TIME_CEILING_S ~10-min wall, i.e.
+# max_tokens > _SDK_TIME_CEILING_S * _SDK_TOKENS_PER_HOUR / 3600 ≈ 21333. We clamp to this in
+# _effective_max_tokens so a large --max-tokens override can't fail every section pre-flight
+# (review-M4). Stable across the anthropic>=0.77 floor and current releases. This is the single
+# authoritative derivation; _effective_max_tokens back-references it rather than restating the formula.
+_SDK_TIME_CEILING_S = 600       # SDK's non-streaming wall-clock ceiling (~10 min) before it demands streaming
+_SDK_TOKENS_PER_HOUR = 128000   # SDK's assumed throughput in the expected-time formula
+_NONSTREAMING_TIME_FLOOR = _SDK_TIME_CEILING_S * _SDK_TOKENS_PER_HOUR // 3600  # 21333
+
+# Chars of a malformed model response to echo in the non-JSON diagnostic error (cosmetic only).
+_ERROR_SNIPPET_CHARS = 200
 
 # Pack vocabulary fallback if no pack is loaded (keeps the schema valid; the boundary still
 # quarantines anything off-vocabulary).
@@ -191,12 +198,12 @@ class BackendExtractor:
         The SDK table is imported lazily and guarded so this is a no-op without the optional SDK.
         """
         # Time-based guard (review-M4): independent of the per-model table, the SDK raises
-        # ValueError("Streaming is required ...") on a non-streamed create() when the expected time
-        # (3600 * max_tokens / 128000 seconds) exceeds the ~10-minute ceiling — i.e. when
-        # max_tokens > 600 * 128000 / 3600 ≈ 21333. DEFAULT_MODEL is NOT in the table below (cap None),
-        # so without this clamp a moderate override (the tool's own truncation message literally invites
-        # "raise --max-tokens", e.g. to 22000) makes the FIRST create() of every section raise pre-flight
-        # and the whole run produce nothing. The 16000 default is already under the floor, so unaffected.
+        # ValueError("Streaming is required ...") on a non-streamed create() once the expected time
+        # exceeds its wall-clock ceiling. Clamp to _NONSTREAMING_TIME_FLOOR; see its definition for the
+        # full SDK time-guard derivation. DEFAULT_MODEL is NOT in the table below (cap None), so without
+        # this clamp a moderate override (the tool's own truncation message literally invites "raise
+        # --max-tokens", e.g. to 22000) makes the FIRST create() of every section raise pre-flight and
+        # the whole run produce nothing. The 16000 default is already under the floor, so unaffected.
         eff = min(self.max_tokens, _NONSTREAMING_TIME_FLOOR)
         try:
             # The table is an SDK internal (anthropic._constants), not a top-level export — match the
@@ -231,15 +238,19 @@ class BackendExtractor:
             output_config={"format": {"type": "json_schema", "schema": self.section_schema()}},
             messages=[{"role": "user", "content": user}],
         )
+        return self._decode_response(resp, title)
+
+    def _decode_response(self, resp: Any, title: str) -> dict:
+        """Interpret the model response: dispatch on stop_reason, extract the text block, parse JSON."""
         stop = getattr(resp, "stop_reason", None)
         if stop == "refusal":
             details = getattr(resp, "stop_details", None)
-            cat = getattr(details, "category", None)
-            expl = getattr(details, "explanation", None)
+            refusal_category = getattr(details, "category", None)
+            refusal_explanation = getattr(details, "explanation", None)
             raise RuntimeError(
                 f"model refused extraction for section {title!r}"
-                + (f" (category={cat})" if cat else "")
-                + (f": {expl}" if expl else ""))
+                + (f" (category={refusal_category})" if refusal_category else "")
+                + (f": {refusal_explanation}" if refusal_explanation else ""))
         if stop == "max_tokens":
             # structured output truncated mid-JSON; surface a diagnosable error rather than a raw
             # JSONDecodeError on the partial payload.
@@ -254,7 +265,7 @@ class BackendExtractor:
             # structured output should always be valid JSON, but surface a diagnosable error (with
             # the stop_reason and a snippet) rather than a bare JSONDecodeError if the model returns
             # malformed text.
-            snippet = text[:200] + ("…" if len(text) > 200 else "")
+            snippet = text[:_ERROR_SNIPPET_CHARS] + ("…" if len(text) > _ERROR_SNIPPET_CHARS else "")
             raise RuntimeError(
                 f"model returned non-JSON for section {title!r} "
                 f"(stop_reason={stop!r}): {e}; got: {snippet!r}") from e
@@ -263,7 +274,7 @@ class BackendExtractor:
     def _stamp(self, raw: dict, source_file: str | None = None) -> dict:
         # R4: stamp each edge with the basename of the file the span came from, so the source-aware
         # boundary can verify it against THAT file. Falls back to the single-source name.
-        sf = source_file or self.source_file_name()
+        source_basename = source_file or self.source_file_name()
         nodes = [
             {
                 "id": n.get("id"),
@@ -285,7 +296,7 @@ class BackendExtractor:
                 "target": e.get("target", ""),
                 "relation": e.get("relation", ""),
                 "span": e.get("span", ""),
-                "source_file": sf,
+                "source_file": source_basename,
                 "provenance": "span-present",
                 "authored_by": "agent",
                 "epistemic_state": "unverified",
@@ -295,6 +306,50 @@ class BackendExtractor:
             for e in raw.get("edges", [])
         ]
         return {"nodes": nodes, "edges": edges, "complete": True}
+
+    # ---- baseline cache maintenance ---------------------------------------
+    def _refresh_baseline(self, baseline: dict, written_nodes: list) -> dict:
+        """Refresh ONLY the nodes a section wrote from the canon (their exact post-merge state) so the
+        threaded baseline stays authoritative for the next section without an O(N) re-parse. On any read
+        hiccup, fall back to a full re-parse (correctness). Returns the (possibly replaced) baseline."""
+        try:
+            for nid in written_nodes:
+                baseline[nid] = self.engine.canon.read_node(nid)
+        except Exception:  # noqa: BLE001 — never let baseline maintenance corrupt a run
+            baseline = {n.id: n for n in self.engine.canon.all_nodes()}
+        return baseline
+
+    # ---- one section: extract → scrub → write → refresh -------------------
+    def _extract_one_section(self, fname: str, title: str, body: str, baseline: dict,
+                             totals: Counter, failed_sections: list) -> tuple[bool, dict]:
+        """Run one section through extract→scrub→write, accumulating into totals/failed_sections.
+
+        Returns (written, baseline): `written` is True iff the section landed (so run() can count it),
+        and `baseline` is the (possibly replaced) threaded cache. A rollback or any per-section failure
+        is recorded in failed_sections and leaves totals un-accumulated — the per-section isolation
+        contract — so one section's failure can't abort the run."""
+        try:
+            # §1.9 egress scrub before the text reaches the model; kg_write restores spans for the canon.
+            scrubbed = self.engine.kg_scrub(body)["scrubbed"]
+            raw = self.extract_section(scrubbed, title)
+            result = self.engine.kg_write(self._stamp(raw, source_file=fname),
+                                          message=f"backend:{fname}:{title or 'preamble'}",
+                                          existing_nodes=list(baseline.values()))
+            if result.get("rolled_back"):
+                # The boundary rolled the whole section's write back (write_nodes raised): its
+                # `written_nodes` is [] and the accepted/demoted counts never landed, so they must NOT
+                # be accumulated. Record it as a failed section instead of over-reporting. The baseline
+                # is untouched (nothing persisted).
+                failed_sections.append({"title": title or "preamble",
+                                        "error": result.get("error") or "kg_write rolled back"})
+                return False, baseline
+            baseline = self._refresh_baseline(baseline, result.get("written_nodes", []))
+            for k, v in result["dispositions"].items():
+                totals[k] += v
+            return True, baseline
+        except Exception as e:  # noqa: BLE001 — isolate any per-section failure
+            failed_sections.append({"title": title or "preamble", "error": f"{type(e).__name__}: {e}"})
+            return False, baseline
 
     # ---- full pipeline ----------------------------------------------------
     def run(self, source_path: str | os.PathLike | None = None) -> dict:
@@ -320,36 +375,12 @@ class BackendExtractor:
                     if not body.strip():
                         continue
                     # A transient API error (or a RuntimeError on refusal / max_tokens / non-JSON) for
-                    # one section must not abort the whole run: isolate it, record it, and keep going so
-                    # the sections that did land are not lost.
-                    try:
-                        # §1.9 egress scrub before the text reaches the model; kg_write restores spans for the canon.
-                        scrubbed = self.engine.kg_scrub(body)["scrubbed"]
-                        raw = self.extract_section(scrubbed, title)
-                        result = self.engine.kg_write(self._stamp(raw, source_file=fname),
-                                                      message=f"backend:{fname}:{title or 'preamble'}",
-                                                      existing_nodes=list(baseline.values()))
-                        if result.get("rolled_back"):
-                            # The boundary rolled the whole section's write back (write_nodes raised):
-                            # its `written_nodes` is [] and the accepted/demoted counts never landed, so
-                            # they must NOT be accumulated. Record it as a failed section instead of
-                            # over-reporting. The baseline is untouched (nothing persisted).
-                            failed_sections.append({"title": title or "preamble",
-                                                    "error": result.get("error") or "kg_write rolled back"})
-                            continue
-                        # refresh ONLY the nodes this section wrote from the canon (their exact post-merge
-                        # state) so the threaded baseline stays authoritative for the next section without
-                        # an O(N) re-parse. On any read hiccup, fall back to a full re-parse (correctness).
-                        try:
-                            for nid in result.get("written_nodes", []):
-                                baseline[nid] = self.engine.canon.read_node(nid)
-                        except Exception:  # noqa: BLE001 — never let baseline maintenance corrupt a run
-                            baseline = {n.id: n for n in self.engine.canon.all_nodes()}
-                        for k, v in result["dispositions"].items():
-                            totals[k] += v
+                    # one section must not abort the whole run: _extract_one_section isolates it, records
+                    # it, and keeps going so the sections that did land are not lost.
+                    written, baseline = self._extract_one_section(fname, title, body, baseline,
+                                                                  totals, failed_sections)
+                    if written:
                         n_written += 1
-                    except Exception as e:  # noqa: BLE001 — isolate any per-section failure
-                        failed_sections.append({"title": title or "preamble", "error": f"{type(e).__name__}: {e}"})
         finally:
             # Always reconcile the derived layer with whatever landed, even if a section raised — the
             # canon may have been partially updated and must not be left with a stale projection.

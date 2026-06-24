@@ -73,6 +73,30 @@ def test_same_edge_both_sides_dedups():
     assert len(merged.edges) == 1
 
 
+# Golden cross-check: the write boundary (kg_write) and this out-of-process merge driver MUST key an
+# edge by the SAME canonical id — model.edge_id is the single source both derive from (review: the
+# identity is DRY, but the mirror can drift). Pin it across tricky slug inputs (separating marks,
+# NFC+casefold, punctuation) so a future fork in either path that re-slugged differently — splitting
+# one logical edge into two ids, defeating dedup — fails right here.
+@pytest.mark.parametrize(
+    "relation,target",
+    [
+        ("grounds", "Concept B"),
+        ("depends-on", "I/O"),  # the separating '/' must keep this distinct from "IO"
+        ("RÉFUTES", "Naïve"),  # NFC normalize + casefold
+        ("bridges", "bar.baz"),  # '.' maps to a separator, not deleted
+    ],
+)
+def test_merge_driver_keys_edges_by_canonical_edge_id(relation, target):
+    eid = edge_id("n1", relation, target)
+    # The Edge identity the driver unions on is exactly model.edge_id (what the boundary assigns).
+    assert _edge(EpistemicState.UNVERIFIED, relation=relation, target=target).id == eid
+    ours = _node([_edge(EpistemicState.UNVERIFIED, relation=relation, target=target)])
+    theirs = _node([_edge(EpistemicState.UNVERIFIED, relation=relation, target=target)])
+    merged, _ = merge_nodes(None, ours, theirs)
+    assert [e.id for e in merged.edges] == [eid]  # same logical edge -> one id, keyed canonically
+
+
 def test_equal_verdict_preserved():
     """An edge GROUNDED on BOTH sides stays grounded — the merge only demotes a *disagreement*."""
     ours = _node([_edge(EpistemicState.GROUNDED)])

@@ -60,11 +60,15 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import venv
 from pathlib import Path
+
+# Stdlib-only leaf module: importable with a bare system Python BEFORE the venv deps exist
+# (kg_engine/__init__ is import-light), and bootstrap runs as ``python scripts/bootstrap.py``
+# so scripts/ is sys.path[0] and ``import kg_engine.atomicio`` resolves.
+from kg_engine.atomicio import atomic_write_text
 
 SCRIPT_DIR = Path(__file__).resolve().parent      # <repo>/scripts
 REPO_ROOT = SCRIPT_DIR.parent                     # <repo>
@@ -75,6 +79,10 @@ PTR_NAME = "engine-python.txt"      # interpreter pointer, written inside the ve
 STAMP_NAME = "install.stamp"        # content hash of the install inputs
 LOCK_NAME = ".kg-provision.lock"    # atomic lock dir, kept beside the venv
 STALE_LOCK_SECS = 30 * 60           # treat a lock older than this as abandoned
+# Heartbeat cadence must stay well under STALE_LOCK_SECS so a healthy holder is never
+# judged stale and stolen; the poll interval is how often a waiter re-checks the lock.
+HEARTBEAT_SECS = STALE_LOCK_SECS / 4
+POLL_SECS = 2.0                     # how often a foreground waiter re-checks the lock
 LOG_NAME = "provision.log"          # where the detached worker logs
 SCHEMA = "1"                        # bump to force every venv to rebuild
 
@@ -200,6 +208,15 @@ def is_ready(venv_dir: Path, stamp: str) -> bool:
         return False
 
 
+def venv_current(venv_dir: Path) -> bool:
+    """True when the venv is provisioned and current right now.
+
+    Recomputes the stamp against the VENV interpreter's identity on every call (review-M7),
+    so a fresh check after another builder lands the venv compares equal.
+    """
+    return is_ready(venv_dir, _current_stamp(venv_dir))
+
+
 # --------------------------------------------------------------------------- #
 # Lock (atomic mkdir; steals abandoned locks)
 # --------------------------------------------------------------------------- #
@@ -253,6 +270,8 @@ def try_acquire(venv_dir: Path) -> bool:
     except FileExistsError:
         age = _lock_age(venv_dir)
         if age > STALE_LOCK_SECS:
+            # Steal discipline mirrors canon.LeaseLock.acquire's reclaim path (the lease-file
+            # twin of this mkdir-dir lock); the two are parallel by design — keep in sync.
             # Steal atomically: renaming a directory is atomic, so exactly one racer
             # can move the stale lock aside (the loser finds it already gone and backs
             # off). rmtree+mkdir alone is not atomic together — two simultaneous
@@ -338,30 +357,14 @@ def install_with_pip(venv_dir: Path) -> None:
     run([str(py), "-m", "pip", "install", str(REPO_ROOT)])
 
 
+def _engine_env() -> dict:
+    """Env for subprocessing into engine code: kg_engine resolves off PYTHONPATH, never installed."""
+    return {**os.environ, "PYTHONPATH": str(SCRIPT_DIR)}
+
+
 def verify_imports(py: Path) -> None:
     print("[bootstrap] Verifying core imports", flush=True)
-    env = {**os.environ, "PYTHONPATH": str(SCRIPT_DIR)}
-    run([str(py), "-c", _VERIFY_IMPORTS], env=env)
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Crash-safe text write (temp + fsync + os.replace).
-
-    The pointer/stamp are the engine's readiness gate, so a half-written stamp
-    (crash/disk-full mid-write) must never be left behind — it would either fake
-    "ready" forever or never rebuild. Writing atomically guarantees readers see either
-    the old file or the complete new one.
-    """
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    run([str(py), "-c", _VERIFY_IMPORTS], env=_engine_env())
 
 
 def _looks_like_our_venv(venv_dir: Path) -> bool:
@@ -375,7 +378,7 @@ def _looks_like_our_venv(venv_dir: Path) -> bool:
     )
 
 
-def do_install(venv_dir: Path, stamp: str) -> Path:
+def do_install(venv_dir: Path) -> Path:
     if not PYPROJECT.exists():
         raise SystemExit(f"[bootstrap] pyproject.toml not found at {PYPROJECT}")
     uv = shutil.which("uv")
@@ -399,7 +402,7 @@ def do_install(venv_dir: Path, stamp: str) -> Path:
     stop_hb = threading.Event()
 
     def _pulse() -> None:
-        while not stop_hb.wait(STALE_LOCK_SECS / 4):
+        while not stop_hb.wait(HEARTBEAT_SECS):
             heartbeat(venv_dir)
 
     hb_thread = threading.Thread(target=_pulse, daemon=True)
@@ -432,11 +435,16 @@ def do_install(venv_dir: Path, stamp: str) -> Path:
     # Pointer first, then stamp (both atomic): the stamp is written STRICTLY LAST, after
     # verify_imports has succeeded, so the presence of a matching stamp implies a verified
     # venv (bootstrap-2) and a crash between pointer and stamp never fakes "ready".
-    _atomic_write_text(venv_dir / PTR_NAME, py.as_posix())
+    atomic_write_text(venv_dir / PTR_NAME, py.as_posix(), mkparents=False, fsync_dir=False)
     # Re-stamp with the BUILT venv's own interpreter identity (uv may have built the venv with a
     # different interpreter than the one running bootstrap), so a later --check under yet another
     # interpreter compares equal and doesn't force a spurious rebuild (review-M7).
-    _atomic_write_text(venv_dir / STAMP_NAME, compute_stamp(_interp_identity(py)))
+    atomic_write_text(
+        venv_dir / STAMP_NAME,
+        compute_stamp(_interp_identity(py)),
+        mkparents=False,
+        fsync_dir=False,
+    )
     print(f"[bootstrap] Engine interpreter: {py.as_posix()}", flush=True)
     print(f"[bootstrap] Wrote {venv_dir / PTR_NAME}", flush=True)
     return py
@@ -468,9 +476,8 @@ def maybe_reconcile(venv_dir: Path) -> None:
         "    print(f\"[creativity-graph] reconcile re-quarantined {len(rep.requarantined)} \"\n"
         "          f\"forged verdict(s)\")\n"
     )
-    env = {**os.environ, "PYTHONPATH": str(SCRIPT_DIR)}
     try:
-        subprocess.run([str(py), "-c", snippet], check=False, env=env)
+        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
     except OSError:
         pass
 
@@ -478,14 +485,48 @@ def maybe_reconcile(venv_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+def _ok_with_reconcile(venv_dir: Path, reconcile: bool) -> int:
+    """The single success post-condition: on any successful provision, reconcile if asked (§1.8)."""
+    if reconcile:
+        maybe_reconcile(venv_dir)
+    return 0
+
+
+def _wait_for_lock(venv_dir: Path, deadline: float) -> int | None:
+    """Wait until we hold the provision lock or the venv is otherwise current.
+
+    Returns 0 when another builder finished while we waited (caller must still reconcile),
+    2 when the wait deadline passed without the venv becoming ready, or None once the lock
+    is acquired (caller proceeds to build). Keep release in the caller's finally — this
+    helper never releases.
+    """
+    while not try_acquire(venv_dir):
+        # re-evaluate readiness against the VENV interpreter's identity each iteration (M7): once
+        # another builder lands the venv, _current_stamp queries that interpreter and matches.
+        # Check readiness BEFORE the deadline so a just-finished build returns ready, not 2.
+        if venv_current(venv_dir):
+            print("[bootstrap] Another setup just finished — engine ready.", flush=True)
+            return 0
+        if time.time() >= deadline:
+            # We gave up waiting and the venv is NOT ready. Return NON-zero (review-low: wait-deadline):
+            # a legitimately long cold source-build (igraph/leidenalg from sdist) can outlast the
+            # deadline, and returning 0 here would tell the launcher "ready" and launch the server
+            # against an unprovisioned venv. 2 = "still provisioning", distinct from a build failure (1).
+            print(
+                "[bootstrap] Another setup is still in progress past the wait deadline; "
+                "it will finish in the background. Try again shortly.",
+                flush=True,
+            )
+            return 2
+        time.sleep(POLL_SECS)
+    return None
+
+
 def provision(venv_dir: Path, *, wait_secs: float, reconcile: bool = False) -> int:
     """Ensure the venv is current. Foreground; returns a process exit code."""
-    stamp = _current_stamp(venv_dir)  # compare against the VENV interpreter's identity (review-M7)
-    if is_ready(venv_dir, stamp):
+    if venv_current(venv_dir):  # compare against the VENV interpreter's identity (review-M7)
         print(f"[bootstrap] Engine already provisioned at {venv_dir}", flush=True)
-        if reconcile:
-            maybe_reconcile(venv_dir)
-        return 0
+        return _ok_with_reconcile(venv_dir, reconcile)
 
     if sys.version_info < MIN_PY:
         sys.stderr.write(
@@ -499,37 +540,18 @@ def provision(venv_dir: Path, *, wait_secs: float, reconcile: bool = False) -> i
     # Serialize against any other provisioner (the SessionStart worker, more terminals,
     # the launcher racing the background hook).
     deadline = time.time() + max(0.0, wait_secs)
-    while not try_acquire(venv_dir):
-        # re-evaluate readiness against the VENV interpreter's identity each iteration (M7): once
-        # another builder lands the venv, _current_stamp queries that interpreter and matches.
-        if is_ready(venv_dir, _current_stamp(venv_dir)):
-            print("[bootstrap] Another setup just finished — engine ready.", flush=True)
-            if reconcile:
-                maybe_reconcile(venv_dir)
-            return 0
-        if time.time() >= deadline:
-            # We gave up waiting and the venv is NOT ready. Return NON-zero (review-low: wait-deadline):
-            # a legitimately long cold source-build (igraph/leidenalg from sdist) can outlast the
-            # deadline, and returning 0 here would tell the launcher "ready" and launch the server
-            # against an unprovisioned venv. 2 = "still provisioning", distinct from a build failure (1).
-            print(
-                "[bootstrap] Another setup is still in progress past the wait deadline; "
-                "it will finish in the background. Try again shortly.",
-                flush=True,
-            )
-            return 2
-        time.sleep(2.0)
+    waited = _wait_for_lock(venv_dir, deadline)
+    if waited == 0:
+        return _ok_with_reconcile(venv_dir, reconcile)
+    if waited == 2:
+        return 2
 
     try:
-        if is_ready(venv_dir, _current_stamp(venv_dir)):  # re-check now that we hold the lock
-            if reconcile:
-                maybe_reconcile(venv_dir)
-            return 0
-        do_install(venv_dir, stamp)
+        if venv_current(venv_dir):  # re-check now that we hold the lock
+            return _ok_with_reconcile(venv_dir, reconcile)
+        do_install(venv_dir)
         print("[bootstrap] Done.", flush=True)
-        if reconcile:
-            maybe_reconcile(venv_dir)
-        return 0
+        return _ok_with_reconcile(venv_dir, reconcile)
     except subprocess.CalledProcessError as exc:
         # A failed pip/uv/venv command: in the foreground catch-up path (the launcher
         # racing the background build) show a clean, actionable line instead of a raw
@@ -629,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         # Freshness probe for the launcher: silent on stdout (it shares stdout with the
         # JSON-RPC channel), exit code carries the answer. 0 == ready & current.
-        return 0 if is_ready(venv_dir, _current_stamp(venv_dir)) else 1
+        return 0 if venv_current(venv_dir) else 1
 
     print(
         f"[bootstrap] System Python: {sys.version.split()[0]} ({sys.executable})",

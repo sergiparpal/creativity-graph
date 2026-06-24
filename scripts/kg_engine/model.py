@@ -74,6 +74,10 @@ GROUNDABLE_STATES = VERDICT_STATES | {EpistemicState.OBSOLETE}
 # Negative information that the projector must never prune (§1.7).
 FAILURE_STATES = {EpistemicState.REJECTED, EpistemicState.FAILED}
 UNDECLARED_TYPE = "undeclared-type"
+# The three shared provenance axes that must be unwrapped from Enum to str on egress (§1.3). Stated
+# once so Edge.to_dict and Node.frontmatter cannot drift; a raw Enum leak here would break the
+# projector's json.dumps(frontmatter) content hash. Edge adds `confidence` on top of these.
+_AXIS_FIELDS = ("provenance", "authored_by", "epistemic_state")
 
 
 def coerce_enum(cls, value, default):
@@ -86,6 +90,16 @@ def coerce_enum(cls, value, default):
         return cls(value)
     except ValueError:
         return default
+
+
+def coerce_axes(obj, *, provenance_default: "Provenance") -> None:
+    """Coerce the three provenance axes on `obj` in place, with the fixed safe defaults shared by
+    Edge/Node: authored_by → AGENT and epistemic_state → UNVERIFIED (the never-forge-a-verdict net —
+    a malformed verdict is demoted, never invented), and the caller-supplied provenance default (the
+    only axis whose default differs between Edge and Node)."""
+    obj.provenance = coerce_enum(Provenance, obj.provenance, provenance_default)
+    obj.authored_by = coerce_enum(AuthoredBy, obj.authored_by, AuthoredBy.AGENT)
+    obj.epistemic_state = coerce_enum(EpistemicState, obj.epistemic_state, EpistemicState.UNVERIFIED)
 
 
 def utcnow() -> str:
@@ -119,16 +133,23 @@ def normalize_text(s: str) -> str:
     return _WS.sub(" ", s).strip().casefold()
 
 
+def span_present_in(span: str, normalized_text: str) -> bool:
+    """Core span-present test (§1.5): normalized `span` is a substring of ALREADY-normalized
+    `normalized_text`. Guards on the normalized span — a Cf-only span normalizes to '' and must fail
+    closed, not match every string (mirror in sources.verifies)."""
+    ns = normalize_text(span)
+    if not ns:
+        return False
+    return ns in normalized_text
+
+
 def span_verifies(span: str, source_text: str) -> bool:
     """True iff `span` appears (normalized substring) in `source_text`. The span-present check (§1.5)."""
     # Guard on the NORMALIZED span, not the raw one: a span of only zero-width / format (Cf) characters
     # survives `str.strip()` (it is non-whitespace) but normalize_text() drops all Cf, leaving '' — and
     # '' is a substring of every string, so the raw guard would fail OPEN. Mirror sources.verifies (the
     # production sibling) which already guards on the normalized form (review-low: span_verifies Cf-only).
-    ns = normalize_text(span)
-    if not ns:
-        return False
-    return ns in normalize_text(source_text)
+    return span_present_in(span, normalize_text(source_text))
 
 
 def slug(s: str) -> str:
@@ -175,9 +196,7 @@ class Edge:
         # tolerate a typo'd/unknown enum string in a hand-edited note: coerce to a safe default rather
         # than raise (a single bad field must not make the whole node vanish from every read, §1.2).
         # UNVERIFIED is the safe epistemic default — it demotes a malformed verdict, never invents one.
-        self.provenance = coerce_enum(Provenance, self.provenance, Provenance.INFERRED)
-        self.authored_by = coerce_enum(AuthoredBy, self.authored_by, AuthoredBy.AGENT)
-        self.epistemic_state = coerce_enum(EpistemicState, self.epistemic_state, EpistemicState.UNVERIFIED)
+        coerce_axes(self, provenance_default=Provenance.INFERRED)
         self.confidence = coerce_enum(Confidence, self.confidence, Confidence.INFERRED)
         # endpoints/relation may arrive as non-str from YAML; the id is a deterministic function of
         # them (single-canonical-edge rule). Always recompute so a stored/forged id can never diverge
@@ -191,7 +210,7 @@ class Edge:
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        for k in ("provenance", "authored_by", "epistemic_state", "confidence"):
+        for k in _AXIS_FIELDS + ("confidence",):
             d[k] = d[k].value if isinstance(d[k], Enum) else d[k]
         return d
 
@@ -220,9 +239,7 @@ class Node:
     edges: list[Edge] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.provenance = coerce_enum(Provenance, self.provenance, Provenance.SPAN_PRESENT)
-        self.authored_by = coerce_enum(AuthoredBy, self.authored_by, AuthoredBy.AGENT)
-        self.epistemic_state = coerce_enum(EpistemicState, self.epistemic_state, EpistemicState.UNVERIFIED)
+        coerce_axes(self, provenance_default=Provenance.SPAN_PRESENT)
         # YAML may coerce id/label/timestamps to non-str (numbers, booleans, datetime). Coerce to str
         # so frontmatter() stays JSON-serializable (the projector hashes json.dumps(frontmatter)) and a
         # falsy-but-present label (0 / false) is not mistaken for "missing" and overwritten by the id.
@@ -234,14 +251,15 @@ class Node:
         self.edges = [e if isinstance(e, Edge) else Edge.from_dict(e, source=self.id) for e in self.edges]
 
     def frontmatter(self) -> dict[str, Any]:
+        # Explicit ordered dict — key order is load-bearing for byte-identical canon (clean git diffs,
+        # canonmerge). The three axis cells are built from _AXIS_FIELDS (stated once with Edge.to_dict)
+        # but spliced here in their fixed position so the order is unchanged.
         return {
             "id": self.id,
             "label": self.label,
             "node_type": self.node_type,
             "file_type": self.file_type,
-            "provenance": self.provenance.value,
-            "authored_by": self.authored_by.value,
-            "epistemic_state": self.epistemic_state.value,
+            **{k: getattr(self, k).value for k in _AXIS_FIELDS},
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "edges": [e.to_dict() for e in self.edges],
@@ -270,16 +288,14 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     # edges (§1.7) — out of every read.
     edges = [Edge.from_dict(e, source=fm.get("id", fallback_id))
              for e in (fm.get("edges") or []) if isinstance(e, dict)]
-    return Node(
-        id=fm.get("id") or fallback_id or slug(fm.get("label", "node")),
-        label=fm.get("label", ""),
-        node_type=fm.get("node_type", UNDECLARED_TYPE),
-        file_type=fm.get("file_type", "prose"),
-        provenance=fm.get("provenance", Provenance.SPAN_PRESENT.value),
-        authored_by=fm.get("authored_by", AuthoredBy.AGENT.value),
-        epistemic_state=fm.get("epistemic_state", EpistemicState.UNVERIFIED.value),
-        created_at=fm.get("created_at", ""),
-        updated_at=fm.get("updated_at", ""),
-        body=body,
-        edges=edges,
-    )
+    # Mirror Edge.from_dict: filter to known Node fields and drop None values so each absent/None key
+    # falls through to the dataclass field default + __post_init__ coercion — the single source of every
+    # static default (incl. "prose", and the enum defaults via coerce_axes). Then inject the two values
+    # that are NOT plain field defaults: the resolved `id` (fm id > fallback_id > slug(label) precedence)
+    # and the pre-parsed `edges` (with the malformed-entry skipping above), plus the parsed body.
+    known = {f for f in Node.__dataclass_fields__}
+    fields = {k: v for k, v in fm.items() if k in known and v is not None}
+    fields["id"] = fm.get("id") or fallback_id or slug(fm.get("label", "node"))
+    fields["body"] = body
+    fields["edges"] = edges
+    return Node(**fields)

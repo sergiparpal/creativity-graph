@@ -2,11 +2,16 @@
 
 A canon note is YAML frontmatter (the three axes + an ``edges:`` block) plus free body text. When two
 branches/machines edit the *same* node, a line-based merge mangles the `edges:` list and — worse — can
-silently keep one side's grounding verdict. This driver is the **out-of-process mirror** of
-``Canon._merge_into_existing`` (canon.py): it unions edges by the deterministic ``edge_id``
-(model.edge_id) and, for an edge present on both sides at a **different** ``epistemic_state``, resolves
-the merged edge to ``unverified`` — never to either side's verdict, with ``verdict_by``/``verdict_at``
-cleared (the same demotion the reconciler applies to an out-of-band verdict change, §1.8).
+silently keep one side's grounding verdict. This driver mirrors the **edge-union + cross-branch-verdict-
+demote intent** of ``Canon._merge_into_existing`` (canon.py) — NOT its exact resolution logic: it unions
+edges by the deterministic ``edge_id`` (model.edge_id) and, for an edge present on both sides at a
+**different** ``epistemic_state``, resolves the merged edge to ``unverified`` — never to either side's
+verdict, with ``verdict_by``/``verdict_at`` cleared (the same demotion the reconciler applies to an
+out-of-band verdict change, §1.8). The git driver's edge rule is **symmetric** (any disagreement demotes),
+whereas ``_merge_into_existing`` is asymmetric incoming-wins with a re-promote special-case — each is safe
+only in its own context. This driver ADDS beyond ``_merge_into_existing``: a node-level demote-on-
+disagreement and a scalar-frontmatter 3-way. The in-process path instead polices a forged node verdict
+later, in the reconciler's audit-aware sweep (§1.8), not at merge time.
 
 It is **structurally incapable of forging a verdict**: the only ``epistemic_state`` it can ever *write*
 on a conflict is ``unverified``. A grounding verdict that survives a clean (non-conflicting) merge has
@@ -37,6 +42,9 @@ __all__ = ["merge_nodes", "merge_note_files", "main"]
 # divergence, like an edge verdict — never-forge-a-verdict, invariant 3); the immutable id is never merged.
 _SCALAR_FIELDS = ("label", "node_type", "file_type")
 
+# git merge-file returns -1 (255) on internal error; a positive return is the conflict-hunk count.
+_GIT_MERGE_INTERNAL_ERROR = 255
+
 
 # --------------------------------------------------------------------------- parse helpers
 
@@ -66,11 +74,26 @@ def _load(path: str | Path) -> Node | None:
     return _parse(_read(path))
 
 
+def _eprint(msg: str) -> None:
+    """Best-effort stderr logger shared by the file-level merge and the driver entrypoint."""
+    try:
+        sys.stderr.write(msg + "\n")
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------- semantic node merge
 
 
+def _demotion_note(subject: str, from_state: EpistemicState, to_state: EpistemicState) -> str:
+    """The human-readable note for a verdict demotion, shared by the edge and node branches."""
+    return f"{subject}: {from_state.value}/{to_state.value} -> unverified"
+
+
 def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list[str]]:
-    """3-way merge two parsed canon nodes — the out-of-process mirror of Canon._merge_into_existing.
+    """3-way merge two parsed canon nodes — mirrors the edge-union + cross-branch-verdict-demote INTENT
+    of Canon._merge_into_existing (not its exact resolution: this edge rule is symmetric, the in-process
+    one is asymmetric incoming-wins with a re-promote case).
 
     - **Edges:** union by the deterministic ``edge_id`` (never lose an edge a side added, mirroring the
       single-canonical-edge rule + never-prune-failure-memory §1.7). An edge on both sides at the SAME
@@ -78,7 +101,9 @@ def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list
       ``verdict_by``/``verdict_at`` cleared — never resolving to either verdict (never-forge-a-verdict).
     - **Scalar frontmatter** (label/type): base-aware 3-way, keeping ours on a true divergence.
     - **Node ``epistemic_state``:** demoted to ``unverified`` when the two sides disagree (forge-proof,
-      same rule as an edge verdict); ``base`` is consulted only for the scalar 3-way.
+      same intent as the edge rule); ``base`` is consulted only for the scalar 3-way. This node-level
+      demote is ADDED here beyond ``_merge_into_existing`` (which leaves node verdicts to the reconciler's
+      audit-aware sweep, §1.8).
 
     Returns ``(merged_node, demotions)`` where ``demotions`` lists the auto-demotions (informational — a
     verdict demotion is a CLEAN resolution, not a merge conflict, so it never sets the exit code)."""
@@ -96,27 +121,26 @@ def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list
             demoted.verdict_by = None
             demoted.verdict_at = None
             by_id[e.id] = demoted
-            demotions.append(
-                f"{e.id}: {existing.epistemic_state.value}/{e.epistemic_state.value} -> unverified")
+            demotions.append(_demotion_note(e.id, existing.epistemic_state, e.epistemic_state))
         # else: equal verdict on both sides -> keep ours (already in by_id)
     merged.edges = list(by_id.values())
 
     # scalar frontmatter: base-aware 3-way, keep ours on divergence
-    for fld in _SCALAR_FIELDS:
-        ov, tv = getattr(ours, fld), getattr(theirs, fld)
-        if ov == tv:
+    for field in _SCALAR_FIELDS:
+        ours_val, theirs_val = getattr(ours, field), getattr(theirs, field)
+        if ours_val == theirs_val:
             continue
-        bv = getattr(base, fld) if base is not None else None
-        if bv is not None and ov == bv:
-            setattr(merged, fld, tv)  # only theirs changed it
+        base_val = getattr(base, field) if base is not None else None
+        if base_val is not None and ours_val == base_val:
+            setattr(merged, field, theirs_val)  # only theirs changed it
         # else: only ours changed, or both diverged / no base -> keep ours (minor field, no hard conflict)
 
-    # node-level epistemic_state: demote on disagreement (forge-proof, mirrors the edge rule)
+    # node-level epistemic_state: demote on disagreement (forge-proof, same intent as the edge rule).
+    # Node carries no verdict_by/verdict_at (those live only on Edge), so there is nothing extra to clear.
     if ours.epistemic_state != theirs.epistemic_state:
         if merged.epistemic_state != EpistemicState.UNVERIFIED:
             demotions.append(
-                f"node:{merged.id}: {ours.epistemic_state.value}/{theirs.epistemic_state.value}"
-                " -> unverified")
+                _demotion_note(f"node:{merged.id}", ours.epistemic_state, theirs.epistemic_state))
         merged.epistemic_state = EpistemicState.UNVERIFIED
 
     return merged, demotions
@@ -128,11 +152,12 @@ def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list
 def _manual_conflict(ours_text: str, theirs_text: str) -> tuple[str, list[str], bool]:
     """Fallback when ``git merge-file`` is unavailable (git off PATH): emit standard whole-file conflict
     markers so the divergence is surfaced honestly rather than silently dropping a side."""
+    def _nl(s: str) -> str:
+        """Ensure a trailing newline so each conflict marker starts on its own line."""
+        return s if s.endswith("\n") else s + "\n"
     merged = (
-        "<<<<<<< ours\n" + ours_text
-        + ("\n" if not ours_text.endswith("\n") else "")
-        + "=======\n" + theirs_text
-        + ("\n" if not theirs_text.endswith("\n") else "")
+        "<<<<<<< ours\n" + _nl(ours_text)
+        + "=======\n" + _nl(theirs_text)
         + ">>>>>>> theirs\n"
     )
     return merged, ["git merge-file unavailable: whole-file conflict"], False
@@ -159,7 +184,7 @@ def _git_merge_file(base_text: str, ours_text: str, theirs_text: str) -> tuple[s
     # git merge-file: 0 == clean; a positive count == that many conflict hunks; 255 (-1) == internal error.
     if r.returncode == 0:
         return r.stdout, [], True
-    if 0 < r.returncode < 255:
+    if 0 < r.returncode < _GIT_MERGE_INTERNAL_ERROR:
         return r.stdout, [f"{r.returncode} conflict hunk(s)"], False
     return _manual_conflict(ours_text, theirs_text)
 
@@ -204,13 +229,6 @@ def merge_note_files(base_text: str, ours_text: str, theirs_text: str) -> tuple[
 
 
 # --------------------------------------------------------------------------- driver entrypoint
-
-
-def _eprint(msg: str) -> None:
-    try:
-        sys.stderr.write(msg + "\n")
-    except OSError:
-        pass
 
 
 def _write_atomic(path: Path, text: str) -> None:

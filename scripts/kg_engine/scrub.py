@@ -10,12 +10,22 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+# The single declared set of valid redaction categories. Every category label used in SENSITIVITY,
+# _PATTERNS, and the placeholder() allocator must be a member; the import-time asserts below trip on a
+# typo (e.g. "CRED_URL") so a mistyped/orphaned category fails LOUDLY instead of silently disabling
+# scrubbing for that category at some sensitivity tier (the worst failure mode for a safety gate).
+ALL_CATEGORIES = frozenset({
+    "SECRET", "EMAIL", "PHONE", "SSN", "CC", "IP", "CREDURL", "PERSON", "ADDRESS",
+})
+
 # sensitivity tiers -> which categories are scrubbed. Secrets are ALWAYS scrubbed.
 SENSITIVITY = {
     "low": {"SECRET"},
     "medium": {"SECRET", "EMAIL", "PHONE", "SSN", "CC", "IP", "CREDURL"},
     "high": {"SECRET", "EMAIL", "PHONE", "SSN", "CC", "IP", "CREDURL", "PERSON", "ADDRESS"},
 }
+assert all(s <= ALL_CATEGORIES for s in SENSITIVITY.values()), \
+    "SENSITIVITY tier names a category outside ALL_CATEGORIES"
 
 # A small lexicon of common given names. The bare PERSON bigram rule fires only when the first token
 # is a recognized given name (or a courtesy title precedes it / a caller supplies extra_terms), so a
@@ -117,6 +127,9 @@ _BARE_PERSON_RE = _PATTERNS[-2][1]
 assert _BARE_PERSON_RE.pattern == r"\b([A-Z][a-z]+)(\s+)([A-Z][a-z]+)\b", \
     "PERSON rule order changed — re-bind _BARE_PERSON_RE to the bare Title-Case bigram pattern"
 
+assert {cat for cat, _ in _PATTERNS} <= ALL_CATEGORIES, \
+    "_PATTERNS names a category outside ALL_CATEGORIES"
+
 _PLACEHOLDER_RE = re.compile(r"⟦([A-Z]+):(\d+)⟧")
 
 
@@ -153,6 +166,35 @@ class Scrubber:
     def _active(self) -> set[str]:
         return SENSITIVITY.get(self.sensitivity, SENSITIVITY["medium"])
 
+    def _scrub_bare_person(self, out: str, alloc) -> str:
+        """Redact bare Title-Case bigrams that look like personal names, rewriting `out` (scrub-4).
+
+        Only redact a bigram whose first token is a known given name; leave concept bigrams
+        untouched. F6: re.sub() scans non-overlapping, so sparing a non-name FIRST token
+        ("Researcher Alan", "Yesterday Michael") would skip past the real name that begins inside the
+        spared span. Iterate manually and, on a spared non-name bigram, resume at the SECOND token's
+        start (m.start(3)) so "Alan Turing"/"Michael Smith" is still re-tested. `alloc` is the shared
+        placeholder allocator from scrub() so placeholder consistency spans every redaction path.
+        """
+        pat = _BARE_PERSON_RE
+        pieces: list[str] = []
+        pos = 0
+        while True:
+            m = pat.search(out, pos)
+            if m is None:
+                pieces.append(out[pos:])
+                break
+            if _is_personal_name(m.group(0)):
+                pieces.append(out[pos:m.start()])
+                pieces.append(alloc("PERSON", m.group(0)))
+                pos = m.end()
+            else:
+                # keep the non-name first token + gap verbatim; rescan from the second token.
+                resume_at = m.start(3)
+                pieces.append(out[pos:resume_at])
+                pos = resume_at
+        return "".join(pieces)
+
     def scrub(self, text: str) -> tuple[str, dict[str, str]]:
         """Return (scrubbed_text, mapping) where mapping is the placeholder -> original value pairs
         NEWLY created in this call (the instance accumulates the full map across calls)."""
@@ -185,6 +227,10 @@ class Scrubber:
             new_mapping[ph] = value
             return ph
 
+        def sub_with(cat: str, pattern: re.Pattern, s: str) -> str:
+            """Replace every whole match of `pattern` in `s` with a placeholder for category `cat`."""
+            return pattern.sub(lambda m: placeholder(cat, m.group(0)), s)
+
         out = text
         # caller-supplied literal terms first (e.g. a names list for this corpus). These are an EXPLICIT
         # redaction request, so honor them at EVERY tier — a lower sensitivity must not silently drop a
@@ -192,37 +238,15 @@ class Scrubber:
         # Patterns are precompiled once in __post_init__ (longest-first, same category order); this loop
         # only runs .sub() so nothing is recompiled per call (perf-#21).
         for cat, pat in self._extra_term_pats:
-            out = pat.sub(lambda m, c=cat: placeholder(c, m.group(0)), out)
+            out = sub_with(cat, pat, out)
 
         for cat, pat in _PATTERNS:
             if cat not in active:
                 continue
             if pat is _BARE_PERSON_RE:
-                # scrub-4: only redact a bare Title-Case bigram that looks like an actual personal
-                # name (first token in the given-name lexicon); leave concept bigrams untouched.
-                # F6: re.sub() scans non-overlapping, so sparing a non-name FIRST token ("Researcher
-                # Alan", "Yesterday Michael") would skip past the real name that begins inside the
-                # spared span. Iterate manually and, on a spared non-name bigram, resume at the SECOND
-                # token's start (m.start(3)) so "Alan Turing"/"Michael Smith" is still re-tested.
-                pieces: list[str] = []
-                pos = 0
-                while True:
-                    m = pat.search(out, pos)
-                    if m is None:
-                        pieces.append(out[pos:])
-                        break
-                    if _is_personal_name(m.group(0)):
-                        pieces.append(out[pos:m.start()])
-                        pieces.append(placeholder("PERSON", m.group(0)))
-                        pos = m.end()
-                    else:
-                        # keep the non-name first token + gap verbatim; rescan from the second token.
-                        second = m.start(3)
-                        pieces.append(out[pos:second])
-                        pos = second
-                out = "".join(pieces)
+                out = self._scrub_bare_person(out, placeholder)
             else:
-                out = pat.sub(lambda m, c=cat: placeholder(c, m.group(0)), out)
+                out = sub_with(cat, pat, out)
         return out, new_mapping
 
     @staticmethod

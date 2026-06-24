@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
@@ -20,7 +21,8 @@ from typing import TYPE_CHECKING, Callable
 
 import networkx as nx
 
-from .canon import Canon, _atomic_write
+from .atomicio import atomic_write_text as _atomic_write
+from .canon import Canon
 from .harness import _node_specificity, idf_seeds
 from .harness import specificity as _specificity_gate
 from .model import EpistemicState, FAILURE_STATES, Provenance
@@ -35,6 +37,28 @@ INDEX_DB = "index.sqlite"
 # an index.sqlite built before them lacks the columns, so a projection that finds them missing forces
 # a full rebuild (CREATE TABLE IF NOT EXISTS cannot add a column to an existing table).
 _NEW_NODE_COLUMNS = {"betweenness", "spec_betweenness", "specificity", "gate_on"}
+# The `nodes` table column order, in DDL order — the single source of truth for the positional
+# persistence contract. `_NODES_DDL`, the INSERT placeholder string, `_node_row`, and the
+# incremental rank-refresh all derive from this tuple, so a column add/reorder is one edit here
+# (no hand-counted bare indices). `(name, sql_type)` per column.
+_NODE_COLUMNS = (
+    ("id", "TEXT PRIMARY KEY"), ("label", "TEXT"), ("node_type", "TEXT"), ("file_type", "TEXT"),
+    ("provenance", "TEXT"), ("authored_by", "TEXT"), ("epistemic_state", "TEXT"),
+    ("degree", "INTEGER"), ("community", "INTEGER"), ("bridge_communities", "INTEGER"),
+    ("structural_bridge", "INTEGER"), ("betweenness", "REAL"), ("spec_betweenness", "REAL"),
+    ("specificity", "REAL"), ("gate_on", "INTEGER"),
+)
+_NODE_COLUMN_NAMES = tuple(name for name, _ in _NODE_COLUMNS)
+# The subset of node columns the incremental pass diffs + refreshes for an unchanged node when a
+# GLOBAL rank moves. structural_bridge is deliberately EXCLUDED from the diff: it is a pure function
+# of bridge_communities (1 iff bridge_communities >= 2), which IS in this subset, so a structural_bridge
+# change can never occur without a bridge_communities change already triggering the refresh.
+_RANK_DIFF_COLUMNS = ("degree", "community", "bridge_communities",
+                      "betweenness", "spec_betweenness", "specificity", "gate_on")
+# The columns the rank-refresh UPDATE writes — _RANK_DIFF_COLUMNS plus structural_bridge (written
+# from its derived value, just never used to decide WHETHER to write).
+_RANK_UPDATE_COLUMNS = ("degree", "community", "bridge_communities", "structural_bridge",
+                        "betweenness", "spec_betweenness", "specificity", "gate_on")
 # Hard ceiling on the kg_context token budget so a client passing a huge value can't make the engine
 # serialize the entire edge table into one response (server-4). The limit clamp on query_graph is the
 # row-count analogue.
@@ -52,6 +76,23 @@ def _like_escape(term: str) -> str:
     """Escape SQL LIKE wildcards so a query term like `span_present` or `100%` matches literally
     (the matching clauses use `ESCAPE '\\'`)."""
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# The gate-aware bridge ranking — ONE source of truth shared by kg_context (a SQL ORDER BY) and
+# kg_agenda (a Python sort key). When the specificity gate earned promotion this projection, rank by
+# the confound-corrected spec_betweenness; otherwise fall back to the honest structural-bridge / raw-
+# betweenness / degree advisory (§1.6). The two surfaces emit different SHAPES (SQL string vs key fn),
+# so only the ordered column names + label are shared; the per-column coercion below keeps the Python
+# key numeric (SQLite types its columns natively).
+_RANK_COERCE = {"spec_betweenness": (float, 0.0), "betweenness": (float, 0.0),
+                "structural_bridge": (int, 0), "degree": (int, 0)}
+
+
+def gate_ranking(gate_on: bool) -> "tuple[str, tuple[str, ...]]":
+    """(ranked_by_label, ordered descending column names) for the bridge ranking, keyed on the gate."""
+    if gate_on:
+        return "spec_betweenness", ("spec_betweenness", "degree")
+    return "structural_bridge", ("structural_bridge", "betweenness", "degree")
 
 
 # --------------------------------------------------------------------------- node-link (version-robust)
@@ -239,9 +280,8 @@ class Projector:
             h.update(u.encode()); h.update(b"\x00"); h.update(v.encode()); h.update(b"\x00")
         return h.hexdigest()
 
-    # ---- ranks (off the hot path)
-    def _ranks(self, G: nx.DiGraph, *, prior_topo_sig: str | None = None,
-               prior_betweenness: dict | None = None) -> Ranks:
+    @staticmethod
+    def _live_subgraph(G: nx.MultiDiGraph) -> nx.Graph:
         # The advisory ranks (degree/communities/betweenness/spec_betweenness) are computed over the
         # NON-FAILED subgraph (§1.7). graph.json and the edges table stay COMPLETE — failure memory is
         # never pruned — but a `failed`/`rejected` edge must not inflate centrality: the adversarial
@@ -253,7 +293,12 @@ class Projector:
         live.add_nodes_from(G.nodes(data=True))
         live.add_edges_from((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)
                             if d.get("epistemic_state") not in _fail)
-        und = live.to_undirected()
+        return live.to_undirected()
+
+    # ---- ranks (off the hot path)
+    def _ranks(self, G: nx.DiGraph, *, prior_topo_sig: str | None = None,
+               prior_betweenness: dict | None = None) -> Ranks:
+        und = self._live_subgraph(G)
         comm = _leiden(und)
         degree = dict(und.degree())
         bridges = {}
@@ -304,8 +349,9 @@ class Projector:
             # computed on — NOT the full graph G. Passing G let the adversarial grounder's `failed`
             # counter-edges (the exact edges §1.7 excludes from centrality) flip the gate that then
             # governs ranking of a live-subgraph spec_betweenness the gate never measured (review-M2).
-            # `und` carries node attrs (incl. label) via to_undirected of `live`, so _node_specificity
-            # works. Hand the gate the already-built undirected graph + betweenness + raw seeds so it
+            # `und` carries node attrs (incl. label) via `_live_subgraph`'s to_undirected, so
+            # _node_specificity works. Hand the gate the already-built undirected graph + betweenness +
+            # raw seeds so it
             # neither rebuilds the graph nor recomputes betweenness/idf (projector-2/projector-3).
             verdict = _specificity_gate(None, corpus, precomputed_betweenness=betweenness,
                                         precomputed_seeds=raw_seeds, precomputed_undirected=und)
@@ -415,12 +461,12 @@ class Projector:
         return report
 
     # ---- sqlite
-    _NODES_DDL = (
-        "CREATE TABLE IF NOT EXISTS nodes("
-        "id TEXT PRIMARY KEY, label TEXT, node_type TEXT, file_type TEXT, "
-        "provenance TEXT, authored_by TEXT, epistemic_state TEXT, "
-        "degree INTEGER, community INTEGER, bridge_communities INTEGER, structural_bridge INTEGER, "
-        "betweenness REAL, spec_betweenness REAL, specificity REAL, gate_on INTEGER)")
+    # Both the DDL and the INSERT VALUES placeholder are generated from _NODE_COLUMNS so the column
+    # set/order lives in exactly one place (no '(?,?,…)' whose '?' count must be hand-matched to 15).
+    _NODES_DDL = ("CREATE TABLE IF NOT EXISTS nodes("
+                  + ", ".join(f"{name} {sqltype}" for name, sqltype in _NODE_COLUMNS) + ")")
+    _NODES_INSERT = ("INSERT OR REPLACE INTO nodes VALUES ("
+                     + ",".join("?" * len(_NODE_COLUMNS)) + ")")
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
@@ -468,27 +514,40 @@ class Projector:
             return True
         return not _NEW_NODE_COLUMNS <= cols
 
-    def _node_row(self, n, ranks: Ranks):
+    def _node_row(self, n, ranks: Ranks) -> dict:
+        """One node's persisted column values as a dict keyed by `_NODE_COLUMN_NAMES`, so callers read
+        row['degree']/row['structural_bridge'] instead of bare DDL-order indices. structural_bridge is a
+        pure function of bridge_communities (1 iff >= 2)."""
         bc = ranks.bridges.get(n.id, 0)
-        return (n.id, n.label, n.node_type, n.file_type, n.provenance.value, n.authored_by.value,
-                n.epistemic_state.value, ranks.degree.get(n.id, 0), ranks.community.get(n.id, -1), bc,
-                1 if bc >= 2 else 0,
-                float(ranks.betweenness.get(n.id, 0.0)), float(ranks.spec_betweenness.get(n.id, 0.0)),
-                float(ranks.specificity.get(n.id, 1.0)), int(ranks.gate_on))
+        return {
+            "id": n.id, "label": n.label, "node_type": n.node_type, "file_type": n.file_type,
+            "provenance": n.provenance.value, "authored_by": n.authored_by.value,
+            "epistemic_state": n.epistemic_state.value,
+            "degree": ranks.degree.get(n.id, 0), "community": ranks.community.get(n.id, -1),
+            "bridge_communities": bc, "structural_bridge": 1 if bc >= 2 else 0,
+            "betweenness": float(ranks.betweenness.get(n.id, 0.0)),
+            "spec_betweenness": float(ranks.spec_betweenness.get(n.id, 0.0)),
+            "specificity": float(ranks.specificity.get(n.id, 1.0)), "gate_on": int(ranks.gate_on),
+        }
+
+    @staticmethod
+    def _node_values(row: dict) -> tuple:
+        """A node row dict flattened to the positional value tuple in DDL order (`_NODES_INSERT`)."""
+        return tuple(row[name] for name in _NODE_COLUMN_NAMES)
 
     @staticmethod
     def _edge_row(e):
         return (e.id, e.source, e.target, e.relation, e.provenance.value, e.authored_by.value,
                 e.epistemic_state.value, e.span, e.source_file, e.confidence.value, e.confidence_score)
 
-    def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash="", stale=None):
+    def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash, stale):
         con = self._connect()
         try:
             con.execute("DELETE FROM nodes")
             con.execute("DELETE FROM edges")
             con.executemany(
-                "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [self._node_row(n, ranks) for n in nodes])
+                self._NODES_INSERT,
+                [self._node_values(self._node_row(n, ranks)) for n in nodes])
             erows = [self._edge_row(e) for n in nodes for e in n.edges]
             con.executemany("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", erows)
             report.touched_nodes = [n.id for n in nodes]
@@ -499,7 +558,7 @@ class Projector:
             con.close()
 
     def _write_incremental(self, nodes, changed, removed, ranks: Ranks, head, hashes, report,
-                           source_hash="", stale=None):
+                           source_hash, stale):
         con = self._connect()
         try:
             changed_ids = {c.id for c in changed}  # hoisted out of the per-node loop below
@@ -508,8 +567,7 @@ class Projector:
                 con.execute("DELETE FROM nodes WHERE id=?", (nid,))
                 con.execute("DELETE FROM edges WHERE source=?", (nid,))
             for n in changed:
-                con.execute("INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            self._node_row(n, ranks))
+                con.execute(self._NODES_INSERT, self._node_values(self._node_row(n, ranks)))
                 report.touched_nodes.append(n.id)
                 # diff this node's edges against the DB; upsert only changed rows, delete vanished
                 cur = {r[0]: r for r in con.execute(
@@ -529,20 +587,21 @@ class Projector:
             # they are diffed and refreshed here too, not just degree/community/bridge. Read every node's
             # prior rank tuple in ONE query instead of a SELECT per node (projector-N+1: the old per-node
             # `SELECT ... WHERE id=?` inside this loop was O(N) round-trips on every incremental reproject).
-            prior_ranks = {r[0]: r[1:] for r in con.execute(
-                "SELECT id,degree,community,bridge_communities,betweenness,spec_betweenness,specificity,"
-                "gate_on FROM nodes")}
+            # _RANK_DIFF_COLUMNS is the diff key; structural_bridge is left OUT of the diff because it is a
+            # pure function of bridge_communities (which IS in the diff), so it can never move on its own.
+            select_sql = ("SELECT id," + ",".join(_RANK_DIFF_COLUMNS) + " FROM nodes")
+            update_sql = ("UPDATE nodes SET "
+                          + ",".join(f"{c}=?" for c in _RANK_UPDATE_COLUMNS) + " WHERE id=?")
+            prior_ranks = {r[0]: r[1:] for r in con.execute(select_sql)}
             for n in nodes:
                 if n.id in changed_ids:
                     continue
                 row = self._node_row(n, ranks)
                 old = prior_ranks.get(n.id)
-                new_vals = (row[7], row[8], row[9], row[11], row[12], row[13], row[14])
+                new_vals = tuple(row[c] for c in _RANK_DIFF_COLUMNS)
                 if old != new_vals:
-                    con.execute("UPDATE nodes SET degree=?,community=?,bridge_communities=?,"
-                                "structural_bridge=?,betweenness=?,spec_betweenness=?,specificity=?,"
-                                "gate_on=? WHERE id=?",
-                                (row[7], row[8], row[9], row[10], row[11], row[12], row[13], row[14], n.id))
+                    con.execute(update_sql,
+                                tuple(row[c] for c in _RANK_UPDATE_COLUMNS) + (n.id,))
             self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig)
             con.commit()
         finally:
@@ -571,6 +630,20 @@ class Projector:
         payload = sources.concat if sources is not None else self._src_text()
         return hashlib.sha256(payload.encode()).hexdigest() if payload else ""
 
+    @staticmethod
+    def _is_stale_edge(e, sources) -> bool:
+        """The R3 staleness predicate: a grounded/failed span-present edge whose stored span no longer
+        verifies against its OWN source_file. The single source of truth for both the full scan and the
+        incremental refilter, so the two can never disagree about which edges are stale."""
+        return (e.epistemic_state in (EpistemicState.GROUNDED, EpistemicState.FAILED)
+                and e.provenance == Provenance.SPAN_PRESENT
+                and not sources.verifies(e.span, source_file=e.source_file))
+
+    @staticmethod
+    def _stale_entry(e) -> dict:
+        """The advisory record for a stale edge — one shape for both the full scan and the refilter."""
+        return {"edge_id": e.id, "reason": "span-no-longer-in-source"}
+
     def _stale_verdicts(self, nodes, sources) -> list[dict]:
         """R3 — the source-staleness advisory (READ-ONLY). A grounded/failed span-present edge's stored
         span was verified at verdict time; if the source is later edited so it no longer appears, re-flag
@@ -580,14 +653,8 @@ class Projector:
         kg_ground decision). Empty when no source is configured (no divergence without a source)."""
         if not sources:
             return []
-        out = []
-        for n in nodes:
-            for e in n.edges:
-                if (e.epistemic_state in (EpistemicState.GROUNDED, EpistemicState.FAILED)
-                        and e.provenance == Provenance.SPAN_PRESENT
-                        and not sources.verifies(e.span, source_file=e.source_file)):
-                    out.append({"edge_id": e.id, "reason": "span-no-longer-in-source"})
-        return out
+        return [self._stale_entry(e) for n in nodes for e in n.edges
+                if self._is_stale_edge(e, sources)]
 
     def _refilter_stale(self, prior, nodes, sources) -> list[dict]:
         """Re-verify ONLY the already-flagged edges against the current canon+source (the full re-scan is
@@ -598,15 +665,9 @@ class Projector:
         if not prior or not sources:
             return []
         edges = {e.id: e for n in nodes for e in n.edges}
-        out = []
-        for entry in prior:
-            e = edges.get(entry.get("edge_id"))
-            if (e is not None
-                    and e.epistemic_state in (EpistemicState.GROUNDED, EpistemicState.FAILED)
-                    and e.provenance == Provenance.SPAN_PRESENT
-                    and not sources.verifies(e.span, source_file=e.source_file)):
-                out.append({"edge_id": e.id, "reason": "span-no-longer-in-source"})
-        return out
+        return [self._stale_entry(e) for entry in prior
+                if (e := edges.get(entry.get("edge_id"))) is not None
+                and self._is_stale_edge(e, sources)]
 
     def _save_meta(self, con, head, hashes, gate_on=0, source_hash="", stale_verdicts=None, topo_sig=""):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('built_from_commit', ?)", (head,))
@@ -828,6 +889,61 @@ class Projector:
                 q.append(path + [nb])
         return None
 
+    @staticmethod
+    def _query_term_clause(query: str | None) -> "tuple[str, list]":
+        """Build the term-wise OR LIKE clause + its args for a natural-language query (empty when no
+        query). A question matches edges that contain ANY of its >=3-char terms in any field; a single
+        LIKE on the whole string would only match a verbatim substring, so multi-word queries always
+        missed. Built once and reused for both the grounded and hypothesis lanes."""
+        if not query:
+            return "", []
+        seen: set = set()
+        terms = [t for t in re.findall(r"[A-Za-z0-9_-]{3,}", query.lower())
+                 if not (t in seen or seen.add(t))]
+        clause = ("(source LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' "
+                  "OR relation LIKE ? ESCAPE '\\' OR span LIKE ? ESCAPE '\\')")
+        if terms:
+            term_args: list = []
+            parts = []
+            for t in terms:
+                parts.append(clause)
+                term_args += [f"%{_like_escape(t)}%"] * 4
+            return "(" + " OR ".join(parts) + ")", term_args
+        return clause, [f"%{_like_escape(query)}%"] * 4
+
+    @staticmethod
+    def _read_stale_advisory(con) -> "tuple[list, int]":
+        """The R3 source-staleness advisory list (capped) + its true total. Grounded/failed span-present
+        edges whose span no longer appears in the source (read-only; the verdict stays untouched until
+        /kg-ground re-runs). Capped at `_STALE_VERDICTS_CAP` so it can't bypass the token budget; the
+        true total is surfaced separately so truncation stays visible (review-low: stale_verdicts uncapped)."""
+        srow = con.execute("SELECT value FROM meta WHERE key='stale_verdicts'").fetchone()
+        try:
+            stale_verdicts = json.loads(srow[0]) if srow and srow[0] else []
+        except (ValueError, TypeError):
+            stale_verdicts = []
+        return stale_verdicts[:_STALE_VERDICTS_CAP], len(stale_verdicts)
+
+    @staticmethod
+    def _bridge_metric_block(con) -> dict:
+        """The completed bridge metric (PLAN Stage 2): read the gate verdict for this projection and rank
+        the top nodes gate-aware (gate_ranking) — spec_betweenness (the confound-corrected metric) when the
+        gate is ON, else the honest structural-bridge / betweenness / degree advisory. Both raw and weighted
+        values are always carried so a reader can see the correction. Reads precomputed columns only."""
+        grow = con.execute("SELECT value FROM meta WHERE key='gate_on'").fetchone()
+        gate_on = int(grow[0]) if grow and grow[0] is not None and str(grow[0]).isdigit() else 0
+        ranked_by, rank_cols = gate_ranking(gate_on)
+        bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes ORDER BY "
+                  + ", ".join(f"{c} DESC" for c in rank_cols) + " LIMIT 10")
+        return {
+            "gate_on": gate_on,
+            "ranked_by": ranked_by,
+            "note": ("specificity-weighting earned promotion this projection — spec_betweenness is "
+                     "the trusted bridge signal" if gate_on else
+                     "gated: spec_betweenness stays advisory; ranking by structural-bridge/degree (§1.6)"),
+            "nodes": [dict(r) for r in con.execute(bm_sql)],
+        }
+
     def kg_context(self, query: str | None = None, *, budget: int = 2000) -> dict:
         """Grounding-aware, provenance-carrying, token-budgeted context. Reads precomputed columns
         only — no centrality is computed here (it is O(1) on the index)."""
@@ -847,26 +963,7 @@ class Projector:
                      "confidence_score DESC")
             cols = ("id,source,target,relation,provenance,authored_by,epistemic_state,span,"
                     "confidence,confidence_score")
-            # term-wise OR match: a natural-language question matches edges that contain ANY of its terms
-            # in any field. A single LIKE on the whole string would only match a verbatim substring of
-            # the question, so multi-word queries always missed. Built ONCE and reused for both lanes.
-            term_clause, term_args = "", []
-            if query:
-                import re as _re
-                seen: set = set()
-                terms = [t for t in _re.findall(r"[A-Za-z0-9_-]{3,}", query.lower())
-                         if not (t in seen or seen.add(t))]
-                _clause = ("(source LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\' "
-                           "OR relation LIKE ? ESCAPE '\\' OR span LIKE ? ESCAPE '\\')")
-                if terms:
-                    parts = []
-                    for t in terms:
-                        parts.append(_clause)
-                        term_args += [f"%{_like_escape(t)}%"] * 4
-                    term_clause = "(" + " OR ".join(parts) + ")"
-                else:
-                    term_clause = _clause
-                    term_args = [f"%{_like_escape(query)}%"] * 4
+            term_clause, term_args = self._query_term_clause(query)
 
             def _fill(where_sql, args, order_sql, cap):
                 rows, used = [], 0
@@ -900,39 +997,8 @@ class Projector:
             bridges = [dict(r) for r in con.execute(
                 "SELECT id,label,degree,bridge_communities FROM nodes WHERE structural_bridge=1 "
                 "ORDER BY degree DESC LIMIT 10")]
-            # the completed bridge metric (PLAN Stage 2): when the gate is ON, the trusted ranking signal
-            # is spec_betweenness (the confound-corrected bridge metric); when OFF, fall back to the
-            # honest structural-bridge / degree advisory. Both raw and weighted values are always carried
-            # so a reader can see the correction. Read precomputed columns only — no centrality here.
-            grow = con.execute("SELECT value FROM meta WHERE key='gate_on'").fetchone()
-            gate_on = int(grow[0]) if grow and grow[0] is not None and str(grow[0]).isdigit() else 0
-            # R3 source-staleness advisory: grounded/failed span-present edges whose span no longer
-            # appears in the source (read-only; the verdict itself is untouched until /kg-ground re-runs).
-            srow = con.execute("SELECT value FROM meta WHERE key='stale_verdicts'").fetchone()
-            try:
-                stale_verdicts = json.loads(srow[0]) if srow and srow[0] else []
-            except (ValueError, TypeError):
-                stale_verdicts = []
-            # cap the advisory list so it can't bypass the token budget and bloat the payload unbounded
-            # (review-low: stale_verdicts uncapped). Surface the true total so truncation stays visible.
-            stale_total = len(stale_verdicts)
-            stale_verdicts = stale_verdicts[:_STALE_VERDICTS_CAP]
-            if gate_on:
-                bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes "
-                          "ORDER BY spec_betweenness DESC, degree DESC LIMIT 10")
-                ranked_by = "spec_betweenness"
-            else:
-                bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes "
-                          "ORDER BY structural_bridge DESC, betweenness DESC, degree DESC LIMIT 10")
-                ranked_by = "structural_bridge"
-            bridge_metric = {
-                "gate_on": gate_on,
-                "ranked_by": ranked_by,
-                "note": ("specificity-weighting earned promotion this projection — spec_betweenness is "
-                         "the trusted bridge signal" if gate_on else
-                         "gated: spec_betweenness stays advisory; ranking by structural-bridge/degree (§1.6)"),
-                "nodes": [dict(r) for r in con.execute(bm_sql)],
-            }
+            bridge_metric = self._bridge_metric_block(con)
+            stale_verdicts, stale_total = self._read_stale_advisory(con)
             return {
                 "items": items,
                 "hypotheses": hypotheses,   # the SEPARATE hypothesized lane — proposals, NOT grounded content
@@ -1012,7 +1078,9 @@ def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
     only inspects rows and returns text."""
     limit = max(1, min(int(limit), 50))
     gate_on = int(next((n.get("gate_on") for n in nodes if n.get("gate_on") is not None), 0) or 0)
-    ranked_by = "spec_betweenness" if gate_on else "structural_bridge"
+    # the gate-aware ranking — same source of truth as kg_context (gate_ranking); never raw betweenness
+    # as lead. The shared `rank_cols` keep the two surfaces' tie-break order from silently diverging.
+    ranked_by, rank_cols = gate_ranking(gate_on)
     by_id = {n["id"]: n for n in nodes}
 
     incident: dict = {n["id"]: [] for n in nodes}
@@ -1021,11 +1089,8 @@ def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
             if endp in incident:
                 incident[endp].append(e)
 
-    def rank_key(n: dict):  # mirror kg_context's gate switch; never raw betweenness as lead
-        d = n.get("degree") or 0
-        if gate_on:
-            return (float(n.get("spec_betweenness") or 0.0), d)
-        return (int(n.get("structural_bridge") or 0), float(n.get("betweenness") or 0.0), d)
+    def rank_key(n: dict):  # mirror kg_context's gate switch via the shared rank_cols
+        return tuple(_RANK_COERCE[c][0](n.get(c) or _RANK_COERCE[c][1]) for c in rank_cols)
 
     gaps: list = []  # (rank_key, item)
     emitted: set = set()  # node ids already surfaced by a node-level detector (one detector per node)

@@ -80,6 +80,23 @@ class Reconciler:
         _atomic_write(self.state_path, json.dumps(state, indent=0))
 
     @staticmethod
+    def _coerce_subdict(state: dict, key: str) -> dict:
+        """Read a state sub-dict that scan() mutates in place: `or {}` rescues a null value, the
+        isinstance guard rescues a non-dict (e.g. a list) — both fail open to a fresh dict so a
+        hand-edited / truncated state can't crash scan() before _save_state heals it."""
+        v = state.get(key) or {}
+        return v if isinstance(v, dict) else {}
+
+    @staticmethod
+    def _anchor(blob: bytes, offset: int) -> bytes:
+        """sha256 of the prefix-tail window ending at `offset` — the fingerprint that proves the cached
+        prefix [0, offset) is still a valid prefix of the current file. Window size and slice semantics
+        live here once so the reuse check and the re-pin can never drift. Deliberately distinct from the
+        module-level `_sha256` (which takes a Path and returns a hexdigest)."""
+        w = Reconciler._AUDIT_ANCHOR_WINDOW
+        return hashlib.sha256(blob[max(0, offset - w):offset]).digest()
+
+    @staticmethod
     def _fold_audit_lines(blob: bytes, counts: dict[str, int]) -> None:
         """Fold a byte blob of complete audit lines into `counts` in place (one increment per record).
         `blob` MUST end on a record boundary (caller trims any partial trailing line). A locale-clean
@@ -121,15 +138,13 @@ class Reconciler:
             return {}
 
         size = len(blob)
-        w = self._AUDIT_ANCHOR_WINDOW
         # Decide whether the cached prefix [0, _audit_offset) is still a valid prefix of the current
         # file. It is iff the file is at least that long AND the tail window ending at the offset is
         # byte-identical to what we hashed last time. Any mismatch -> recompute from scratch.
         reuse = (
             self._audit_offset > 0
             and size >= self._audit_offset
-            and hashlib.sha256(blob[max(0, self._audit_offset - w):self._audit_offset]).digest()
-            == self._audit_anchor
+            and self._anchor(blob, self._audit_offset) == self._audit_anchor
         )
         if reuse:
             counts = dict(self._audit_counts_cache)
@@ -154,8 +169,20 @@ class Reconciler:
         # we actually parsed, and the anchor pins the new prefix tail for the next sweep's prefix check.
         self._audit_offset = fold_end
         self._audit_counts_cache = dict(counts)
-        self._audit_anchor = hashlib.sha256(blob[max(0, fold_end - w):fold_end]).digest()
+        self._audit_anchor = self._anchor(blob, fold_end)
         return counts
+
+    @staticmethod
+    def _node_keys(node) -> "list[str]":
+        """The node + edge baseline keys a parsed node contributes. Single-sources the `node:` prefix
+        so the incremental live-set and the all_nodes() recompute the prune relies on stay byte-identical."""
+        return [f"node:{node.id}", *(e.id for e in node.edges)]
+
+    @staticmethod
+    def _file_record(st, digest: str, keys) -> dict:
+        """The four-field files_state cache record for one note (mtime/size/sha256/keys), built once
+        so the two construction sites in scan() can't drift if a field is added or renamed."""
+        return {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest, "keys": keys}
 
     @staticmethod
     def _file_keys(p) -> "list[str] | None":
@@ -168,23 +195,88 @@ class Reconciler:
             node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
         except Exception:  # noqa: BLE001 — a malformed note has no parseable keys
             return None
-        return [f"node:{node.id}", *(e.id for e in node.edges)]
+        return Reconciler._node_keys(node)
+
+    def _requarantine_forged(self, node, epistemic: dict, consumed: dict, audit: dict[str, int],
+                             report: ReconcileReport) -> bool:
+        """Reset any out-of-band forged verdict on `node` and its edges to UNVERIFIED, recording the
+        re-quarantined ids on `report` and writing each key's current state into the `epistemic`
+        baseline. Mutates `epistemic`/`consumed` in place (the latter via _forged's record spend) and
+        returns True iff anything was reset, so scan() knows the node must be re-persisted (§1.8)."""
+        mutated = False
+
+        # node-level forged verdict
+        nkey = f"node:{node.id}"
+        if self._forged(nkey, node.epistemic_state, epistemic, consumed, audit):
+            node.epistemic_state = EpistemicState.UNVERIFIED
+            report.requarantined.append(node.id)
+            mutated = True
+        epistemic[nkey] = node.epistemic_state.value
+
+        # edge-level forged verdicts
+        for e in node.edges:
+            ekey = e.id
+            if self._forged(ekey, e.epistemic_state, epistemic, consumed, audit):
+                e.epistemic_state = EpistemicState.UNVERIFIED
+                e.verdict_by = None
+                e.verdict_at = None
+                report.requarantined.append(e.id)
+                mutated = True
+            epistemic[ekey] = e.epistemic_state.value
+
+        return mutated
+
+    def _relocate_to_canonical(self, node, p: Path, rel: str, files_state: dict,
+                               live_files: set) -> "tuple[Path, str] | None":
+        """Return the (path, rel) the corrected node should be written at, relocating a non-canonical
+        filename to its canonical slug path first; return None to signal "skip this note, retry next
+        sweep" (a slug collision pre-check failed). A canonical filename passes through unchanged.
+
+        write_one persists to the CANONICAL slug path (node_path(node.id)). When the note we
+        actually read lives at a NON-canonical filename (e.g. hand-created Foo.md for id 'Foo',
+        slug -> foo.md), the correction must land canonically with the stale original gone —
+        else a duplicate edge in two states, and re-statting the untouched original would
+        re-skip it forever (reconciler-3, self-concealing).
+
+        Detect "non-canonical" by comparing the directory-entry name to the PURE SLUG name
+        (`slug(id).md`), a plain case-sensitive string compare with NO filesystem resolution.
+        node_path() calls Path.resolve(), and on Windows resolve() returns the EXISTING on-disk
+        casing ('Foo.md'), which would mask the difference from the canonical 'foo.md' and skip
+        this correction; note_paths() yields the real stored name ('Foo.md'). And remove the
+        original BEFORE writing: on a case-insensitive filesystem (macOS/Windows) Foo.md and
+        foo.md are the SAME file, so a write-then-unlink would delete the just-written note, and a
+        case-preserving replace would keep the stale 'Foo.md' name anyway. Deleting first lets
+        write_one create a fresh, correctly-cased foo.md; on a case-sensitive FS it just drops the
+        distinct duplicate. The corrected node is in memory, so a crash in the tiny unlink->write
+        window at worst drops an already-forged note (re-corrected next sweep), never a grounded one."""
+        canonical_name = f"{slug(node.id)}.md"
+        if p.name != canonical_name:
+            try:
+                # Would the canonical write collide with a DISTINCT existing note (a real id≠
+                # owning slug(id).md on a case-sensitive FS)? Detect BEFORE the destructive
+                # unlink: the old code unlinked first, then write_one -> _check_slug_collision
+                # raised, and the UNCAUGHT ValueError aborted the ENTIRE sweep with the original
+                # already deleted — a vault-wide reconcile outage plus note loss (review-M1).
+                self.canon._check_slug_collision(node)
+            except ValueError:
+                live_files.add(rel)  # keep the original; retry next sweep, don't abort the sweep
+                return None
+            p.unlink(missing_ok=True)  # drop the non-canonical original before the canonical write
+            files_state.pop(rel, None)
+            rel = canonical_name
+            p = self.canon.notes_dir / canonical_name
+        return p, rel
 
     # ---- scan
     def scan(self, full_sweep: bool = False) -> ReconcileReport:
         state = self._load_state()
         # Coerce each sub-key defensively: a hand-edited / truncated state with `{"files": null}` (or a
-        # non-dict sub-value) would otherwise crash scan() before _save_state can heal it. `or {}`
-        # rescues null; the isinstance guard rescues a non-dict (e.g. a list) — both fail open to fresh.
-        files_state = state.get("files") or {}
-        epistemic = state.get("epistemic") or {}
-        consumed = state.get("consumed") or {}
-        if not isinstance(files_state, dict):
-            files_state = {}
-        if not isinstance(epistemic, dict):
-            epistemic = {}
-        if not isinstance(consumed, dict):
-            consumed = {}
+        # non-dict sub-value) would otherwise crash scan() before _save_state can heal it. These stay the
+        # LIVE sub-dicts mutated in place below (consumed spends records in _forged, epistemic is the
+        # re-quarantine baseline) and written back at the end — _coerce_subdict must never copy them out.
+        files_state = self._coerce_subdict(state, "files")
+        epistemic = self._coerce_subdict(state, "epistemic")
+        consumed = self._coerce_subdict(state, "consumed")
         audit = self._audit_counts()
         report = ReconcileReport(full_sweep=full_sweep)
         # On a FULL SWEEP we visit and hash every note in the loop below, so we can build the live
@@ -212,8 +304,7 @@ class Reconciler:
                 keys = prev.get("keys")
                 if keys is None:
                     keys = self._file_keys(p)
-                files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest,
-                                    "keys": keys if keys is not None else []}
+                files_state[rel] = self._file_record(st, digest, keys if keys is not None else [])
                 live_files.add(rel)
                 if keys:
                     live_keys.update(keys)
@@ -230,61 +321,14 @@ class Reconciler:
                 # malformed note contributes NO parseable keys — exactly what all_nodes() would yield.
                 live_files.add(rel)
                 continue  # leave its file_state untouched so it's retried next scan
-            mutated = False
 
-            # node-level forged verdict
-            nkey = f"node:{node.id}"
-            if self._forged(nkey, node.epistemic_state, epistemic, consumed, audit):
-                node.epistemic_state = EpistemicState.UNVERIFIED
-                report.requarantined.append(node.id)
-                mutated = True
-            epistemic[nkey] = node.epistemic_state.value
-
-            # edge-level forged verdicts
-            for e in node.edges:
-                ekey = e.id
-                if self._forged(ekey, e.epistemic_state, epistemic, consumed, audit):
-                    e.epistemic_state = EpistemicState.UNVERIFIED
-                    e.verdict_by = None
-                    e.verdict_at = None
-                    report.requarantined.append(e.id)
-                    mutated = True
-                epistemic[ekey] = e.epistemic_state.value
+            mutated = self._requarantine_forged(node, epistemic, consumed, audit, report)
 
             if mutated:
-                # write_one persists to the CANONICAL slug path (node_path(node.id)). When the note we
-                # actually read lives at a NON-canonical filename (e.g. hand-created Foo.md for id 'Foo',
-                # slug -> foo.md), the correction must land canonically with the stale original gone —
-                # else a duplicate edge in two states, and re-statting the untouched original would
-                # re-skip it forever (reconciler-3, self-concealing).
-                #
-                # Detect "non-canonical" by comparing the directory-entry name to the PURE SLUG name
-                # (`slug(id).md`), a plain case-sensitive string compare with NO filesystem resolution.
-                # node_path() calls Path.resolve(), and on Windows resolve() returns the EXISTING on-disk
-                # casing ('Foo.md'), which would mask the difference from the canonical 'foo.md' and skip
-                # this correction; note_paths() yields the real stored name ('Foo.md'). And remove the
-                # original BEFORE writing: on a case-insensitive filesystem (macOS/Windows) Foo.md and
-                # foo.md are the SAME file, so a write-then-unlink would delete the just-written note, and a
-                # case-preserving replace would keep the stale 'Foo.md' name anyway. Deleting first lets
-                # write_one create a fresh, correctly-cased foo.md; on a case-sensitive FS it just drops the
-                # distinct duplicate. The corrected node is in memory, so a crash in the tiny unlink->write
-                # window at worst drops an already-forged note (re-corrected next sweep), never a grounded one.
-                canonical_name = f"{slug(node.id)}.md"
-                if p.name != canonical_name:
-                    try:
-                        # Would the canonical write collide with a DISTINCT existing note (a real id≠
-                        # owning slug(id).md on a case-sensitive FS)? Detect BEFORE the destructive
-                        # unlink: the old code unlinked first, then write_one -> _check_slug_collision
-                        # raised, and the UNCAUGHT ValueError aborted the ENTIRE sweep with the original
-                        # already deleted — a vault-wide reconcile outage plus note loss (review-M1).
-                        self.canon._check_slug_collision(node)
-                    except ValueError:
-                        live_files.add(rel)  # keep the original; retry next sweep, don't abort the sweep
-                        continue
-                    p.unlink(missing_ok=True)  # drop the non-canonical original before the canonical write
-                    files_state.pop(rel, None)
-                    rel = canonical_name
-                    p = self.canon.notes_dir / canonical_name
+                relocated = self._relocate_to_canonical(node, p, rel, files_state, live_files)
+                if relocated is None:
+                    continue  # collision pre-check failed: keep the original, retry next sweep
+                p, rel = relocated
                 try:
                     self.canon.write_one(node)
                 except Exception:  # noqa: BLE001 — one unwritable/colliding note must not abort the sweep
@@ -292,8 +336,8 @@ class Reconciler:
                     continue
                 st = p.stat()
                 digest = _sha256(p)
-            keys = [f"node:{node.id}", *(e.id for e in node.edges)]
-            files_state[rel] = {"mtime": st.st_mtime, "size": st.st_size, "sha256": digest, "keys": keys}
+            keys = self._node_keys(node)
+            files_state[rel] = self._file_record(st, digest, keys)
             live_files.add(rel)
             live_keys.update(keys)
 

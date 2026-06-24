@@ -79,15 +79,18 @@ def coverage(pack: PackContract, source_text: str) -> dict:
     # word-boundary match, not raw substring: a short term ('io','ml','a') must not count as grounded
     # because it appears INSIDE an unrelated word ('ratio','html'), which inflated the metric (model-pack-4).
     glossary_in_source = sum(1 for t in glossary_norms if _term_in_text(t, norm_src))
-    n_def = max(len(defined), 1)
-    n_gloss = max(len(glossary_norms), 1)
     return {
         "source_defined_terms": len(defined),
         "glossary_terms": len(pack.glossary),
         "source_terms_in_glossary": in_glossary,
-        "source_coverage": round(in_glossary / n_def, 3),
-        "glossary_grounded_in_source": round(glossary_in_source / n_gloss, 3),
+        "source_coverage": _safe_ratio(in_glossary, len(defined)),
+        "glossary_grounded_in_source": _safe_ratio(glossary_in_source, len(glossary_norms)),
     }
+
+
+def _safe_ratio(num: int, denom: int, ndigits: int = 3) -> float:
+    """num/denom rounded to ndigits, guarding a zero denominator (an empty population reads as 0.0)."""
+    return round(num / max(denom, 1), ndigits)
 
 
 def _term_in_text(term: str, text: str) -> bool:
@@ -98,16 +101,23 @@ def _term_in_text(term: str, text: str) -> bool:
     return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) is not None
 
 
-# Quoted/bold/code "defined terms". Quote caps match the 60-char post-filter below so a long bold or
-# quoted phrase isn't silently dropped by an inconsistent inner cap.
-_DEFN_RE = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`|\"([^\"]{3,60})\"|“([^”]{3,60})”")
+# Quoted/bold/code "defined terms". The quote alternatives carry a 3-char floor; bold/code do not, so
+# `**a**` yields the 1-char term 'a' while `"a"` is dropped — the quote floor is intentional, since a
+# bare bold/code marker is a stronger defined-term signal than a 1-2 char quoted fragment.
+_MIN_TERM_LEN = 3
+_MAX_TERM_LEN = 60
+_DEFN_RE = re.compile(
+    rf"\*\*(.+?)\*\*|`([^`]+)`"
+    rf"|\"([^\"]{{{_MIN_TERM_LEN},{_MAX_TERM_LEN}}})\""
+    rf"|“([^”]{{{_MIN_TERM_LEN},{_MAX_TERM_LEN}}})”"
+)
 
 
 def _defined_terms(text: str) -> set[str]:
     terms = set()
     for m in _DEFN_RE.finditer(text):
         term = next((g for g in m.groups() if g), "").strip()
-        if term and len(term) <= 60:
+        if term and len(term) <= _MAX_TERM_LEN:
             terms.add(term)
     return terms
 
@@ -126,17 +136,19 @@ def _main(argv: list[str]) -> int:
     print(f"PACK OK: domain={pack.domain!r} node_types={len(pack.node_types)} "
           f"edge_types={len(pack.edge_types)} glossary={len(pack.glossary)}")
     src = argv[2] if len(argv) > 2 else None
+    # `validate` also reports coverage when a source is supplied (the optional `[source]` arg); the
+    # `coverage` command always does, requiring one.
     if cmd == "coverage" or src:
         if not src:
             print("coverage needs a source path", file=sys.stderr)
             return 2
         # R4: accept a file, directory, or glob of .md/.txt (a single file still works, byte-identical).
         from .sources import SourceSet
-        sset = SourceSet(src)
-        if not sset:
+        source_set = SourceSet(src)
+        if not source_set:
             print(f"no .md/.txt source found at: {src}", file=sys.stderr)
             return 2
-        cov = coverage(pack, sset.concat)
+        cov = coverage(pack, source_set.concat)
         for k, v in cov.items():
             print(f"  {k}: {v}")
     return 0

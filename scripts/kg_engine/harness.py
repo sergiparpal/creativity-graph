@@ -81,6 +81,11 @@ def _node_specificity(label: str, seeds: dict[str, float], default: float) -> fl
     return sum(seeds.get(t, default) for t in terms) / len(terms)
 
 
+# rank-churn gate: specificity-weighting only earns promotion when the top-betweenness leaders move by
+# more than this fraction once weighted (§1.4/§1.6). Advisory knob — the harness measures, never gates.
+_CHURN_GATE = 0.2
+
+
 def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness: dict | None = None,
                 precomputed_seeds: dict | None = None, precomputed_undirected=None) -> dict:
     """Compare specificity-weighted betweenness vs raw degree vs raw betweenness.
@@ -124,7 +129,13 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
     # incidental churn. Surface the spread so a degenerate run is legible, not silently "gate ON".
     spread = (max(spec.values()) - min(spec.values())) if spec else 0.0
     has_spread = spread > 1e-9
-    gate_on = bool(confound and churn > 0.2 and has_spread)
+    gate_on = bool(confound and churn > _CHURN_GATE and has_spread)
+    if gate_on:
+        verdict = "specificity-weighting earns its place — gate ON"
+    elif not has_spread:
+        verdict = "specificity is uniform (corpus too small / no IDF spread) — stays advisory"
+    else:
+        verdict = "specificity-weighting does not clearly separate — stays advisory"
     return {
         "n": G.number_of_nodes(),
         "mean_specificity": round(mean_spec, 3),
@@ -135,10 +146,7 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
         "rank_churn": round(churn, 3),
         "generality_confound_detected": confound,
         "gate_on": gate_on,
-        "verdict": ("specificity-weighting earns its place — gate ON" if gate_on
-                    else ("specificity is uniform (corpus too small / no IDF spread) — stays advisory"
-                          if not has_spread
-                          else "specificity-weighting does not clearly separate — stays advisory")),
+        "verdict": verdict,
     }
 
 
@@ -200,6 +208,13 @@ def absorption(graph_data: dict, history: dict, *, now=None, absorb_growth: int 
 
 _SENT = re.compile(r"[.!?]+\s+")
 
+# a "key term" is a word longer than this; sentences whose words are all this short or shorter yield no
+# key terms and are excluded from both numerator and denominator of unsupported_rate (see _score_condition).
+_KEY_TERM_MIN_LEN = 5
+_KEY_TERMS_PER_SENTENCE = 3              # cap on key terms sampled per sentence
+_UTILITY_SATURATION = 5                  # utility hits saturate the per-output score at this count
+_UNSUPPORTED_SLACK = 0.05                # hallucination-guard slack allowed on unsupported_rate in _beats
+
 
 def _ngrams(text: str, n=3) -> set:
     words = [w.lower() for w in _WORD.findall(text)]
@@ -222,15 +237,17 @@ def _score_condition(outputs: list[str], source_text: str) -> dict:
         # an empty/too-short output has no n-grams; score it 0 novelty rather than a free 1.0, so a
         # condition can't game the experiment by emitting blank or one-word "ideas".
         novelties.append(1.0 - overlap if ong else 0.0)
-        util.append(min(1.0, len(re.findall(r"\bbecause\b|\bif\b|\btherefore\b|\bbridge|\bconnect", o.lower())) / 5))
+        util.append(min(1.0, len(re.findall(r"\bbecause\b|\bif\b|\btherefore\b|\bbridge|\bconnect", o.lower())) / _UTILITY_SATURATION))
         # only sentences that have >=1 scorable key term can be judged supported/unsupported.
-        # a sentence whose words are all short (<=5 chars) yields no key terms — we can't decide it
-        # either way, so it's excluded from BOTH numerator and denominator rather than counted as a
-        # free "unsupported" (which would bias the unsupported_rate axis upward — finding harness-f4-1).
-        sents = [s for s in _SENT.split(o) if len(s.split()) >= 4 and _key_terms(s)]
-        if sents:
-            unsup = sum(1 for s in sents if not any(t in src_norm for t in _key_terms(s)))
-            unsupported.append(unsup / len(sents))
+        # a sentence whose words are all short (<= _KEY_TERM_MIN_LEN chars) yields no key terms — we
+        # can't decide it either way, so it's excluded from BOTH numerator and denominator rather than
+        # counted as a free "unsupported" (which would bias the unsupported_rate axis upward — finding
+        # harness-f4-1). Tokenize each sentence once and reuse those terms for both filter and numerator.
+        scored = [(s, _key_terms(s)) for s in _SENT.split(o) if len(s.split()) >= 4]
+        scored = [(s, t) for s, t in scored if t]
+        if scored:
+            unsup = sum(1 for _, t in scored if not any(x in src_norm for x in t))
+            unsupported.append(unsup / len(scored))
     return {
         "n": len(outputs),
         "diversity": round(diversity, 3),
@@ -241,14 +258,15 @@ def _score_condition(outputs: list[str], source_text: str) -> dict:
 
 
 def _key_terms(sentence: str) -> list[str]:
-    return [w.lower() for w in _WORD.findall(sentence) if len(w) > 5][:3]
+    return [w.lower() for w in _WORD.findall(sentence)
+            if len(w) > _KEY_TERM_MIN_LEN][:_KEY_TERMS_PER_SENTENCE]
 
 
 def _beats(a: dict, c: dict) -> bool:
     """`a` beats baseline `c`: no regression on diversity/novelty/unsupported (with 0.05 slack on the
     hallucination guard) AND a strict gain on at least one of diversity/novelty (a tie is not a win)."""
     no_regression = (a["diversity"] >= c["diversity"] and a["novelty"] >= c["novelty"]
-                     and a["unsupported_rate"] <= c["unsupported_rate"] + 0.05)
+                     and a["unsupported_rate"] <= c["unsupported_rate"] + _UNSUPPORTED_SLACK)
     strict_gain = (a["diversity"] > c["diversity"] or a["novelty"] > c["novelty"])
     return no_regression and strict_gain
 
@@ -281,10 +299,23 @@ def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
 
 # --------------------------------------------------------------------------- CLI
 
+# Krippendorff α at or above this is reported RELIABLE; below it the grounding signal stays advisory.
+_ALPHA_RELIABLE = 0.67
+
 
 def _demo_corpus() -> list[str]:
     return ["entropy grounds the arrow of time", "betweenness measures bridges",
             "specificity weights betweenness by term rarity", "the generality confound inflates vague nodes"]
+
+
+def _load_json_or_demo(path, demo, *, notice: str):
+    """Load JSON from `path` if it exists, else return `demo` and print the standard fallback `notice`.
+
+    Returns (parsed_or_demo, used_demo). `path` may be None (no arg supplied)."""
+    if path and Path(path).exists():
+        return json.loads(Path(path).read_text()), False
+    print(f"[harness] {notice}", file=sys.stderr)
+    return demo, True
 
 
 def _main(argv: list[str]) -> int:
@@ -294,44 +325,37 @@ def _main(argv: list[str]) -> int:
     cmd = argv[0]
     if cmd == "agreement":
         path = argv[1] if len(argv) > 1 else None
-        if path and Path(path).exists():
-            label_sets = json.loads(Path(path).read_text())
-        else:
-            label_sets = [{"e1": "correct", "e2": "vague", "e3": "correct"},
-                          {"e1": "correct", "e2": "vague", "e3": "fabricated"}]
-            print("[harness] no labels file; using demo label sets", file=sys.stderr)
+        demo = [{"e1": "correct", "e2": "vague", "e3": "correct"},
+                {"e1": "correct", "e2": "vague", "e3": "fabricated"}]
+        label_sets, _ = _load_json_or_demo(path, demo, notice="no labels file; using demo label sets")
         a = agreement(label_sets)
         print(f"krippendorff_alpha: {a:.3f}")
-        print(f"verdict: {'RELIABLE (>=0.67)' if a >= 0.67 else 'BELOW THRESHOLD — grounding signal stays advisory'}")
+        reliable = f"RELIABLE (>={_ALPHA_RELIABLE})" if a >= _ALPHA_RELIABLE else "BELOW THRESHOLD — grounding signal stays advisory"
+        print(f"verdict: {reliable}")
         return 0
     if cmd == "specificity":
         gpath = argv[1] if len(argv) > 1 else "derived/graph.json"
         spath = argv[2] if len(argv) > 2 else None
-        if Path(gpath).exists():
-            gdata = json.loads(Path(gpath).read_text())
-        else:
-            gdata = {"directed": True, "nodes": [{"id": "a", "label": "system"}, {"id": "b", "label": "entropy"},
-                     {"id": "c", "label": "time"}, {"id": "d", "label": "thermodynamic arrow"}],
-                     "links": [{"source": "a", "target": "b"}, {"source": "a", "target": "c"},
-                               {"source": "b", "target": "d"}, {"source": "c", "target": "d"}]}
-            print("[harness] no graph.json; using demo graph", file=sys.stderr)
+        demo = {"directed": True, "nodes": [{"id": "a", "label": "system"}, {"id": "b", "label": "entropy"},
+                {"id": "c", "label": "time"}, {"id": "d", "label": "thermodynamic arrow"}],
+                "links": [{"source": "a", "target": "b"}, {"source": "a", "target": "c"},
+                          {"source": "b", "target": "d"}, {"source": "c", "target": "d"}]}
+        gdata, _ = _load_json_or_demo(gpath, demo, notice="no graph.json; using demo graph")
         corpus = [Path(spath).read_text()] if spath and Path(spath).exists() else _demo_corpus()
         res = specificity(gdata, corpus)
         print(json.dumps(res, indent=2))
         return 0
     if cmd == "ideation":
         path = argv[1] if len(argv) > 1 else None
-        if path and Path(path).exists():
-            blob = json.loads(Path(path).read_text())
-            src = blob.get("source", "")
-            # when outputs aren't nested under "outputs", treat the rest of the blob as conditions but
-            # never let the top-level "source" string leak in as a fake (char-iterated) condition.
-            obc = blob.get("outputs", {k: v for k, v in blob.items() if k != "source"})
-        else:
-            obc = {"control": ["A is connected to B."], "graph": ["A bridges B and C because entropy grounds time."],
-                   "rag": ["A relates to B somehow."]}
-            src = "entropy grounds the arrow of time"
-            print("[harness] no outputs file; using demo outputs", file=sys.stderr)
+        demo = {"source": "entropy grounds the arrow of time",
+                "outputs": {"control": ["A is connected to B."],
+                            "graph": ["A bridges B and C because entropy grounds time."],
+                            "rag": ["A relates to B somehow."]}}
+        blob, _ = _load_json_or_demo(path, demo, notice="no outputs file; using demo outputs")
+        src = blob.get("source", "")
+        # when outputs aren't nested under "outputs", treat the rest of the blob as conditions but
+        # never let the top-level "source" string leak in as a fake (char-iterated) condition.
+        obc = blob.get("outputs", {k: v for k, v in blob.items() if k != "source"})
         res = ideation(obc, src)
         print(json.dumps(res, indent=2))
         return 0

@@ -36,6 +36,15 @@ from .model import edge_id
 DEFAULT_SET = ["bridge", "seed", "compression"]
 ALL_SET = ["bridge", "seed", "compression", "regroup", "transplant", "ensemble"]
 
+# The relation emitted by every structural-bridge mechanism (bridge/seed/regroup/ensemble). It MUST
+# exist in pack.yaml edge_types or the candidate is QUARANTINED at the kg_write boundary; and within a
+# mechanism the failure-memory check and the emit must use the same string or failure memory silently
+# never matches. transplant is exempt — it emits the hub's dynamic dominant relation, not this constant.
+BRIDGES_RELATION = "bridges"
+
+# The community id meaning "no community" — the sentinel _attr default for a node's "community" attr.
+NO_COMMUNITY = -1
+
 # seed (§3) all-pairs BFS size gate (perf #8). At or below this node count `seed` runs the EXACT
 # original code path (unbounded BFS + full O(V^2) pair scan) so small graphs stay byte-identical with
 # the golden/reproducibility expectations. Above it, BFS is bounded by SEED_BFS_CUTOFF (see `seed`).
@@ -45,8 +54,10 @@ SEED_ALLPAIRS_MAX_NODES = 400
 # always score 0 and are dropped. Radius 2 enumerates every pair seed can ever turn into a candidate.
 SEED_BFS_CUTOFF = 2
 
-# Distinct "argument not supplied" sentinel for the re-partition memo (perf #13). None is a real
-# _repartition return value (both community algorithms failed), so it cannot double as "not supplied".
+# Distinct "argument not supplied" sentinel for the re-partition memo (perf #13). The contract (the
+# authoritative statement; downstream sites point here): None is a legitimate `_repartition` return
+# value (both community algorithms failed and it fell back to no usable partition), so None cannot
+# double as "not supplied" — `_UNSET` carries that meaning and a real None still flows through.
 _UNSET = object()
 
 
@@ -102,6 +113,12 @@ def _bridge_strength(G, n, gate_on: int) -> float:
     return float(_attr(G, n, "structural_bridge", 0)) + 1e-6 * float(_attr(G, n, "degree", 0))
 
 
+def _pair_specificity(G, a, b) -> float:
+    """A candidate's specificity is the MIN of its two endpoints' specificity, defaulting to 1.0 — the
+    §4 generality-control rule shared by every edge mechanism (no candidate ranks high for being generic)."""
+    return min(float(_attr(G, a, "specificity", 1.0)), float(_attr(G, b, "specificity", 1.0)))
+
+
 def _undirected_adjacency(G) -> dict:
     adj: dict = defaultdict(set)
     for u, v in G.edges():
@@ -109,6 +126,21 @@ def _undirected_adjacency(G) -> dict:
             adj[u].add(v)
             adj[v].add(u)
     return adj
+
+
+def _internal_edge_count(und, members: set) -> int:
+    """Count undirected internal edges among `members`, each counted exactly once (frozenset-dedup).
+    Feeds compression's MDL screen and transplant's absorption-capacity density proxy."""
+    return len({frozenset((u, v)) for u in members for v in und.neighbors(u)
+                if v in members and u != v})
+
+
+def _members_by_community(G) -> dict:
+    """Group node ids by their stored community attr (NO_COMMUNITY default), as a defaultdict(list)."""
+    by_comm: dict = defaultdict(list)
+    for n in G.nodes():
+        by_comm[_attr(G, n, "community", NO_COMMUNITY)].append(n)
+    return by_comm
 
 
 def _shared(G, und, adj):
@@ -163,21 +195,21 @@ def bridge(G, *, pack, corpus, failures, k=10, adj=None) -> list:
         su = _bridge_strength(G, u, gate_on)
         if su <= 0:
             continue
-        cu = _attr(G, u, "community", -1)
+        cu = _attr(G, u, "community", NO_COMMUNITY)
         for v in nodes[i + 1:]:
-            if v in adj[u] or _attr(G, v, "community", -1) == cu:
+            if v in adj[u] or _attr(G, v, "community", NO_COMMUNITY) == cu:
                 continue  # already connected, or same community (not a cross-community bridge)
             sv = _bridge_strength(G, v, gate_on)
             if sv <= 0:
                 continue
-            if _is_failure(failures, u, "bridges", v):
+            if _is_failure(failures, u, BRIDGES_RELATION, v):
                 continue
-            spec = min(float(_attr(G, u, "specificity", 1.0)), float(_attr(G, v, "specificity", 1.0)))
+            spec = _pair_specificity(G, u, v)
             score = su + sv
             cands.append(_edge_cand(
-                "bridge", u, v, "bridges", score=score, specificity=spec, section="§2/§4",
+                "bridge", u, v, BRIDGES_RELATION, score=score, specificity=spec, section="§2/§4",
                 rationale=(f"cross-community bridge: {_attr(G, u, 'label', u)} (c{cu}) ⇄ "
-                           f"{_attr(G, v, 'label', v)} (c{_attr(G, v, 'community', -1)}); "
+                           f"{_attr(G, v, 'label', v)} (c{_attr(G, v, 'community', NO_COMMUNITY)}); "
                            f"strength={score:.4f} via {'spec_betweenness' if gate_on else 'structural-bridge'}")))
     return _rank(cands, k)
 
@@ -221,11 +253,11 @@ def seed(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
         residual = c - exp.get(d, 0.0)
         if residual <= 0:
             continue  # only abnormally-connectable pairs (positive residual)
-        if _is_failure(failures, u, "bridges", v):
+        if _is_failure(failures, u, BRIDGES_RELATION, v):
             continue
-        spec = min(float(_attr(G, u, "specificity", 1.0)), float(_attr(G, v, "specificity", 1.0)))
+        spec = _pair_specificity(G, u, v)
         cands.append(_edge_cand(
-            "seed", u, v, "bridges", score=residual, specificity=spec, section="§3",
+            "seed", u, v, BRIDGES_RELATION, score=residual, specificity=spec, section="§3",
             rationale=(f"abnormally connectable for its distance: d={d}, shared neighbours={c} vs "
                        f"expected {exp.get(d, 0.0):.2f} (residual {residual:+.2f})")))
     return _rank(cands, k)
@@ -240,19 +272,15 @@ def compression(G, *, pack, corpus, failures, k=10, und=None) -> list:
     if und is None:
         und = G.to_undirected()
     mean_spec = _mean_specificity(G)
-    by_comm: dict = defaultdict(list)
-    for n in G.nodes():
-        by_comm[_attr(G, n, "community", -1)].append(n)
+    by_comm = _members_by_community(G)
     N = max(G.number_of_nodes(), 2)
     bits = math.log2(N)
     cands: list = []
     for cid, members in by_comm.items():
-        if cid == -1 or len(members) < 3:
+        if cid == NO_COMMUNITY or len(members) < 3:
             continue
         mset = set(members)
-        internal = {frozenset((u, v)) for u in members for v in und.neighbors(u)
-                    if v in mset and u != v}
-        e_int, m = len(internal), len(members)
+        e_int, m = _internal_edge_count(und, mset), len(members)
         direct = e_int * 2 * bits                 # each internal edge: two endpoint ids
         compressed = (m + 1) * bits               # m collapses_into edges + the one new node
         if compressed >= direct:
@@ -279,8 +307,8 @@ def regroup(G, *, pack, corpus, failures, k=10, und=None, adj=None, new_comm=_UN
         und = G.to_undirected()
     # perf #13 — the Leiden re-partition is the expensive step. On a full `kg_generate('all')` run it
     # is computed once in `run_generators` and threaded in (regroup AND ensemble's degraded path share
-    # it), so Leiden runs once per run instead of twice. `_UNSET` (not None) is the "not supplied"
-    # sentinel: None is a legitimate _repartition result (both algorithms failed) and must flow through.
+    # it), so Leiden runs once per run instead of twice. `_UNSET` vs None: see the sentinel def — a real
+    # None (both algorithms failed) is supplied and must flow through; `_UNSET` means "not supplied".
     if new_comm is _UNSET:
         new_comm = _repartition(und, resolution=4.0, seed=7)
     # _repartition returns None ONLY when BOTH community algorithms failed and it fell back to the
@@ -296,22 +324,22 @@ def regroup(G, *, pack, corpus, failures, k=10, und=None, adj=None, new_comm=_UN
     nodes = list(G.nodes())
     cands: list = []
     for i, u in enumerate(nodes):
-        ou, nu = _attr(G, u, "community", -1), new_comm.get(u)
+        ou, nu = _attr(G, u, "community", NO_COMMUNITY), new_comm.get(u)
         for v in nodes[i + 1:]:
             if v in adj[u]:
                 continue
             # intra-community BEFORE (same stored community), cross-community AFTER (new partition splits)
-            if ou == -1 or _attr(G, v, "community", -1) != ou:
+            if ou == NO_COMMUNITY or _attr(G, v, "community", NO_COMMUNITY) != ou:
                 continue
             if nu is None or new_comm.get(v) == nu:
                 continue
-            if _is_failure(failures, u, "bridges", v):
+            if _is_failure(failures, u, BRIDGES_RELATION, v):
                 continue
             su = _bridge_strength(G, u, gate_on)
             sv = _bridge_strength(G, v, gate_on)
-            spec = min(float(_attr(G, u, "specificity", 1.0)), float(_attr(G, v, "specificity", 1.0)))
+            spec = _pair_specificity(G, u, v)
             cands.append(_edge_cand(
-                "regroup", u, v, "bridges", score=(su + sv) + 1e-3, specificity=spec, section="§8",
+                "regroup", u, v, BRIDGES_RELATION, score=(su + sv) + 1e-3, specificity=spec, section="§8",
                 rationale=(f"invisible under the prior partition: {_attr(G, u, 'label', u)} and "
                            f"{_attr(G, v, 'label', v)} share community c{ou} at the stored resolution but "
                            f"split apart when re-partitioned")))
@@ -328,56 +356,53 @@ def transplant(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
         return []
     if und is None:
         und = G.to_undirected()  # hoisted once: absorption() reads its neighbours m times per call (perf)
-    by_comm: dict = defaultdict(list)
-    for n in G.nodes():
-        by_comm[_attr(G, n, "community", -1)].append(n)
-    if len([c for c in by_comm if c != -1]) < 2:
+    by_comm = _members_by_community(G)
+    if len([c for c in by_comm if c != NO_COMMUNITY]) < 2:
         return []
     # the hub: highest-degree node in a real community
-    hub = max((n for n in G.nodes() if _attr(G, n, "community", -1) != -1),
+    hub = max((n for n in G.nodes() if _attr(G, n, "community", NO_COMMUNITY) != NO_COMMUNITY),
               key=lambda n: (float(_attr(G, n, "degree", 0)), n), default=None)
     if hub is None:
         return []
-    hub_comm = _attr(G, hub, "community", -1)
+    hub_comm = _attr(G, hub, "community", NO_COMMUNITY)
     # the hub's dominant outgoing relation (its reorganising pattern)
     rel_counts: dict = defaultdict(int)
     for _, _, data in G.out_edges(hub, data=True):
         rel_counts[data.get("relation", "")] += 1
     if not rel_counts:
         return []
-    rstar = max(sorted(rel_counts), key=lambda r: rel_counts[r])
+    dominant_relation = max(sorted(rel_counts), key=lambda r: rel_counts[r])
     # absorption capacity per other community: mean specificity / density
     def absorption(members):
         m = len(members)
         if m < 1:
             return 0.0
-        ms = set(members)
-        internal = {frozenset((u, v)) for u in members for v in und.neighbors(u)
-                    if v in ms and u != v}
-        density = (len(internal) / (m * (m - 1) / 2)) if m > 1 else 1.0
+        member_set = set(members)
+        e_int = _internal_edge_count(und, member_set)
+        density = (e_int / (m * (m - 1) / 2)) if m > 1 else 1.0
         mean_spec = sum(float(_attr(G, u, "specificity", 1.0)) for u in members) / m
         return mean_spec / (density + 1e-6)
-    targets = [(c, members) for c, members in by_comm.items() if c != hub_comm and c != -1]
+    targets = [(c, members) for c, members in by_comm.items() if c != hub_comm and c != NO_COMMUNITY]
     if not targets:
         return []
-    best_c, best_members = max(targets, key=lambda cm: (absorption(cm[1]), cm[0]))
+    best_c, best_members = max(targets, key=lambda c_members: (absorption(c_members[1]), c_members[0]))
     best_absorption = absorption(best_members)  # loop-invariant: compute once, reuse per candidate (perf)
     if adj is None:
         adj = _undirected_adjacency(G)
     cands: list = []
-    for b in sorted(best_members, key=lambda n: (-float(_attr(G, n, "degree", 0)), n)):
-        if b == hub or b in adj[hub]:
+    for target_node in sorted(best_members, key=lambda n: (-float(_attr(G, n, "degree", 0)), n)):
+        if target_node == hub or target_node in adj[hub]:
             continue
-        if _is_failure(failures, hub, rstar, b):
+        if _is_failure(failures, hub, dominant_relation, target_node):
             continue
-        spec = min(float(_attr(G, hub, "specificity", 1.0)), float(_attr(G, b, "specificity", 1.0)))
+        spec = _pair_specificity(G, hub, target_node)
         score = float(_attr(G, hub, "degree", 0)) * best_absorption
         cands.append(_edge_cand(
-            "transplant", hub, b, rstar, score=score, specificity=spec, section="§5",
+            "transplant", hub, target_node, dominant_relation, score=score, specificity=spec, section="§5",
             rationale=(f"macro-bridge: transplant hub '{_attr(G, hub, 'label', hub)}' (c{hub_comm}, "
-                       f"degree {int(_attr(G, hub, 'degree', 0))}) reorganising relation '{rstar}' into "
+                       f"degree {int(_attr(G, hub, 'degree', 0))}) reorganising relation '{dominant_relation}' into "
                        f"the more absorptive community c{best_c}; hidden commitments to audit: does "
-                       f"'{_attr(G, b, 'label', b)}' actually admit a '{rstar}' the way the hub's targets do?")))
+                       f"'{_attr(G, target_node, 'label', target_node)}' actually admit a '{dominant_relation}' the way the hub's targets do?")))
     return _rank(cands, k)
 
 
@@ -412,11 +437,11 @@ def ensemble(G, *, pack, corpus, failures, k=10, second_graph=None, und=None, ad
             if key in seen:
                 continue
             seen.add(key)
-            if _is_failure(failures, u, "bridges", v):
+            if _is_failure(failures, u, BRIDGES_RELATION, v):
                 continue
-            spec = min(float(_attr(G, u, "specificity", 1.0)), float(_attr(G, v, "specificity", 1.0)))
+            spec = _pair_specificity(G, u, v)
             cands.append(_edge_cand(
-                "ensemble", u, v, "bridges", score=1.0, specificity=spec, section="§9",
+                "ensemble", u, v, BRIDGES_RELATION, score=1.0, specificity=spec, section="§9",
                 rationale=(f"exo bridge: {_attr(G, u, 'label', u)} ⇄ {_attr(G, v, 'label', v)} is adjacent "
                            f"in the SECOND construction but absent here — external structure our own "
                            f"dynamics resisted (perturbation=external)")))
@@ -501,8 +526,8 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
         return _shared_adj
 
     # perf #13 — memoize the §8 Leiden re-partition for the run: regroup and ensemble's degraded path
-    # both consume it, so on an 'all' run it is computed once instead of twice. Computed lazily; `_UNSET`
-    # means "not yet computed", distinct from a real None result (both community algorithms failed).
+    # both consume it, so on an 'all' run it is computed once instead of twice. Computed lazily; here
+    # `_UNSET` means "not yet computed", distinct from a real None result (see the sentinel def).
     _shared_repart = _UNSET
 
     def repart_of():
@@ -513,6 +538,8 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
 
     out: list = []
     for m in mechs:
+        # Each branch mirrors that mechanism's keyword-only signature, threading only the lazy thunks it
+        # accepts (perf #12/#13). The ladder covers all six distinct _DISPATCH functions exhaustively.
         fn = _DISPATCH[m]
         if fn is bridge:
             out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, adj=adj_of())
@@ -531,8 +558,6 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
             ens_repart = repart_of() if second_graph is None else _UNSET
             out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, second_graph=second_graph,
                       und=und_of(), adj=adj_of(), new_comm=ens_repart)
-        else:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k)
     # Dedup EDGE candidates across mechanisms by (source, target, relation) — the triple the canonical
     # edge_id derives from (review-low): with `second_graph=None`, ensemble degrades to regroup and
     # re-emits the SAME edges under a second mechanism name; other mechanisms can also independently

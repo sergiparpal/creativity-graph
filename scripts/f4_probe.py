@@ -39,6 +39,27 @@ ASTROLOGY = {"fabricated", "vague"}
 VALID_VERDICTS = GOOD | ASTROLOGY | {"wrong_type"}
 TRUE_VALUES = {"y", "yes", "true", "1"}  # accepted spellings for span_found
 
+PRECISION_GATE = 0.70    # advisory exit gate printed by score() (this script measures, never enforces)
+CALIBRATION_GAP = 0.10   # mean-confidence gap that counts as "scores track correctness"
+MIN_RELATION_N = 3       # don't show a per-relation precision under this many labeled edges
+SAMPLE_SEED = 42         # fixed seed so sheet() samples reproducibly
+TOP_RELATIONS = 15       # cap on the top-relations list in summary()
+
+
+def _verdict(row):
+    """The verdict cell of a label row, normalized (stripped + lowercased)."""
+    return row.get("verdict", "").strip().lower()
+
+
+def _is_correct(row):
+    """True iff the row's normalized verdict counts as correct."""
+    return _verdict(row) in GOOD
+
+
+def _span_found(row):
+    """True iff the row's span_found cell is one of the accepted true spellings."""
+    return row.get("span_found", "").strip().lower() in TRUE_VALUES
+
 
 def _flag_str(args, name, default):
     if name not in args:
@@ -79,24 +100,26 @@ def load(path):
     return nodes, edges, id2label, id2type
 
 
+def _print_counter(title, counter, top=None, row=lambda k, v: f"  {k:12} {v}"):
+    """Print a titled Counter as most_common rows; `top` caps the rows, `row` formats each."""
+    print(title)
+    for k, v in counter.most_common(top):
+        print(row(k, v))
+
+
 def summary(path):
     nodes, edges, _, id2type = load(path)
     print(f"nodes: {len(nodes)}   edges: {len(edges)}\n")
 
     by_type = Counter(n.get("file_type", "?") for n in nodes)
-    print("nodes by file_type:")
-    for k, v in by_type.most_common():
-        print(f"  {k:12} {v}")
+    _print_counter("nodes by file_type:", by_type)
 
     by_conf = Counter(e.get("confidence", "?") for e in edges)
-    print("\nedges by confidence:")
-    for k, v in by_conf.most_common():
-        print(f"  {k:12} {v}")
+    _print_counter("\nedges by confidence:", by_conf)
 
     by_rel = Counter(e.get("relation", "?") for e in edges)
-    print(f"\ntop relations ({len(by_rel)} distinct):")
-    for k, v in by_rel.most_common(15):
-        print(f"  {v:4}  {k}")
+    _print_counter(f"\ntop relations ({len(by_rel)} distinct):", by_rel,
+                   top=TOP_RELATIONS, row=lambda k, v: f"  {v:4}  {k}")
 
     scores = [e.get("confidence_score") for e in edges
               if e.get("confidence") == INFERRED and e.get("confidence_score") is not None]
@@ -121,7 +144,7 @@ def sheet(path, n, out, include_extracted):
         pool = [(i, e) for i, e in pool if e.get("confidence") != EXTRACTED]
     if not pool:
         sys.exit("no edges to label (try --include-extracted)")
-    random.seed(42)
+    random.seed(SAMPLE_SEED)
     random.shuffle(pool)
     pick = pool[:n]
 
@@ -144,14 +167,15 @@ def sheet(path, n, out, include_extracted):
     print(f"  python f4_probe.py score {out}")
 
 
-def score(path):
+def _load_labeled_rows(path):
+    """Read the label CSV, keeping only rows with a non-empty verdict cell."""
     with open(path, encoding="utf-8-sig") as f:
-        rows = [r for r in csv.DictReader(f) if r.get("verdict", "").strip()]
-    if not rows:
-        sys.exit("no labeled rows (fill the `verdict` column first)")
+        return [r for r in csv.DictReader(f) if _verdict(r)]
 
-    n = len(rows)
-    verdicts = Counter(r["verdict"].strip().lower() for r in rows)
+
+def _report_headline(rows, n):
+    """Print the precision / astrology / span-support headline block."""
+    verdicts = Counter(_verdict(r) for r in rows)
     unknown = {v: c for v, c in verdicts.items() if v not in VALID_VERDICTS}
     if unknown:
         print(f"WARNING: {sum(unknown.values())} row(s) carry an unrecognized verdict "
@@ -159,54 +183,76 @@ def score(path):
               f"but still count toward the denominator, deflating precision. Fix them.", file=sys.stderr)
     correct = sum(verdicts[v] for v in GOOD)
     astro = sum(verdicts[v] for v in ASTROLOGY)
-    span_y = sum(1 for r in rows if r.get("span_found", "").strip().lower() in TRUE_VALUES)
+    span_y = sum(1 for r in rows if _span_found(r))
 
     print(f"labeled edges: {n}\n")
-    print(f"PRECISION (correct / labeled):        {correct/n:.2f}   <- exit gate is >= 0.70")
+    print(f"PRECISION (correct / labeled):        {correct/n:.2f}   <- exit gate is >= {PRECISION_GATE:.2f}")
     print(f"astrology rate (fabricated+vague):    {astro/n:.2f}   <- the grounding risk, measured")
     print(f"span-support rate (span_found=y):     {span_y/n:.2f}   <- the span-present check")
+    return verdicts
 
+
+def _report_verdict_breakdown(verdicts, n):
+    """Print the per-verdict count breakdown."""
     print("\nverdict breakdown:")
     for v, c in verdicts.most_common():
         print(f"  {v:12} {c:4}  ({100*c/n:.0f}%)")
 
+
+def _report_per_relation(rows):
+    """Print precision per relation type for relations with enough labeled edges."""
     per_rel = defaultdict(lambda: [0, 0])
     has_relation = any("relation" in r for r in rows)
     for r in rows:
-        ok = r["verdict"].strip().lower() in GOOD
+        ok = _is_correct(r)
         rel = r.get("relation") or "?"
         per_rel[rel][0] += ok
         per_rel[rel][1] += 1
-    print("\nprecision per relation (n>=3):")
+    print(f"\nprecision per relation (n>={MIN_RELATION_N}):")
     if not has_relation:
         # don't present a single bogus "?" bucket as a per-relation breakdown when the sheet simply has
         # no 'relation' column — say so instead (review-nit).
         print("  (no 'relation' column in the sheet — per-relation breakdown unavailable)")
     else:
         for rel, (ok, tot) in sorted(per_rel.items(), key=lambda x: -x[1][1]):
-            if tot >= 3:
+            if tot >= MIN_RELATION_N:
                 print(f"  {ok/tot:.2f}  ({ok}/{tot})  {rel}")
 
-    # does a numeric confidence (if present) predict correctness?
-    cs_correct, cs_wrong = [], []
+
+def _report_calibration(rows):
+    """Print whether a numeric confidence_score (if present) predicts correctness."""
+    scores_for_correct, scores_for_wrong = [], []
     for r in rows:
         try:
-            cs = float(r.get("confidence_score", ""))
+            score = float(r.get("confidence_score", ""))
         except (ValueError, TypeError):
             continue
-        if not math.isfinite(cs):  # 'NaN'/'inf' parse to a float but would poison the calibration mean
+        if not math.isfinite(score):  # 'NaN'/'inf' parse to a float but would poison the calibration mean
             continue
-        (cs_correct if r["verdict"].strip().lower() in GOOD else cs_wrong).append(cs)
-    if cs_correct and cs_wrong:
-        mc, mw = sum(cs_correct)/len(cs_correct), sum(cs_wrong)/len(cs_wrong)
+        (scores_for_correct if _is_correct(r) else scores_for_wrong).append(score)
+    if scores_for_correct and scores_for_wrong:
+        mean_correct = sum(scores_for_correct)/len(scores_for_correct)
+        mean_wrong = sum(scores_for_wrong)/len(scores_for_wrong)
         print("\nconfidence calibration (does the numeric confidence predict correctness?):")
-        print(f"  mean confidence_score | correct edges:   {mc:.2f}")
-        print(f"  mean confidence_score | incorrect edges: {mw:.2f}")
-        gap = mc - mw
-        verdict = ("scores track correctness — the confidence means something"
-                   if gap >= 0.10 else
-                   "scores DON'T separate correct from wrong — confidence is vocabulary, not grounding")
-        print(f"  gap: {gap:+.2f}  ->  {verdict}")
+        print(f"  mean confidence_score | correct edges:   {mean_correct:.2f}")
+        print(f"  mean confidence_score | incorrect edges: {mean_wrong:.2f}")
+        gap = mean_correct - mean_wrong
+        calibration_msg = ("scores track correctness — the confidence means something"
+                           if gap >= CALIBRATION_GAP else
+                           "scores DON'T separate correct from wrong — confidence is vocabulary, not grounding")
+        print(f"  gap: {gap:+.2f}  ->  {calibration_msg}")
+
+
+def score(path):
+    rows = _load_labeled_rows(path)
+    if not rows:
+        sys.exit("no labeled rows (fill the `verdict` column first)")
+
+    n = len(rows)
+    verdicts = _report_headline(rows, n)
+    _report_verdict_breakdown(verdicts, n)
+    _report_per_relation(rows)
+    _report_calibration(rows)
 
 
 def main():
@@ -219,7 +265,7 @@ def main():
             summary(path)
         elif cmd == "sheet":
             sheet(path, _flag_int(args, "--n", 80), _flag_str(args, "--out", "labels.csv"),
-                  "--include-extracted" in args)
+                  include_extracted="--include-extracted" in args)
         elif cmd == "score":
             score(path)
         else:
