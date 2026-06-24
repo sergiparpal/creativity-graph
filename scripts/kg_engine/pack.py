@@ -91,8 +91,10 @@ def coverage(pack: PackContract, source_text: str) -> dict:
 
 
 def _term_in_text(term: str, text: str) -> bool:
-    """True iff `term` occurs in `text` not embedded inside a larger word (so 'io' matches 'io' but
-    not 'ratio'). Word-boundary lookarounds, robust to terms with leading/trailing non-word chars."""
+    """True iff `term` occurs in `text` not embedded inside a larger word (so 'io' matches 'io' but not
+    'ratio'). Uses `\\w`-boundary lookarounds; this is exact for a term that BEGINS and ENDS with a word
+    character. For a term whose own first/last char is itself a non-word char, the boundary check is
+    applied against that punctuation, so matching there is best-effort rather than guaranteed (review-nit)."""
     return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) is not None
 
 

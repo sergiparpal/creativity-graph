@@ -174,10 +174,10 @@ class Scrubber:
             return ph
 
         out = text
-        # caller-supplied literal terms first (e.g. a names list for this corpus)
+        # caller-supplied literal terms first (e.g. a names list for this corpus). These are an EXPLICIT
+        # redaction request, so honor them at EVERY tier — a lower sensitivity must not silently drop a
+        # caller's own term list (review-low). Pattern-based categories below still respect `active`.
         for cat, terms in self.extra_terms.items():
-            if cat not in active and cat != "SECRET":
-                continue
             for term in sorted(terms, key=len, reverse=True):
                 if not term:
                     continue
