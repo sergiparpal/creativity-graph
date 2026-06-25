@@ -140,6 +140,36 @@ scripts/launch_server.mjs`) self-heals the venv in the foreground if it is spawn
 finishes, so it starts cleanly on a fresh machine. See *Installation system* in `CLAUDE.md` for the
 full chain.
 
+### Troubleshooting install
+
+**`/plugin install` says `Plugin "creativity-graph" not found in marketplace "sergiparpal"` — even
+though `/plugin marketplace add` reported success.** This is a **stale marketplace cache**, not a
+problem with the published manifest. `marketplace add` reports "Successfully added" even when it reuses
+an existing cached clone of the marketplace (under `~/.claude/plugins/marketplaces/<name>/`), so an old
+clone that predates the plugin entry hides it from the install lookup. Fix it in order:
+
+```
+# 1. Refresh the cached manifest, then retry the install:
+/plugin marketplace update sergiparpal
+/plugin install creativity-graph@sergiparpal
+
+# 2. Still "not found"? Remove and re-add the marketplace fresh:
+/plugin marketplace remove sergiparpal
+/plugin marketplace add sergiparpal/creativity-graph
+/plugin install creativity-graph@sergiparpal
+```
+
+If it *still* fails after that, delete the cached clone (`rm -rf
+~/.claude/plugins/marketplaces/sergiparpal`) and restart Claude Code — the in-session marketplace
+registry isn't always refreshed until restart — then redo step 2. As a last resort, confirm the machine
+can actually reach GitHub (a failed clone silently falls back to cache); anything other than `200` here
+is a network/access problem on that machine, not the repo:
+
+```sh
+curl -sS -o /dev/null -w "%{http_code}\n" \
+  https://raw.githubusercontent.com/sergiparpal/creativity-graph/main/.claude-plugin/marketplace.json
+```
+
 ### Multi-machine / multi-branch canon merges (optional)
 
 The canon is one Markdown file per node, so two machines (or two branches) editing the **same** node

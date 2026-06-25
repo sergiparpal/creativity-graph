@@ -14,6 +14,15 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Troubleshooting note for `Plugin "creativity-graph" not found in marketplace "sergiparpal"` after a
+  successful `marketplace add`.** Documented in the README *Install & enable* section that this is a
+  stale marketplace cache (`marketplace add` reports success even when it reuses a cached clone that
+  predates the plugin entry), with the ordered fix — `marketplace update` → remove + re-add → delete
+  `~/.claude/plugins/marketplaces/<name>/` and restart — and a `curl` reachability check to rule out a
+  silent clone-failure fallback to cache.
+
 ## [0.4.0] — 2026-06-25
 
 ### Added
