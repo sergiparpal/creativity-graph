@@ -60,10 +60,16 @@ same identity updates the existing one, never creates a duplicate. `edge.id` is 
   author a candidate); payload set `epistemic_state` to any non-`unverified` state (a verdict **or**
   `obsolete`) → reset to `unverified` (those flow only through `kg_ground`).
 - `QUARANTINED` — structurally valid but untrusted; not merged into trusted canon. Cases: undeclared
-  node/edge type (routed to the `undeclared-type` bucket, never silently accepted); reconciler-detected
-  out-of-band epistemic_state transition (forged verdict re-quarantined).
+  node/edge type (routed to the `undeclared-type` bucket, never silently accepted); an edge that collapses
+  into failure memory — its id, or on the hypothesized lane its reverse, already `rejected`/`failed`
+  (`collapses-into-known-failure`, §1.7); a re-emit of an edge already carrying a positive verdict
+  (`grounded`/`obsolete`) so the incoming-wins merge can't overwrite it (`collapses-into-known-verdict`,
+  §1.8); reconciler-detected out-of-band epistemic_state transition (forged verdict re-quarantined).
 - `REJECTED`  — hard fail, not written. Cases: no supporting span (`no-supporting-span`); span not found in
-  source (`span-not-in-source`, fabrication); degenerate/too-short span (`span-too-short`); truncated/partial payload; schema-invalid.
+  source (`span-not-in-source`, fabrication); span present in the corpus but absent from the edge's named
+  `source_file` (`span-not-in-named-source`, R4); degenerate/too-short span (`span-too-short`); net-new
+  writable node/edge past the flood budget (`rate-limited-flood`, §Stage 9); a span-present/inferred item
+  submitted on the propose lane (`propose-lane-text-claim`); truncated/partial payload; schema-invalid.
 
 `retryable=false` for **semantic** rejections (no-span, span-not-in-source, span-too-short); `retryable=true` for
 **transport** failures (truncation, schema). Reason string always set. (`vague` is *not* a boundary reason —
@@ -89,8 +95,11 @@ demoted to `unverified` (every lane, including hypothesized). `authored_by=human
 `agent`. A claimed `authored_by=deterministic` is demoted to `agent` on the span-present/inferred lane (it
 would bypass the span check); on the **hypothesized** lane there is no span check to bypass, so a
 deterministic discovery-mechanism author is **preserved** there. Verdicts are applied ONLY through
-`kg_ground`, which stamps `verdict_by`, `verdict_at`, and appends an audit record. The reconciler
-re-quarantines any out-of-band epistemic_state transition that lacks a matching audit record.
+`kg_ground` (and the id-migrating `kg_rename`), which stamp `verdict_by`, `verdict_at`, and append a record
+to the crash-safe `GroundAuditLog` (`groundaudit`, §1.8) via `audited_write` (capturing the offset first so a
+failed canon write truncates the orphan record back). The reconciler *counts* those records (`_audit_counts`,
+not set-membership, so a replayed verdict has no unconsumed record left) and re-quarantines any out-of-band
+epistemic_state transition that lacks an unconsumed audit record.
 
 ## Memory of failures (§1.7)
 
@@ -117,13 +126,16 @@ edit, or a non-git vault — still reprojects.
   in-memory byte-snapshot rollback; the git commit is best-effort, outside the rollback scope),
   `all_nodes`, `all_edges`; `LeaseLock(path, ttl)` with `acquire/heartbeat/release/is_stale`.
 - `reconciler`: `Reconciler(canon, state_path)` with `scan(full_sweep=False) -> ReconcileReport`;
-  `reattach_after_reproject(graph_json) -> OrphanReport`.
+  `reattach_after_reproject(graph_json) -> OrphanReport`. The reader half of the §1.8 forge-detection
+  protocol — counts the `GroundAuditLog` records (`groundaudit`) so each legitimate transition consumes
+  exactly one, catching a replayed out-of-band verdict.
 - `scrub`: `Scrubber(sensitivity)` with `scrub(text) -> (scrubbed, mapping)`; `restore(text, mapping)`.
 - `pack`: pydantic `PackContract`; `load_pack(path) -> PackContract`; `coverage(pack, source_text) -> dict`.
 - `projector`: `Projector(canon, derived_dir)` with `project(incremental=True) -> ProjectReport`;
   `kg_context(query=None, budget=2000) -> dict`.
 - `harness`: `agreement(label_sets) -> alpha`; `specificity(graph, corpus) -> verdict`;
-  `ideation(outputs_by_condition) -> table`; `absorption(graph, history, *, now) -> dict` (§14 window).
+  `ideation(outputs_by_condition, source_text="") -> dict` (`{table, verdict}`, the headline graph-vs-control
+  verdict, plus a `generate_verdict` when a `graph+generate` arm is present); `absorption(graph, history, *, now) -> dict` (§14 window).
 - `generate`: `run_generators(G, mechanism, *, pack, corpus, failures, k, second_graph) -> list[Candidate]`
   — the six discovery mechanisms `bridge/seed/compression/regroup/transplant/ensemble` (read-only, hypothesized
   candidates); `load_second_graph(path)` for the §9 ensemble.
@@ -131,6 +143,24 @@ edit, or a non-git vault — still reprojects.
   (+ `DISPATCH`), each returning a propose-lane payload (`provenance=hypothesized`, no span, no verdict).
 - `backend`: `BackendExtractor` + `main(argv)` — the headless `python -m kg_engine.backend extract` driver
   (extract → boundary → canon → project) used for an unattended, session-less rebuild.
+- `sources`: `SourceSet(path=None)` resolving a file | dir | glob of `.md`/`.txt` into an ordered
+  `texts() -> {basename: text}` view (R4); `verifies(span, source_file="")` for source-aware span checking
+  (the named file when known, else any declared source); classmethod `signature(path)` for the memo key.
+- `graphio`: version-robust node-link (de)serialization `node_link_graph(data)` / `_node_link_data(G)`
+  (the on-disk `graph.json` shape, §1.2) + `node_attr(G, n, key, default)`; a dependency-free leaf that
+  breaks the `projector ↔ harness` / `generate → projector` import cycle.
+- `groundaudit`: `GroundAuditLog(path)` with `append`/`truncate`/`size`/`audited_write(records, attempt)`
+  — the crash-safe §1.8 grounding-audit **writer** half (the reconciler is the reader); raises
+  `OrphanAuditError` when a failed transition's compensating truncate cannot complete.
+- `atomicio`: crash-safe `atomic_write_bytes(path, data)` / `atomic_write_text(path, text)`
+  (temp → fsync → `os.replace`); stdlib-only, shared by the engine (`canon`, `projector`) and the
+  installer (`bootstrap`).
+- `export`: `build_html(engine)` / `build_report(engine)` / `export(engine, kind)` — the read-only R1
+  render of the derived layer into a self-contained `graph.html` + `GRAPH_REPORT.md`; never writes the
+  canon or the derived index (`projector` stays its sole writer).
+- `canonmerge`: `merge_nodes` / `merge_note_files` / `main` — the R5 semantic git merge driver for
+  per-node canon Markdown (union edges by `edge_id`, demote a cross-branch verdict conflict to
+  `unverified`); structurally incapable of forging a verdict.
 - `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 17 tools: `kg_ping`,
   `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`
   (read-only structural agenda), `kg_export` (read-only human-facing render), `kg_write`, `kg_ground`,

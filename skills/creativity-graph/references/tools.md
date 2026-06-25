@@ -3,7 +3,10 @@
 Load on demand. The MCP **tool surface** (graph mutation + read), then the deterministic **CLI surface**
 (`f4_probe.py`, `kg_engine.pack`, `kg_engine.harness`). Every name, signature, and return shape below
 mirrors `scripts/kg_engine/server.py` + `scripts/kg_engine/projector.py`. Nothing here is invented — if a
-field is missing, grep the engine source, don't guess.
+field is missing, grep the engine source, don't guess. Every tool is also wrapped by a uniform
+transport-error envelope: a RAISED internal exception (not a deliberate domain `{ok:false}` disposition)
+returns `{"ok": false, "error": "<message>", "error_kind": "<ExceptionType>"}` and is logged, so a tool
+call never crashes the session; success returns and domain `{ok:false}` results pass through unchanged.
 
 ---
 
@@ -119,7 +122,7 @@ record so the reconciler treats the transition as legitimate.
 ```
 
 A promoted hypothesis adds `"provenance_upgraded_to": "span-present" | "inferred"` to the success return.
-On failure: `{"ok": false, "error": "invalid verdict 'maybe'"}` / `"node not found"` / `"edge not found"`.
+On failure: `{"ok": false, "error": "invalid verdict 'maybe'"}` / `"invalid kind 'Node'; expected node|edge"` / `"node not found"` / `"edge not found"`.
 Promotion-specific refusals: `hypothesis-needs-support` (grounding a `hypothesized` edge with neither
 `support_span` nor `support_note`), `support-span-not-in-source`, `support-span-too-short`.
 For an edge, also sets `verdict_by` (always `agent` via this tool — a human verdict cannot be forged

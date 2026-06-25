@@ -15,7 +15,7 @@ A conceptual document does not verify itself the way code verifies against a par
 (`examples/source.md` §intro). A naive extractor turns such prose into convincing nonsense.
 This plugin extracts a graph, then forces every non-trivial edge to earn its place against the
 *original text* and against adversarial attack. A deterministic Python engine (`scripts/kg_engine`,
-267 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
+496 tests green) does the rule-bound work; this session and its subagents do the LANGUAGE work and
 hand structured JSON back across the MCP boundary. Your job is to orchestrate, not to forge.
 
 ## The model: canon vs derived (§1.2)

@@ -117,6 +117,12 @@ Structurally valid but untrusted; not merged into trusted canon, routed to the `
 Reasons:
 - `undeclared-node-type` — `node_type` not in the pack's `node_types`.
 - `undeclared-edge-type` — `relation` not in the pack's `edge_types`.
+- `collapses-into-known-failure` — a re-emitted edge whose canonical id already lives in `FAILURE_STATES`
+  (`rejected`/`failed`); on the hypothesized lane its **reverse** counts too. Failure memory binds
+  re-extraction (§1.7).
+- `collapses-into-known-verdict` — a text-claim re-emit of an edge already `grounded`/`obsolete`; held so
+  the canon's incoming-wins merge can't reset the verdict to a fresh `unverified` edge on an idempotent
+  `/kg-build` re-run (§1.8).
 
 The reconciler also **re-quarantines** any out-of-band `epistemic_state` transition (a forged verdict
 edited straight into canon, bypassing `kg_ground`).

@@ -96,6 +96,33 @@ JSON back across the MCP boundary.
   kg_engine.export html|report|all`, the `kg_export` MCP tool, and the `/kg-view` command. MCP tool surface
   grows **16 → 17**. Coverage in `tests/test_export.py`.
 
+### Changed
+
+- **Uniform MCP transport-error envelope across all 17 tools.** The tools previously exposed four
+  inconsistent error shapes to a client (mutations `{ok:false, error}`; `get_node` `{error:…}` with no
+  `ok` key; reads `None`; and `query_graph`/`kg_context`/`get_neighbors` letting a mid-read SQLite/NetworkX
+  error raise straight through as an MCP-level exception). A `functools.wraps` `_tool_result` decorator
+  stacked under every `@mcp.tool()` now turns a **raised** exception into a uniform
+  `{ok:false, error, error_kind}` envelope (plus a logged warning), while success returns — including the
+  deliberate `{ok:false}` domain dispositions and the reads' own `{path:…}`/`{error:"not found"}`/list/`None`
+  shapes — pass through **unchanged**, so transport ok/error and domain disposition stay two orthogonal axes
+  and the never-stall contract holds. `wraps` keeps each signature, so FastMCP still builds the correct tool
+  schema (verified through a real FastMCP, not just the test harness). Adds the engine's first logging seam
+  (`logging.getLogger("kg_engine")`): the two silent `except Exception: pass` index fallbacks (edge-owner
+  lookup, `kg_metrics`) now `logger.debug` before falling back.
+- **Internal — new leaf modules, decoupling, and hot-path perf (no observable behavior change).** Three
+  dependency-free leaves were lifted out of larger modules: `groundaudit.py` (`GroundAuditLog` — the §1.8
+  grounding-audit durability protocol `append`/`truncate`/`audited_write`, formerly inline in the `KGEngine`
+  facade), `graphio.py` (the NetworkX node-link adapters `_node_link_data`/`node_link_graph` + a public
+  `node_attr`, breaking the `projector`↔`harness` import cycle so all three import downward), and
+  `atomicio.py` (`atomic_write_bytes`/`atomic_write_text`, single-sourcing the temp+fsync+replace core
+  previously duplicated across `canon`/`projector`/`bootstrap`); plus a shared `scripts/_engine_resolve.mjs`
+  for venv/interpreter/`PYTHONPATH` resolution and the retirement of three cross-module coupling smells. On
+  the hot path, betweenness is now recomputed only on a full rebuild or a genuine live-topology change (a
+  sha256 over the failure-filtered structure), eliminating the O(V·E) recompute on every `/kg-ground` drain;
+  the canon parse that `is_stale()` performs is shared into `project()` instead of parsed twice; and `CSafeLoader`
+  fronts the parse path. All §1.x invariants preserved (114 + 3 maintainability/perf findings resolved).
+
 ### Fixed — second exhaustive review (48 findings)
 
 A full-codebase review of the R1–R6 additions (which landed after the v0.3.0 review) plus a regression
@@ -141,6 +168,41 @@ tests; the full suite is green (392).
   line; the canon merge driver writes atomically and fails open; `source_path` userConfig is `string`
   (so a directory/glob is selectable); igraph/leidenalg gain upper bounds; plus assorted comment/docstring
   corrections.
+
+### Fixed — third exhaustive review (49 findings)
+
+A later full-codebase review (53 candidate issues; 49 confirmed after adversarial per-finding
+verification) of the post-R1–R6 engine. All fixed here with regression tests; the suite grew 414 → 496.
+
+- **Verdict-integrity / §1.8 audit-log forge-proofing.** `_forged` drains an idempotent re-ground's
+  surplus audit record so it can never later justify an out-of-band forgery; the reconcile sweep re-folds
+  the audit log fresh and reads-under-lease before re-quarantine, so a verdict applied mid-sweep is not
+  reverted or clobbered; `GroundAuditLog.truncate()` reports success and `audited_write` raises
+  `OrphanAuditError` on an un-truncatable orphan (routed through the MCP error envelope) instead of silently
+  reporting a clean rollback (`append`/`truncate` fsync the parent dir; the batch loop is
+  compensation-guarded); `canon._merge_into_existing` carries a preserved verdict's span/provenance/notes
+  (not just its state), closing a `kg_propose` re-proposal leak.
+- **The degraded derived layer the PreToolUse hook silently served.** `hooks/precontext.py` hand-built a
+  `Projector` with no `source_set`/`specificity_seeds`/`metrics_mode`, so a hook-triggered projection
+  computed the IDF/specificity gate, `spec_betweenness`, and the R3 stale-verdict scan against an **empty**
+  corpus and wrote a `cheap_sig` identical to the server's — and because `is_stale()` is source-blind, the
+  server then served that degraded derived layer as fresh until the next canon write. Both construction
+  sites now collapse into one `_wire_projector` / `KGEngine.read_only_projector` seam, so the hook reads the
+  same corpus and specificity seeds as a full engine.
+- **Cross-platform / locks.** `git merge-file` stdout decoded `encoding="utf-8"` (Windows mojibake); the
+  bootstrap lock gains a pid-liveness probe, post-steal heartbeat re-validation, and ownership-verified
+  release (mirroring `LeaseLock`).
+- **Egress scrub.** Cumulative reserved-literal tracking + identity entries prevent over-expanding a literal
+  placeholder on restore; added base64/AWS-secret + natural-language-keyword rules; EMAIL claims a long
+  machine local-part ahead of the high-entropy fallback.
+- **Mediums/lows:** an in-payload duplicate of a flood-rejected net-new edge can no longer bypass the
+  rate-limit cap; `project()`'s contention branch heals an outdated schema (reads no longer crash on `no
+  such column`) and `ORDER BY`/`LIMIT` get a deterministic id tiebreak; `kg_ground` applies the
+  hypothesis-promotion gate to nodes and validates `kind`; `model` folds U+0130 before casefold for span
+  matching and raises the documented `ValueError` on non-dict frontmatter; `canon` reaps transient dotfiles
+  on the full sweep and restores a live lock on replace failure; `canonmerge` resolves equal-state edges
+  incoming-wins (aligned with `canon.py`); `export` escapes `source_file` and stops the layout loop when it
+  cools; `harness`/`pack`/`backend`/`f4_probe`/`validate_plugin`/CI/launcher hardening.
 
 ## [0.3.3] — 2026-06-23
 

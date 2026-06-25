@@ -25,7 +25,7 @@ A prose theory does not verify itself the way code verifies against a parse tree
 everything, edges no one ever checked, confident verdicts no one ever earned. This plugin
 exists to make that failure mode *structurally impossible*.
 
-A deterministic Python engine (`scripts/kg_engine`, 267 tests green) does the work that must be
+A deterministic Python engine (`scripts/kg_engine`, 496 tests green) does the work that must be
 exact — schema validation, span verification, verdict stamping, projection, scrubbing. The
 Claude Code session and its subagents do the **language** work — reading prose, proposing typed
 edges, copying spans, arguing the adversarial case — and hand structured JSON back across an
@@ -221,8 +221,11 @@ creativity-graph/
 ├── scripts/
 │   ├── kg_engine/                 # the deterministic engine
 │   │   ├── model.py boundary.py canon.py reconciler.py
-│   │   ├── projector.py scrub.py pack.py harness.py
+│   │   ├── atomicio.py groundaudit.py graphio.py   # IO/durability leaves (atomic writes · §1.8 audit log · node-link IO)
+│   │   ├── projector.py scrub.py pack.py harness.py sources.py   # sources.py = R4 multi-doc SourceSet
 │   │   ├── generate.py operations.py   # the generative layer (discovery mechanisms + §8 endo ops)
+│   │   ├── export.py templates/graph_html.py   # R1 human-facing render (kg_export → graph.html)
+│   │   ├── canonmerge.py              # R5 semantic git merge driver for per-node canon
 │   │   └── backend.py server.py        # headless extract CLI + FastMCP server
 │   ├── bootstrap.py               # cross-platform self-provisioning installer (uv | venv+pip)
 │   ├── launch_server.mjs          # Node MCP launcher (pointer + foreground catch-up)
@@ -399,7 +402,7 @@ Run from the repo with the engine venv (`/home/sergi/creativity-graph/.venv/bin/
 
 ```bash
 uv sync                                  # provision the engine venv (dev; the plugin runtime uses scripts/bootstrap.py)
-uv run pytest tests/ -q                  # → 267 passed
+uv run pytest tests/ -q                  # → 496 passed
 claude plugin validate --strict          # validate the plugin manifest + components
 ```
 
@@ -424,10 +427,14 @@ python -m kg_engine.harness ideation    outputs.json       # control|graph|graph
 
 `model` (enums + `Node`/`Edge` + `span_verifies`) · `boundary` (`validate_payload`) ·
 `canon` (`Canon`, atomic git-backed writes) · `reconciler` (re-attach verdicts, re-quarantine
-forgeries) · `projector` (`project`, `kg_context`) · `scrub` (`Scrubber`) · `pack`
-(`PackContract`, `coverage`) · `harness` (`agreement`/`specificity`/`ideation`) ·
-`generate` (`run_generators` — the six discovery mechanisms) · `operations` (the four §8 endo ops) ·
-`backend` (`BackendExtractor` — headless extract) · `server`
+forgeries) · `groundaudit` (`GroundAuditLog` — the §1.8 grounding-audit log the reconciler reads for
+forge detection) · `atomicio` (`atomic_write_bytes`/`atomic_write_text`) · `graphio` (node-link IO —
+`_node_link_data`/`node_link_graph`/`node_attr`) · `projector` (`project`, `kg_context`) · `scrub`
+(`Scrubber`) · `pack` (`PackContract`, `coverage`) · `sources` (`SourceSet` — R4 multi-doc ingestion) ·
+`harness` (`agreement`/`specificity`/`ideation`) · `generate` (`run_generators` — the six discovery
+mechanisms) · `operations` (the four §8 endo ops) · `export` (`build_html`/`build_report`/`export` —
+R1 human-facing render) · `canonmerge` (semantic git merge driver — mirror of
+`Canon._merge_into_existing`) · `backend` (`BackendExtractor` — headless extract) · `server`
 (`KGEngine` + FastMCP tool registration).
 
 ---

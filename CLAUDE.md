@@ -64,7 +64,10 @@ The **canon** is human-editable Markdown, one file per node at `${CLAUDE_PROJECT
 "contains nothing the canon does not" — disposable and rebuildable. `projector.py` precomputes only
 O(1) signals off the hot path (local degree; structural-bridge status from Leiden communities) and is
 the **only** writer of the derived layer; read tools rebuild it lazily when stale (content-hash per
-node). Verdicts survive a reprojection because `reconciler.py` re-attaches them from an audit log.
+node). Verdicts survive a reprojection because the canon is the source of truth: `reconciler.py`
+(`reattach_after_reproject`) re-matches each canon verdict against the freshly-projected edge ids. The
+§1.8 grounding-audit log (the `groundaudit.py` `GroundAuditLog` leaf) is a separate mechanism — it lets a
+real `kg_ground` verdict be told apart from an out-of-band forgery, which the reconciler re-quarantines.
 
 ### Three-axis provenance — orthogonal, never collapsed to one scalar
 Every node/edge carries three independent axes (`model.py` enums); a single "quality" number is
