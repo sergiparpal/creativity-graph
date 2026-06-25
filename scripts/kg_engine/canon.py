@@ -39,6 +39,22 @@ HEARTBEAT_REFRESHES_PER_TTL = 3
 # seconds — long past any live atomic-write/lock-reclaim window — so the reaper never races a write.
 BACKUP_RETENTION_PER_NOTE = 3
 TRANSIENT_REAP_TTL = 3600.0
+# Bounded wait for the single-writer lease before a WRITER gives up. A parallel /kg-build wave funnels
+# every kg_write through the ONE single-threaded MCP server process (FastMCP runs sync tools directly on
+# the event loop, so the brief write critical section is already serialized there), so the lease is only
+# ever genuinely contended ACROSS processes — the detached per-session reconcile worker
+# (`bootstrap --reconcile`) or the headless backend racing a server write. Each holder keeps the lease
+# only for its own brief write, so a writer that finds it taken retries with exponential backoff and
+# serializes cleanly instead of failing outright. Capped so a genuinely wedged LIVE foreign holder
+# surfaces as the locked-vault error rather than hanging forever. A DEAD holder on the SAME host is
+# reclaimed immediately via staleness inside acquire() (its pid no longer probes alive), so it is never
+# waited on; a CROSS-HOST holder's pid can't be probed (and Windows can't probe at all), so such a dead
+# holder is only seen stale once its lease TTL lapses — a writer may wait up to this budget meanwhile,
+# then surface the error, and a later attempt reclaims it. The default comfortably covers a full max-size
+# (10) wave of brief writes serializing; tests override it per Canon (e.g. 0 to assert the old immediate-fail).
+LOCK_ACQUIRE_TIMEOUT = 30.0
+LOCK_RETRY_INITIAL = 0.05
+LOCK_RETRY_MAX = 0.5
 # Grounding audit log (kg_ground tamper-evidence). Defined here — the lowest layer that must keep it
 # out of git — and re-exported by reconciler so server/tests have one source of truth.
 GROUND_AUDIT = ".kg-ground-audit.jsonl"
@@ -316,6 +332,10 @@ class Canon:
         self._notes_dir_resolved = self.notes_dir.resolve()
         self.lock = LeaseLock(self.root / LOCK_NAME)
         self._lock_depth = 0  # re-entrancy guard so nested writes don't deadlock the single-writer lease
+        # Bounded wait a WRITER tolerates for the lease before raising (cross-process contention only —
+        # see LOCK_ACQUIRE_TIMEOUT). Per-instance so a test can shorten/zero it; the lazy projector's
+        # try_acquire_lock() is unaffected and stays strictly non-blocking.
+        self.lock_acquire_timeout = LOCK_ACQUIRE_TIMEOUT
         # ensure_layout=False lets a READ-ONLY consumer (e.g. the precontext PreToolUse hook, which runs
         # on every Grep/Glob/Read) construct a Canon for kg_context reads WITHOUT the constructor side
         # effects: the canon-dir mkdir and the .git/info/exclude rewrite (_ensure_git_excludes re-reads
@@ -353,9 +373,36 @@ class Canon:
 
     # ---- single-writer lease (re-entrant within this process)
     def _acquire_lock(self) -> None:
-        if self._lock_depth == 0 and not self.lock.acquire():
+        if self._lock_depth == 0 and not self._acquire_lease_blocking():
             raise RuntimeError("canon vault is locked by another live session")
         self._lock_depth += 1
+
+    def _acquire_lease_blocking(self) -> bool:
+        """Acquire the single-writer lease, retrying with bounded exponential backoff while it is held by
+        ANOTHER live session, so near-simultaneous writers SERIALIZE cleanly instead of one failing
+        outright (a full parallel /kg-build wave's brief writes, or the detached reconcile worker racing a
+        server write — see LOCK_ACQUIRE_TIMEOUT for why contention is only ever cross-process).
+
+        LeaseLock.acquire() is idempotent for the OWNING process (same pid → re-acquire returns True on
+        the first attempt), so the server's own serialized writes never enter the backoff loop; the loop
+        only spins for a foreign LIVE holder, which keeps the lease only for its own brief write. A foreign
+        DEAD holder on the SAME host is reclaimed by acquire() itself (staleness via pid-probe), not by
+        waiting; a cross-host (or Windows) dead holder can't be pid-probed, so it is seen stale only once
+        its lease TTL lapses — the writer may wait up to the budget first, then a later attempt reclaims it.
+        Returns False only after the whole `lock_acquire_timeout` budget elapses (a wedged live, or
+        not-yet-TTL-stale cross-host dead, foreign holder), which the caller surfaces as the locked-vault
+        error. Only writers reach this; try_acquire_lock() stays strictly non-blocking so the lazy
+        projector never stalls a read behind a write."""
+        deadline = time.monotonic() + self.lock_acquire_timeout
+        backoff = LOCK_RETRY_INITIAL
+        while True:
+            if self.lock.acquire():
+                return True
+            now = time.monotonic()
+            if now >= deadline:
+                return False
+            time.sleep(min(backoff, deadline - now))
+            backoff = min(backoff * 2, LOCK_RETRY_MAX)
 
     def _release_lock(self) -> None:
         self._lock_depth -= 1

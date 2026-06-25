@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -341,3 +342,96 @@ def test_reclaim_does_not_orphan_live_record_on_restore_failure(tmp_path, monkey
     assert json.loads(p.read_text(encoding="utf-8"))["pid"] == me.pid
     # no sidelined leftover (the content-copy fallback unlinks it)
     assert not list(tmp_path.glob(f"{LOCK_NAME}.stale-*"))
+
+
+# --------------------------------------------------------------------------- parallel-wave lock contention
+# The /kg-build orchestrator launches one kg-extractor per section in BOUNDED PARALLEL WAVES; a full wave
+# finishing near-simultaneously means several writers contend for the single-writer lease at once. The
+# bounded retry-with-backoff in Canon._acquire_lock makes those brief writes SERIALIZE cleanly instead of
+# all-but-one failing with RuntimeError. Each writer here is a SEPARATE Canon with a distinct lock host,
+# faithfully simulating distinct processes (same pid, different host -> not _owned_by_self, and a foreign
+# host probes as a live holder), so the lease is genuinely contended rather than re-acquired idempotently.
+
+
+def _foreign_canon(vault: Path, host: str) -> Canon:
+    """A Canon whose lease looks like a distinct live session (foreign host), so two of them genuinely
+    contend on the one vault lock instead of sharing it as the same owner."""
+    c = Canon(vault)
+    c.lock.host = host
+    return c
+
+
+def test_full_wave_of_concurrent_writers_all_commit_none_corrupted(tmp_path: Path):
+    """A full max-size wave (10) of concurrent foreign-session writers all serialize on the lease and
+    commit: every node lands, none is corrupted, none is silently dropped, and no writer raises."""
+    WAVE = 10
+    canons = [_foreign_canon(tmp_path, f"writer-host-{i}") for i in range(WAVE)]
+    errors: list[str] = []
+    start = threading.Barrier(WAVE)
+
+    def writer(i: int, c: Canon) -> None:
+        try:
+            start.wait()  # release all writers at once -> maximal contention on the single lease
+            info = c.write_nodes([Node(id=f"n{i}", label=f"N{i}", body=f"body {i}")],
+                                 message=f"wave write {i}")
+            if info.rolled_back:
+                errors.append(f"writer {i} rolled back: {info.error}")
+        except Exception as e:  # noqa: BLE001 — a contended writer must retry+serialize, never raise
+            errors.append(f"writer {i} raised {type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=writer, args=(i, c)) for i, c in enumerate(canons)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not any(t.is_alive() for t in threads), "a writer deadlocked on the lease"
+    assert not errors, errors
+    got = {n.id: n for n in Canon(tmp_path).all_nodes()}
+    assert set(got) == {f"n{i}" for i in range(WAVE)}, f"missing/extra nodes: {sorted(got)}"
+    for i in range(WAVE):
+        assert got[f"n{i}"].body == f"body {i}", f"n{i} body corrupted: {got[f'n{i}'].body!r}"
+    # the lease is released and the vault is clean (lock gone, no sidelined leftovers)
+    assert not (tmp_path / LOCK_NAME).exists()
+    assert not list(tmp_path.glob(f"{LOCK_NAME}.release-*"))
+
+
+def test_contended_writer_waits_for_lease_then_commits(tmp_path: Path):
+    """A writer that finds the lease held by a live foreign session BLOCKS (bounded) until it is released,
+    then commits — it serializes rather than failing (the wave-finishing-near-simultaneously case)."""
+    holder = _foreign_canon(tmp_path, "holder-host")
+    assert holder.lock.acquire()  # hold the lease as a foreign live session
+    writer = _foreign_canon(tmp_path, "writer-host")
+    writer.lock_acquire_timeout = 10.0
+    done: dict = {}
+
+    def do_write() -> None:
+        done["info"] = writer.write_nodes([Node(id="late", label="Late", body="landed")],
+                                          message="late write")
+
+    t = threading.Thread(target=do_write)
+    t.start()
+    time.sleep(0.3)
+    assert "info" not in done, "writer should still be WAITING for the held lease, not done/failed"
+    holder.lock.release()  # free the lease — the waiter now acquires on its next retry
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert done["info"] and not done["info"].rolled_back
+    assert Canon(tmp_path).read_node("late").body == "landed"
+
+
+def test_writer_fails_fast_when_lease_held_and_retry_budget_zero(tmp_path: Path):
+    """With the retry budget zeroed, a writer that finds the lease held by a foreign live session fails
+    immediately with the locked-vault error — confirming the bounded retry is what serializes a real
+    wave (timeout=0 restores the pre-retry immediate-fail behavior)."""
+    holder = _foreign_canon(tmp_path, "holder-host")
+    assert holder.lock.acquire()
+    try:
+        writer = _foreign_canon(tmp_path, "writer-host")
+        writer.lock_acquire_timeout = 0.0
+        with pytest.raises(RuntimeError, match="locked by another live session"):
+            writer.write_nodes([Node(id="x", label="X")], message="should fail fast")
+    finally:
+        holder.lock.release()
+    # the failed write left nothing behind (atomic: no partial node persisted)
+    assert not Canon(tmp_path).exists("x")

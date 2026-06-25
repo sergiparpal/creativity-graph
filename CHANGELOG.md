@@ -14,8 +14,51 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-25
+
+### Added
+
+- **`/kg-build` now extracts in BOUNDED PARALLEL WAVES instead of strictly section-by-section.** The
+  orchestrator still launches **one `kg-extractor` subagent per `##` section** (the span-isolation property
+  — a section's text is the only text that extractor can see, which is what makes `span-present` (§1.5)
+  checkable rather than a paraphrase), but it now launches them concurrently in waves of `WAVE_SIZE` (issue
+  `WAVE_SIZE` `Task` calls in one batch, await the wave, launch the next), so a 19-section document is four
+  waves instead of 19 serial cold-started agents. The slow part — each extractor's token-by-token `kg_write`
+  payload generation — overlaps across the wave; the brief `kg_write` calls funnel through the one
+  single-threaded MCP server process and serialize there, so nothing is dropped or corrupted. No grounding
+  guarantee changes: parallelism is *across* launches, never *within* one (collapsing sections into a single
+  subagent would let a span be mis-attributed across sections of the same `source_file`, undetectable by the
+  boundary — so that is explicitly forbidden).
+- **New `extract_wave_size` plugin option (`userConfig`, `"type": "string"`, default `"6"`, range 1–10).** It
+  sets how many section-extractors `/kg-build` runs at once. It is an ORCHESTRATION knob consumed by the
+  command/skill, **not** the engine (it is the one `userConfig` key with no read in
+  `build_engine_from_env`, by design), surfaced like `source_path` as
+  `${CLAUDE_PLUGIN_OPTION_EXTRACT_WAVE_SIZE}`. `/kg-build` also accepts an inline override (`$2`) so a one-off
+  run can change it without editing config — **precedence: inline arg > user_config > default**. Resolution is
+  deterministic and unit-tested (`kg_engine.waves.resolve_wave_size`; the command's pure-Bash Step 0 mirrors
+  it, with a drift-guard test): unset / non-numeric / `< 1` → `6`; `> 10` → clamp to `10`.
+
 ### Changed
 
+- **`kg-extractor` now defaults to Sonnet (`model: sonnet` in `agents/extractor.md`).** Previously the agent
+  had no `model:` field and inherited the session model (Opus), so a parallel wave meant a fleet of Opus
+  agents each emitting a large JSON payload. Sonnet is the speed/quality sweet spot for this nuanced
+  extraction; the hard guarantees (verbatim-span verification, pack-type validation, never-forge-a-verdict)
+  are enforced by the `kg_write` boundary regardless of model, so a faster model cannot weaken integrity — it
+  only affects extraction *judgment*, which the Stage-4 precision gate (`f4_probe`, ≥ 0.70) measures. (Haiku
+  is deliberately *not* the default — more quarantines/noise on dense prose — and remains an opt-in only if
+  the precision gate stays green.)
+- **The canon single-writer lease now waits (bounded retry-with-backoff) under cross-process contention
+  instead of failing fast.** `Canon._acquire_lock` previously raised `RuntimeError("canon vault is locked by
+  another live session")` the instant `LeaseLock.acquire()` found the lease held by another live session. A
+  parallel `/kg-build` wave funnels every write through one server process (serialized on FastMCP's event
+  loop, so same-process re-acquire is idempotent and never contends), but the detached per-session reconcile
+  worker / headless backend *are* separate processes; a writer that now finds the lease taken retries with
+  exponential backoff up to `LOCK_ACQUIRE_TIMEOUT` (30 s, well over a full max-size wave of brief writes)
+  before surfacing the error, so near-simultaneous writers SERIALIZE cleanly rather than one failing. The
+  re-entrancy guard (`_lock_depth`) is unchanged, and the lazy projector's `try_acquire_lock()` stays
+  strictly non-blocking so a read never stalls behind a write. A dead holder is still reclaimed via staleness,
+  not waited on.
 - **`source_path` is now a required plugin option (`"required": true` in `.claude-plugin/plugin.json`).** It
   has no default, and the install/config screen previously let it be left blank — which the engine resolves to
   empty source text, so every extracted edge fails span verification (`REJECTED:span-not-in-source`) and
@@ -29,14 +72,19 @@ JSON back across the MCP boundary.
 ### Documentation
 
 - **Documented the install-time configure screen in the README.** A new *"The install config screen"*
-  subsection under *Install & enable* explains that the three `userConfig` options (`source_path`,
-  `sensitivity`, `metrics_mode`) are free-text fields, not menus — Claude Code's `userConfig` schema has no
-  `enum`/options support — what to type in each, that `source_path` must be set, and how to reconfigure after
-  install (`pluginConfigs[…].options` in `settings.json` + `/reload-plugins`).
+  subsection under *Install & enable* explains that the `userConfig` options (`source_path`, `sensitivity`,
+  `metrics_mode`, and — added later in this release — `extract_wave_size`) are free-text fields, not menus —
+  Claude Code's `userConfig` schema has no `enum`/options support — what to type in each, that `source_path`
+  must be set, and how to reconfigure after install (`pluginConfigs[…].options` in `settings.json` +
+  `/reload-plugins`).
 - **Clarified the `source_path` "default" in `CLAUDE.md`.** The Configuration section now notes `source_path`
   is `required: true` with no default, and that the `examples/source.md` fallback resolves against
   `KG_PROJECT_DIR`/`CLAUDE_PROJECT_DIR` (not the plugin root) — so it only fires inside the repo checkout, and an
   installed plugin with a blank path gets empty source text.
+- **Documented `extract_wave_size` in the README config section.** The `userConfig` table and the
+  install-config-screen walkthrough now list the fourth option alongside `source_path`/`sensitivity`/
+  `metrics_mode`, with its 1–10 range, default `6`, and the `/kg-build [source_path] [wave_size]` inline
+  override.
 
 ## [0.4.1] — 2026-06-25
 

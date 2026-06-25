@@ -199,18 +199,19 @@ syncable audit log — is a deliberately deferred follow-up; see `CHANGELOG.md`.
 ### The install config screen ("Configure creativity-graph")
 
 `/plugin install creativity-graph@sergiparpal` opens a **Configure creativity-graph** screen
-listing the three options below and a final **Save configuration** row:
+listing the four options below and a final **Save configuration** row:
 
 ```
 ❯ Source document path
   Egress sensitivity
   Metrics mode
+  Extraction wave size
 
   Save configuration
 ```
 
 **These are free-text fields, not menus — there are no preset choices to pick.** Claude Code's
-`userConfig` schema has no `enum`/options support, and all three keys are declared `"type":
+`userConfig` schema has no `enum`/options support, and all four keys are declared `"type":
 "string"`, so each renders as a text box you type into (not a selectable list). Move between rows
 with **↑/↓**, type a value into a field — or leave it blank to accept its default — then choose
 **Save configuration**. Pressing Enter on a row *without* typing just leaves that field at its
@@ -231,6 +232,12 @@ The **userConfig** table just below is the per-option reference; in short:
 - **Metrics mode — optional, defaults to `structure_only`.** Leave blank. `structure_only` is the
   only value that does anything; `with_embeddings` is **inert** (the engine never branches on it —
   the former `sqlite-vss` path was removed).
+- **Extraction wave size — optional, defaults to `6`.** How many section-extractor subagents
+  `/kg-build` launches concurrently per wave (bounded parallelism). Type an integer **1–10**; higher
+  is faster but applies more rate-limit/lock pressure. Unset / non-numeric / `< 1` falls back to `6`;
+  `> 10` clamps to `10`. Unlike the other three, this is an **orchestration** knob the `/kg-build`
+  command consumes — the engine never reads it — so changing it needs no server restart, and a one-off
+  run can override it inline (`/kg-build <source> <wave_size>`) without touching config.
 
 **Changing it after install.** The values are stored in `settings.json` under
 `pluginConfigs["creativity-graph@sergiparpal"].options`. To change them, edit that block (user
@@ -245,6 +252,7 @@ picked up the change with `kg_ping()`, which echoes `{metrics_mode, sensitivity,
 | `source_path` | absolute path — a **file, directory, or glob** of `.md`/`.txt` | **none — set this** | the document(s) the graph is built and grounded against. A single file is the common case; a **directory or glob** (R4) builds from every `.md`/`.txt` member, and each edge's span is verified against the specific file it came from (`source_file`). **Effectively required:** there is no default, so until you set it the graph has nothing to verify spans against. *(Markdown/text only — no PDF/media.)* |
 | `sensitivity` | `low` \| `medium` \| `high` | `medium` | egress scrubbing: `low` = secrets only; `medium` = + structured PII; `high` = + person/address heuristics. |
 | `metrics_mode` | `structure_only` | `structure_only` | the only effective value: graph structure is the bridge signal. The engine never branches on this (it is stored and echoed by `kg_ping` only), and there is no enum constraint — an embeddings path is **not implemented** (the former `sqlite-vss` candidate generator was removed), so any other value is inert. |
+| `extract_wave_size` | integer **1–10** (as a string) | `6` | how many `kg-extractor` subagents `/kg-build` launches **concurrently per wave** (bounded parallelism). An **orchestration** knob the command/skill consumes (`${CLAUDE_PLUGIN_OPTION_EXTRACT_WAVE_SIZE}`) — the engine never reads it, so it is the one `userConfig` key with no `build_engine_from_env` read. Unset / non-numeric / `< 1` → `6`; `> 10` → `10`. Override inline for one run with `/kg-build <source> <wave_size>` (precedence: inline arg > this option > default). Higher = faster but more rate-limit/lock pressure; a wave's brief `kg_write` calls funnel through the one single-threaded MCP server and serialize there, with the canon's single-writer lease as the cross-process safety guarantee, so a build is never dropped or corrupted regardless of size. |
 
 > ⚠️ **Set `source_path` first.** It has no default. If it is left unconfigured, every extracted edge fails
 > the span-present check (`REJECTED: span-not-in-source`) because there is no source text to verify against —
@@ -322,11 +330,17 @@ creativity-graph/
 **offensive** — never gatekept by a quality metric — and the **same** grounding loop is the **defensive
 filter**, applied afterward. The portico that stood at the door of imagination is moved to after it.
 
-### `/kg-build [source_path]` — extract → canon → project
-Drives the **kg-extractor** subagent section by section over the (scrubbed) source. Each
-section yields a `kg_write` payload of typed nodes and typed edges, every non-deterministic
-edge carrying a verbatim span. The boundary accepts/demotes/quarantines/rejects each item; the
-command then projects the canon into the derived layer and reports `kg_metrics`. Build-time gate:
+### `/kg-build [source_path] [wave_size]` — extract → canon → project
+Drives the **kg-extractor** subagent (defaults to **Sonnet**, fast + cheap) over the (scrubbed)
+source — **one subagent per `##` section**, launched in **bounded parallel waves** of `wave_size`
+(default `6`, range 1–10; see `extract_wave_size` above). Keeping one section per subagent preserves
+span-isolation (each extractor can only cite text it was actually shown); the waves just run several of
+those at once, so a 19-section doc is a few waves instead of 19 serial agents. Each section yields a
+`kg_write` payload of typed nodes and typed edges, every non-deterministic edge carrying a verbatim
+span. The boundary accepts/demotes/quarantines/rejects each item — and a wave's brief writes funnel
+through the one single-threaded MCP server (so they serialize there), with the canon's single-writer lease
+guarding against cross-process contention, so nothing is dropped or corrupted no matter the wave size.
+The command then projects the canon into the derived layer and reports `kg_metrics`. Build-time gate:
 run `f4_probe.py score` and require precision ≥ 0.70 before trusting the graph.
 
 ### `/kg-ground [query-or-node-filter]` — earn the verdicts (§1.6/§1.7/§1.8)

@@ -1,6 +1,6 @@
 {
   "name": "creativity-graph",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Turn a non-self-grounding conceptual document into a rigorously-grounded, queryable knowledge graph: a human-editable canon with three-axis provenance, a span-present write boundary, a grounding loop with memory of failures, and a regenerable NetworkX/SQLite derived layer.",
   "author": {
     "name": "Sergi Parpal",
@@ -26,6 +26,12 @@
       "title": "Metrics mode",
       "description": "One of structure_only | with_embeddings (structure_only uses graph structure as the signal; with_embeddings is currently inert — the former sqlite-vss candidate generator was removed). Validated by the engine; unknown values fall back to structure_only.",
       "default": "structure_only"
+    },
+    "extract_wave_size": {
+      "type": "string",
+      "title": "Extraction wave size",
+      "description": "How many section-extractor subagents /kg-build launches concurrently per wave (bounded parallelism, 1–10). Higher = faster but more rate-limit/lock pressure. Default 6.",
+      "default": "6"
     }
   }
 }

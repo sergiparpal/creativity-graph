@@ -124,7 +124,7 @@ bundles these; its `references/{contract,tools,pack-schema}.md` are loaded on de
 
 | Command | Subagent(s) | What happens |
 |---|---|---|
-| `/kg-build` | `kg-extractor` | Section-by-section extraction → `kg_scrub` (egress) → `kg_write` boundary; lands `unverified` edges with verbatim spans |
+| `/kg-build` | `kg-extractor` | One extractor per `##` section (Sonnet by default), launched in bounded parallel **waves** (`extract_wave_size`, default 6) → `kg_scrub` (egress) → `kg_write` boundary; lands `unverified` edges with verbatim spans. One section per subagent preserves span-isolation; a wave's brief writes funnel through the single-threaded MCP server (FastMCP runs sync tools on the event loop) and serialize there, with the canon lease as the cross-process safety guarantee |
 | `/kg-ground` | `kg-grounder`, `kg-adversarial-grounder` | Drain the unverified queue (`grounded`/`rejected`); red-team hubs, write counter-edges, mark `failed` — all via `kg_ground` |
 | `/kg-generate` | `kg-generator` | Run the discovery mechanisms (`kg_generate`: bridge/seed/compression/regroup/transplant/ensemble), phrase/name them, write `hypothesized`/`unverified` via `kg_propose`/`kg_operate` — generation is offensive, never metric-gated |
 | `/kg-perturb` | `kg-generator` | Build a second construction and cross-generate (`kg_generate` ensemble §9/§15) — the only mechanism that attacks coverage |
@@ -202,8 +202,13 @@ root. For an installed plugin a blank path yields empty source text, so every ag
 `REJECTED:span-not-in-source`); `sensitivity` →
 `CLAUDE_PLUGIN_OPTION_SENSITIVITY` (default `medium`); `metrics_mode` →
 `CLAUDE_PLUGIN_OPTION_METRICS_MODE` (default `structure_only`). `.mcp.json` also hardcodes
-`KG_PROJECT_DIR`, `KG_DATA`, `KG_PACK_PATH`, and `PYTHONPATH=…/scripts`. `source_path`, `sensitivity`,
-and `metrics_mode` are the only three `userConfig` keys (the former unwired `domain` knob was removed).
+`KG_PROJECT_DIR`, `KG_DATA`, `KG_PACK_PATH`, and `PYTHONPATH=…/scripts`. Those three are the only
+`userConfig` keys the **engine** reads (the former unwired `domain` knob was removed). A **fourth** key,
+`extract_wave_size` (default `"6"`, range 1–10), is an **orchestration-only** knob: the `/kg-build`
+command/skill consumes `${CLAUDE_PLUGIN_OPTION_EXTRACT_WAVE_SIZE}` to size its parallel extraction waves
+(resolved by `kg_engine.waves.resolve_wave_size`), and `build_engine_from_env` deliberately does **not**
+read it — so it is the one `userConfig` key with no engine env wiring, and is not forwarded through
+`.mcp.json`.
 
 ## Releasing
 

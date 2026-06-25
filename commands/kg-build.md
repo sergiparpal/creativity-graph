@@ -1,6 +1,6 @@
 ---
-description: Build the grounded knowledge graph from a source document — extract section-by-section into the canon, then project.
-argument-hint: "[source_path]"
+description: Build the grounded knowledge graph from a source document — extract section-by-section into the canon (bounded parallel waves), then project.
+argument-hint: "[source_path] [wave_size]"
 allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_scrub, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph
 ---
 
@@ -24,6 +24,13 @@ You do **not** call `kg_write` yourself, and you **never** assert a verdict — 
   SOURCE="${1:-${CLAUDE_PLUGIN_OPTION_SOURCE_PATH:-examples/source.md}}"
   ```
 
+- `$2` — **optional inline wave size**: how many section-extractor subagents to launch CONCURRENTLY per
+  wave (bounded parallelism). **Precedence: explicit `$2` > user_config > default.** When `$2` is omitted
+  it falls back to `${CLAUDE_PLUGIN_OPTION_EXTRACT_WAVE_SIZE}`, then to `6`. The value is parsed to an
+  integer and **clamped to 1–10** (unset / non-numeric / `< 1` → `6`; `> 10` → `10`). One section is still
+  one subagent (the span-isolation property, below); the wave size only controls how many of those run at
+  once. Resolved deterministically in Step 0.
+
 ## Procedure
 
 ### 0. Resolve & enumerate the source FILES (Bash)
@@ -33,6 +40,15 @@ file list, then iterate the sections **within each file**, carrying that file's 
 
 ```bash
 SOURCE="${1:-${CLAUDE_PLUGIN_OPTION_SOURCE_PATH:-examples/source.md}}"
+# Resolve the extraction WAVE SIZE: inline override ($2) > user_config > default 6; integer; clamp 1..10.
+# (This pure-Bash resolution mirrors kg_engine.waves.resolve_wave_size, the unit-tested reference — no
+# venv/PYTHONPATH dependency here. A present-but-invalid value falls straight to the default 6, not the
+# next level down.)
+WAVE_RAW="${2:-${CLAUDE_PLUGIN_OPTION_EXTRACT_WAVE_SIZE:-6}}"
+case "$WAVE_RAW" in (''|*[!0-9]*) WAVE_SIZE=6 ;; (*) WAVE_SIZE=$WAVE_RAW ;; esac   # unset/non-numeric -> 6
+[ "$WAVE_SIZE" -lt 1 ] 2>/dev/null && WAVE_SIZE=6      # below range -> default
+[ "$WAVE_SIZE" -gt 10 ] 2>/dev/null && WAVE_SIZE=10    # above range -> clamp to max
+echo "extraction wave size: $WAVE_SIZE"
 # Build the list of source FILES (a single file, every .md/.txt in a directory, or a glob).
 if [ -d "$SOURCE" ]; then
   FILES=$(find "$SOURCE" -maxdepth 1 -type f \( -name '*.md' -o -name '*.txt' \) ! -name '.*' | sort)
@@ -73,17 +89,26 @@ extractor copies spans **verbatim** (§1.5) from the scrubbed text it was given,
 validates them. Do not paraphrase or "clean up" the section text you pass in; a mangled span will be **REJECTED**
 as `span-not-in-source` (fabrication).
 
-### 2. Launch the `kg-extractor` subagent per section (Task)
+### 2. Launch the `kg-extractor` subagent per section, in BOUNDED PARALLEL WAVES (Task)
 
 For **each** `## ` section **of each file**, launch the extractor with the **section's verbatim text** and the
 **basename of the file it came from** as `source_file`. The extractor stamps every edge in that section with that
 basename; with a multi-file build the boundary verifies each span against **that file specifically** (R4 — a span
 attributed to the wrong file is REJECTED `span-not-in-named-source`). The extractor reads the section, emits a
-single complete `kg_write` payload, and reports its dispositions back to you. Run sections **sequentially** so
-later sections can reference node IDs created earlier (the boundary auto-creates placeholder nodes for an edge's
-`source`, and targets may reference not-yet-created nodes — so order is for legibility, not correctness).
+single complete `kg_write` payload, and reports its dispositions back to you.
 
-Exact Task invocation (repeat per section, substituting the heading + body):
+**Launch the per-section subagents CONCURRENTLY in waves of `WAVE_SIZE` (from Step 0).** Collect the full list of
+`(file, section)` pairs, then process it in batches: issue `WAVE_SIZE` `Task(...)` calls **in a single message**
+(so they run in parallel), wait for that whole wave to finish, then launch the next wave, until every section is
+done. The default `WAVE_SIZE` is `6`; a 19-section document is therefore four waves (6 + 6 + 6 + 1) instead of 19
+serial launches — the extractors' (slow) token generation overlaps across the wave, while the (brief) `kg_write`
+calls all funnel through the one MCP server process and **serialize cleanly** there, so nothing is dropped or
+corrupted. Ordering does **not** matter for correctness: the boundary auto-creates a placeholder node for an
+edge's `source`, and a `target` may reference a node a later section creates, so edges across waves resolve
+regardless of which wave lands first. Keep **one section per subagent** (never batch sections into one launch —
+see the span-isolation note below).
+
+Exact Task invocation (one per section — repeat across the wave, substituting each section's heading + body):
 
 ```
 Task(
@@ -116,9 +141,13 @@ the kg_write result (dispositions, details[], written_nodes[], rolled_back).
 )
 ```
 
-> Why one section per launch: it keeps each extractor's span-verification scoped to text it can actually see, which
-> is what makes `span-present` (§1.5) checkable rather than a paraphrase. A whole-document launch invites the
-> extractor to "remember" spans and fabricate them.
+> Why one section per launch (the **span-isolation** property — unchanged by the parallel waves): it keeps each
+> extractor's span-verification scoped to text it can actually see, which is what makes `span-present` (§1.5)
+> checkable rather than a paraphrase. A whole-document launch invites the extractor to "remember" spans and
+> fabricate them. **Parallelism is across launches, never within one**: collapsing several sections into a single
+> subagent would let an extractor mis-attribute a span across sections of the same file — undetectable by the
+> boundary, which verifies the span against the whole `source_file`, not the one section. Waves change *how many*
+> single-section extractors run at once; they never change *what one extractor sees*.
 
 Collect each launch's returned `kg_write` result: the `dispositions` counts
 (**ACCEPTED / DEMOTED / QUARANTINED / REJECTED**), `details[]`, `written_nodes[]`, and `rolled_back`.
@@ -159,7 +188,8 @@ Summarize the build back to the user:
 
 ## Worked example (against `examples/source.md`)
 
-After five extractor launches over the demo corpus you should expect ACCEPTED nodes like `compression`,
+After five extractor launches over the demo corpus (one wave at the default `WAVE_SIZE=6`, since the demo has
+five `##` sections) you should expect ACCEPTED nodes like `compression`,
 `generality-confound`, `specificity`, `bridge`, `betweenness`, `specificity-weighted-betweenness`, `degree`,
 `canon`, `derived`, and ACCEPTED edges such as:
 

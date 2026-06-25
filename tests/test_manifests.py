@@ -81,8 +81,11 @@ def test_plugin_userconfig_has_no_dead_domain():
     plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     user_config = plugin["userConfig"]
     assert "domain" not in user_config, "domain maps to no engine env var — misleading dead config"
-    # the fields that remain are the ones the engine actually reads (server.py:build_engine_from_env)
-    assert set(user_config) == {"source_path", "sensitivity", "metrics_mode"}
+    # `source_path`/`sensitivity`/`metrics_mode` are the keys the engine actually reads
+    # (server.py:build_engine_from_env); `extract_wave_size` is an ORCHESTRATION knob the /kg-build
+    # command/skill consumes (kg_engine.waves.resolve_wave_size), never the engine — so it is the one
+    # userConfig key with no corresponding env read in build_engine_from_env, and that is intentional.
+    assert set(user_config) == {"source_path", "sensitivity", "metrics_mode", "extract_wave_size"}
 
 
 # ---- config-manifests-6: CI exercises the cross-platform install promise ----

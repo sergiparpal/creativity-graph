@@ -119,3 +119,34 @@ specificity-weighted-betweenness bridge metric (precomputed + gated), and the `/
   invent the very freshness it is meant to measure. Left as a documented extension point.
 - **Embedding-based candidate generation** (`metrics_mode=with_embeddings`). The structure-only path is
   the default; the embedding extra was removed in 0.2.1 and is not a dependency here.
+
+---
+
+## Faster builds (v0.5.0) — Sonnet extractor + bounded parallel waves
+
+`/kg-build` was the slowest command: it launched one `kg-extractor` per `##` section **sequentially**, and
+the extractor **inherited the session model (Opus)**, so a 19-section document meant ~19 cold-started Opus
+agents each emitting a large `kg_write` payload token-by-token, one after another. The bottleneck is
+output-token generation × cold-start × serial. Two changes cut wall-clock without weakening any guarantee:
+
+- **The extractor now defaults to `model: sonnet`.** The hard guarantees (verbatim-span verification,
+  pack-type validation, never-forge-a-verdict) live in the `kg_write` boundary, not the model — so a faster
+  model cannot break integrity; it only risks extraction *judgment*, which the Stage-4 precision gate
+  (`f4_probe`, ≥ 0.70) measures. Sonnet is the speed/quality sweet spot; Haiku is deliberately not the
+  default (more quarantines on dense prose). If Sonnet ever drops below the gate, revert the extractor to
+  Opus and keep the parallel speedup alone.
+- **The orchestrator launches one-subagent-per-section in BOUNDED PARALLEL WAVES** of `extract_wave_size`
+  (new `userConfig`, default 6, range 1–10; inline override `/kg-build <source> <wave_size>` beats config
+  beats default — resolved deterministically by `kg_engine.waves.resolve_wave_size`, mirrored by the
+  command's pure-Bash Step 0). **One section per subagent is preserved** — collapsing sections into one
+  launch would let a span be mis-attributed across sections of the same `source_file`, undetectable by the
+  boundary — so span-isolation is intact; only *how many* single-section extractors run at once changed.
+
+**Why parallel writes are safe.** FastMCP runs sync tools directly on the MCP server's single event-loop
+thread, so a wave's `kg_write` calls funnel through one process and already serialize there; the canon's
+single-writer lease is only ever contended *across* processes (the detached reconcile worker / headless
+backend). `Canon._acquire_lock` now does a bounded retry-with-backoff (≤ `LOCK_ACQUIRE_TIMEOUT`, 30 s — well
+over a full max-size wave of brief writes) so a contended writer **serializes cleanly instead of failing
+fast**, while the lazy projector's read path stays strictly non-blocking. New tests cover wave-size
+resolution (default/fallback/clamp/precedence + a Bash-mirror drift guard) and a full 10-writer concurrent
+wave (all commit, none corrupts, none dropped). Suite green at 549 tests.
