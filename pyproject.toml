@@ -1,6 +1,6 @@
 [project]
 name = "kg-engine"
-version = "0.4.0"
+version = "0.4.1"
 description = "Deterministic graph engine for the creativity-graph Claude Code plugin"
 requires-python = ">=3.10"
 # Core, always-installed dependencies. Each is verified to install from wheels with no
@@ -16,7 +16,12 @@ dependencies = [
     # (review-low). Verified working at igraph 1.0.0 / leidenalg 0.12.0; lift the cap after testing a
     # newer major.
     "python-igraph>=0.11,<2", # graph backend for Leiden
-    "leidenalg>=0.10,<1",     # Leiden community detection
+    # leidenalg stays a HARD dependency — it installs cleanly from wheels. It is kept here, not under
+    # optional, because its DLL only fails to LOAD (not install) when Windows Smart App Control blocks
+    # the unsigned native _c_leiden; that is handled by graceful degradation, not by dropping the dep.
+    # bootstrap verifies it via a SOFT probe (not the mandatory import set) and projector._leiden
+    # degrades to label propagation when the import fails, so a SAC-blocked DLL never breaks the engine.
+    "leidenalg>=0.10,<1",     # Leiden community detection (optional at runtime — see note above)
 ]
 
 [project.optional-dependencies]

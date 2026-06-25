@@ -234,6 +234,67 @@ def test_do_install_keeps_preexisting_foreign_dir_on_failure(tmp_path, monkeypat
     assert not (venv_dir / "pyvenv.cfg").exists()
 
 
+# --------------------------------------------------------------------------- #
+# leidenalg soft probe (SAC-blocked native DLL → graceful degradation)
+# --------------------------------------------------------------------------- #
+def test_verify_imports_excludes_leidenalg_but_keeps_core():
+    # Windows Smart App Control can block leidenalg's unsigned native _c_leiden DLL from
+    # LOADING even though it installs fine. At runtime projector._leiden already degrades to
+    # label propagation, so a blocked leidenalg must NOT be a mandatory import that aborts
+    # provisioning. It moved to a separate soft probe; the hard set keeps only what the server
+    # genuinely needs to come up.
+    assert "leidenalg" not in bootstrap._VERIFY_IMPORTS
+    for mod in ("mcp", "pydantic", "networkx", "igraph", "yaml", "kg_engine"):
+        assert mod in bootstrap._VERIFY_IMPORTS
+
+
+def test_leidenalg_probe_swallows_launch_failure(tmp_path, capsys):
+    # The probe must NEVER raise or exit non-zero — even if the interpreter can't be launched
+    # at all. A missing interpreter path makes subprocess.run raise FileNotFoundError (an
+    # OSError); the probe swallows it and still prints the fallback line.
+    bootstrap.probe_leidenalg(tmp_path / "no-such-python")  # must not raise
+    assert "label-propagation fallback" in capsys.readouterr().out
+
+
+def test_leidenalg_probe_reports_status_with_real_interpreter(capfd):
+    # Against a REAL interpreter the probe prints exactly one status line and returns None
+    # (never raises). The line is emitted by the in-venv child subprocess, so capture at the
+    # fd level (capfd, not capsys). Which line appears depends on whether leidenalg loads in
+    # THIS environment, so accept either — the contract is "always reports, never fails".
+    bootstrap.probe_leidenalg(Path(bootstrap.sys.executable))
+    out = capfd.readouterr().out
+    assert ("Leiden community detection enabled" in out) or ("label-propagation fallback" in out)
+
+
+def test_do_install_completes_when_leidenalg_unavailable(tmp_path, monkeypatch):
+    # The end-to-end guarantee for the SAC case: even when leidenalg is unimportable, do_install
+    # still finishes — writing engine-python.txt + install.stamp and returning the interpreter.
+    # The probe is advisory only and can never abort the provision (which would rmtree the venv).
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+
+    venv_dir = tmp_path / "venv"
+    monkeypatch.setattr(bootstrap, "install_with_uv", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "install_with_pip", _fake_install_real_venv)
+    monkeypatch.setattr(bootstrap, "verify_imports", lambda py: None)  # core imports "succeed"
+
+    called = {"probe": False}
+
+    def fake_probe(py):  # leidenalg blocked: reports unavailable, returns cleanly
+        called["probe"] = True
+        print("[bootstrap] leidenalg unavailable (ImportError: DLL load failed while importing "
+              "_c_leiden); using label-propagation fallback (projector._leiden)")
+
+    monkeypatch.setattr(bootstrap, "probe_leidenalg", fake_probe)
+
+    py = bootstrap.do_install(venv_dir)
+    assert called["probe"]                                   # the probe ran (after verify)
+    assert py.exists()
+    assert (venv_dir / bootstrap.PTR_NAME).exists()
+    assert (venv_dir / bootstrap.STAMP_NAME).exists()        # stamp written last => provision OK
+
+
 def test_stamp_written_strictly_last(tmp_path, monkeypatch):
     # bootstrap-2: a matching stamp must imply a VERIFIED venv. If verify_imports fails the
     # stamp is never written, so is_ready() can never report a half-built venv as ready.

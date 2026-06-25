@@ -14,6 +14,34 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-06-25
+
+### Fixed
+
+- **Windows Smart App Control no longer breaks engine provisioning by blocking leidenalg's native DLL.**
+  On a fresh install where Windows Smart App Control / Application Control is enforced
+  (`VerifiedAndReputablePolicyState = 1`), `scripts/bootstrap.py` installed all dependencies fine (cp314
+  wheels included) but then failed the import-verification step: leidenalg's unsigned native `_c_leiden`
+  DLL is blocked from **loading** (reputation-based — igraph's DLL loads, leidenalg's does not) with
+  `ImportError: DLL load failed while importing _c_leiden: "An Application Control policy has blocked this
+  file"`. Because `verify_imports` treated leidenalg as a **mandatory** import, that aborted `do_install`,
+  which then `rmtree`'d the half-built venv — so provisioning never completed and the `creativity-graph`
+  MCP server never came up ("1 error during load", no `kg_*` tools). This contradicted the **runtime**,
+  where leidenalg has long been **optional**: `projector._leiden` wraps the import in `try/except` and
+  degrades to label-propagation community detection when it can't load. The bootstrap now matches that
+  contract: `leidenalg` is **removed from the mandatory `_VERIFY_IMPORTS` set** (which keeps `mcp`,
+  `pydantic`, `networkx`, `igraph`, `yaml`, `kg_engine` as hard requirements), and a **separate soft probe
+  (`probe_leidenalg`)** reports `leidenalg OK (Leiden community detection enabled)` or `leidenalg
+  unavailable (<ExceptionType>: <msg>); using label-propagation fallback (projector._leiden)` and **never
+  causes a non-zero exit** (it runs a non-checking subprocess and swallows the in-venv DLL-load error and
+  any parent-side launch failure). `leidenalg` **stays a hard `[project.dependencies]` entry** — it
+  installs cleanly; only its DLL load is blocked under SAC — so the engine still uses Leiden wherever SAC
+  permits and degrades gracefully where it does not. **No Windows security setting is touched and disabling
+  SAC is never suggested** — the engine runs degraded instead. Coverage added in `tests/test_bootstrap.py`
+  (mandatory set excludes leidenalg, the probe swallows a launch failure and a real-interpreter probe, and
+  `do_install` completes — writing `engine-python.txt` + `install.stamp` — even when the probe reports
+  leidenalg unavailable).
+
 ### Documentation
 
 - **Troubleshooting note for `Plugin "creativity-graph" not found in marketplace "sergiparpal"` after a

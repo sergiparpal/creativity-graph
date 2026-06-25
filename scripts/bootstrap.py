@@ -92,8 +92,15 @@ SCHEMA = "1"                        # bump to force every venv to rebuild
 # imports as ``igraph``; pyyaml as ``yaml``. ``kg_engine`` resolves off PYTHONPATH. (Git is
 # used only via the ``git`` CLI through subprocess in canon.py — no ``import git`` — so the
 # ``git`` module is intentionally absent here and from [project.dependencies].)
+#
+# ``leidenalg`` is deliberately NOT in this MANDATORY set. It installs fine, but its unsigned
+# native ``_c_leiden`` DLL can be blocked from LOADING by Windows Smart App Control /
+# Application Control (reputation-based — igraph's DLL loads, leidenalg's may not). At runtime
+# it is already OPTIONAL: ``projector._leiden`` wraps the import in try/except and degrades to
+# label propagation. So a blocked-but-installed leidenalg must not abort provisioning — it is
+# checked separately by ``probe_leidenalg`` (a soft probe that reports status and never fails).
 _VERIFY_IMPORTS = (
-    "import mcp, pydantic, networkx, igraph, leidenalg, yaml, kg_engine; "
+    "import mcp, pydantic, networkx, igraph, yaml, kg_engine; "
     "print('[bootstrap] core imports OK')"
 )
 
@@ -513,6 +520,35 @@ def verify_imports(py: Path) -> None:
     run([str(py), "-c", _VERIFY_IMPORTS], env=_engine_env())
 
 
+def probe_leidenalg(py: Path) -> None:
+    """Soft-probe the OPTIONAL ``leidenalg`` import in the freshly-built venv — advisory only.
+
+    leidenalg installs fine but its unsigned native ``_c_leiden`` DLL can be blocked from
+    LOADING by Windows Smart App Control / Application Control. At runtime that is already
+    tolerated (``projector._leiden`` degrades to label propagation), so a blocked import must
+    NOT abort the provision the way ``verify_imports`` would. This reports which path the engine
+    will take and ALWAYS returns cleanly: it runs a NON-checking subprocess (never ``run()``,
+    which is ``check=True``) and swallows every failure — the in-venv import error / DLL-load
+    error is caught by the snippet, a parent-side launch failure (OSError) by the ``except``.
+    """
+    snippet = (
+        "try:\n"
+        "    import leidenalg\n"
+        "    print('[bootstrap] leidenalg OK (Leiden community detection enabled)')\n"
+        "except Exception as e:\n"
+        "    print('[bootstrap] leidenalg unavailable (' + type(e).__name__ + ': ' + str(e)\n"
+        "          + '); using label-propagation fallback (projector._leiden)')\n"
+    )
+    try:
+        subprocess.run([str(py), "-c", snippet], check=False, env=_engine_env())
+    except Exception as exc:  # noqa: BLE001 — a blocked/optional dep must never abort provisioning
+        print(
+            f"[bootstrap] leidenalg unavailable ({type(exc).__name__}: {exc}); "
+            "using label-propagation fallback (projector._leiden)",
+            flush=True,
+        )
+
+
 def _looks_like_our_venv(venv_dir: Path) -> bool:
     """True when the dir is a venv this provisioner owns/built (so deleting it on failure
     is safe). We refuse to rmtree an arbitrary pre-existing user dir that --venv /
@@ -562,6 +598,9 @@ def do_install(venv_dir: Path) -> Path:
         if not py.exists():
             raise SystemExit(f"[bootstrap] venv interpreter not found at {py}")
         verify_imports(py)
+        # Optional, never fatal: report whether Leiden is loadable or the engine will fall back
+        # to label propagation (SAC-blocked DLL). probe_leidenalg swallows all failures.
+        probe_leidenalg(py)
     except BaseException:
         # A failed/interrupted install leaves a venv with an interpreter but a partial
         # dependency graph that the next run would silently "reuse". Remove it so the
