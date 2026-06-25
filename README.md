@@ -196,6 +196,48 @@ a conflict, so it cannot forge a verdict; a verdict that survives a clean merge 
 record is re-quarantined by the per-session reconciler anyway. (Sharing verdicts *across* machines — a
 syncable audit log — is a deliberately deferred follow-up; see `CHANGELOG.md`.)
 
+### The install config screen ("Configure creativity-graph")
+
+`/plugin install creativity-graph@sergiparpal` opens a **Configure creativity-graph** screen
+listing the three options below and a final **Save configuration** row:
+
+```
+❯ Source document path
+  Egress sensitivity
+  Metrics mode
+
+  Save configuration
+```
+
+**These are free-text fields, not menus — there are no preset choices to pick.** Claude Code's
+`userConfig` schema has no `enum`/options support, and all three keys are declared `"type":
+"string"`, so each renders as a text box you type into (not a selectable list). Move between rows
+with **↑/↓**, type a value into a field — or leave it blank to accept its default — then choose
+**Save configuration**. Pressing Enter on a row *without* typing just leaves that field at its
+default and moves on: harmless for the bottom two, **but not for the source path** (see below).
+The **userConfig** table just below is the per-option reference; in short:
+
+- **Source document path — you must set this.** Type the **absolute** path to the Markdown/text
+  file you want graphed (or a directory/glob of `.md`/`.txt` files), e.g.
+  `/home/you/notes/theory.md`. It has **no default**. Leave it blank and the build runs *without
+  error* but produces an **empty, unusable graph**: with no source text to verify against, every
+  extracted edge is rejected `span-not-in-source`. (The engine's `examples/source.md` fallback is
+  resolved against *your* project directory — where that file does not exist — so it only ever
+  fires when you run from inside this repo checkout, never for an installed plugin.) Always enter
+  an absolute path here.
+- **Egress sensitivity — optional, defaults to `medium`.** Leave blank, or type exactly one of
+  `low` / `medium` / `high`. An unrecognized word silently behaves as `medium` (though `kg_ping`
+  echoes back whatever you typed), so stick to the three words.
+- **Metrics mode — optional, defaults to `structure_only`.** Leave blank. `structure_only` is the
+  only value that does anything; `with_embeddings` is **inert** (the engine never branches on it —
+  the former `sqlite-vss` path was removed).
+
+**Changing it after install.** The values are stored in `settings.json` under
+`pluginConfigs["creativity-graph@sergiparpal"].options`. To change them, edit that block (user
+scope `~/.claude/settings.json`, or project scope `.claude/settings.json`) and run
+`/reload-plugins`, or re-open the configure screen from the `/plugin` menu. Confirm the server
+picked up the change with `kg_ping()`, which echoes `{metrics_mode, sensitivity, …}`.
+
 ### userConfig (`.claude-plugin/plugin.json`)
 
 | option | values | default | effect |

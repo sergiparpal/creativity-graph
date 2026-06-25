@@ -14,6 +14,30 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+### Changed
+
+- **`source_path` is now a required plugin option (`"required": true` in `.claude-plugin/plugin.json`).** It
+  has no default, and the install/config screen previously let it be left blank — which the engine resolves to
+  empty source text, so every extracted edge fails span verification (`REJECTED:span-not-in-source`) and
+  `/kg-build` silently produces an empty, unusable graph. Marking it `required` makes Claude Code's configure
+  screen enforce a value up front instead of failing quietly at build time. Kept `type: "string"` (not
+  `"file"`/`"directory"`) so the directory/glob multi-doc inputs (R4) still validate. `build_engine_from_env`'s
+  `<project>/examples/source.md` fallback is unchanged — it still fires only when running from inside the repo
+  checkout (where that file exists), since it resolves against `KG_PROJECT_DIR`/`CLAUDE_PROJECT_DIR`, not the
+  plugin root.
+
+### Documentation
+
+- **Documented the install-time configure screen in the README.** A new *"The install config screen"*
+  subsection under *Install & enable* explains that the three `userConfig` options (`source_path`,
+  `sensitivity`, `metrics_mode`) are free-text fields, not menus — Claude Code's `userConfig` schema has no
+  `enum`/options support — what to type in each, that `source_path` must be set, and how to reconfigure after
+  install (`pluginConfigs[…].options` in `settings.json` + `/reload-plugins`).
+- **Clarified the `source_path` "default" in `CLAUDE.md`.** The Configuration section now notes `source_path`
+  is `required: true` with no default, and that the `examples/source.md` fallback resolves against
+  `KG_PROJECT_DIR`/`CLAUDE_PROJECT_DIR` (not the plugin root) — so it only fires inside the repo checkout, and an
+  installed plugin with a blank path gets empty source text.
+
 ## [0.4.1] — 2026-06-25
 
 ### Fixed

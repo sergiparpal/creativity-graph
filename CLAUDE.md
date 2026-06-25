@@ -195,7 +195,11 @@ git end-to-end).
 ## Configuration
 
 `plugin.json` `userConfig` → engine env (read in `server.py:build_engine_from_env`):
-`source_path` → `KG_SOURCE_PATH` (default `examples/source.md`); `sensitivity` →
+`source_path` → `KG_SOURCE_PATH` (`required: true`, **no default**; when unset, `build_engine_from_env`
+falls back to `<project>/examples/source.md` *only if that file exists* — i.e. effectively only inside this
+repo checkout, since the fallback resolves against `KG_PROJECT_DIR`/`CLAUDE_PROJECT_DIR`, not the plugin
+root. For an installed plugin a blank path yields empty source text, so every agent edge is
+`REJECTED:span-not-in-source`); `sensitivity` →
 `CLAUDE_PLUGIN_OPTION_SENSITIVITY` (default `medium`); `metrics_mode` →
 `CLAUDE_PLUGIN_OPTION_METRICS_MODE` (default `structure_only`). `.mcp.json` also hardcodes
 `KG_PROJECT_DIR`, `KG_DATA`, `KG_PACK_PATH`, and `PYTHONPATH=…/scripts`. `source_path`, `sensitivity`,
