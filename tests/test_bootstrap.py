@@ -343,10 +343,16 @@ def _write_info(venv_dir, *, pid, host, token="tok", t=None):
 # --------------------------------------------------------------------------- #
 # M7 — PID-liveness probe: a crashed holder is reclaimable in ms, not 30 min
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="pid-liveness probe is POSIX-only: os.kill(pid, 0) is unsafe on Windows "
+    "(CTRL_C_EVENT, not a no-op existence check), so _pid_probe assumes-alive there and a "
+    "dead-pid lock is reclaimed by age, not the probe — mirroring canon.LeaseLock._pid_probe.",
+)
 def test_dead_pid_lock_is_stolen_before_stale_window(tmp_path):
     # M7: a hard-killed background worker freezes its heartbeat, so the age signal stays
     # FRESH for the full 30-min STALE_LOCK_SECS. A cheap os.kill(pid, 0) probe must reclaim
-    # it in milliseconds instead — mirroring canon._pid_probe.
+    # it in milliseconds instead — mirroring canon._pid_probe. POSIX-only (see skipif).
     venv_dir = tmp_path / "venv"
     # A held, FRESH lock (heartbeat just now) whose recorded holder is a dead pid on THIS host.
     bootstrap._lock_dir(venv_dir).mkdir(parents=True)
