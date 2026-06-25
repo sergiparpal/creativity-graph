@@ -1,4 +1,4 @@
-"""Regression tests for the egress scrubber (§1.9): two narrow correctness bugs.
+"""Regression tests for the egress scrubber (§1.9): narrow correctness bugs.
 
 F6  — the bare PERSON bigram rule scanned non-overlapping, so a non-name Title-Case word immediately
       before a real full name ("Researcher Alan Turing") matched the FIRST bigram, was spared by the
@@ -7,6 +7,10 @@ F6  — the bare PERSON bigram rule scanned non-overlapping, so a non-name Title
 F11/M5 — at the default sensitivity='medium' the PHONE pattern matched bare 6-7 digit prose runs and
       dash-separated page ranges ("pages 100-200", bare "100200"), over-redacting figures into ⟦PHONE⟧
       (restored on write, but it degrades extraction). The fix requires phone-ish structure.
+M4  — a literal ⟦CAT:N⟧ placeholder in section B's prose was over-expanded by the consumer's restore
+      map when section A had already used that number for a real redaction. The boundary restores ONLY
+      from each scrub() call's RETURNED mapping, so the fix emits an identity entry there for any literal
+      and skips reserved numbers cumulatively across calls so the namespaces never overlap forward.
 """
 from __future__ import annotations
 
@@ -98,3 +102,50 @@ def test_phone_still_redacts_international_number():
 def test_phone_still_redacts_parenthesized_area_code():
     scrubbed, _ = Scrubber("medium").scrub("Dial (415) 555-2671 now.")
     assert "555-2671" not in scrubbed and "⟦PHONE" in scrubbed, scrubbed
+
+
+# --- M4: a literal placeholder must round-trip ACROSS calls via the consumer's RETURNED-map restore --
+
+def _server_restore_map(*calls):
+    """Mimic the MCP server: accumulate ONLY each scrub() call's returned new_mapping (server._scrub_map
+    is built from the returned maps, never from scrubber._mapping), then return (outputs, restore_map)."""
+    sc = Scrubber("high")
+    outs, restore_map = [], {}
+    for text in calls:
+        out, mapping = sc.scrub(text)
+        restore_map.update(mapping)
+        outs.append(out)
+    return outs, restore_map
+
+
+def test_literal_placeholder_round_trips_across_calls_via_returned_map():
+    # Section A's prose explains the redaction syntax (a LITERAL ⟦EMAIL:1⟧); section B then has a real
+    # email. The boundary restores from the RETURNED maps only — the literal must NOT expand, and the
+    # real email must take a DIFFERENT id (the reserved number is skipped cumulatively).
+    a = "The marker ⟦EMAIL:1⟧ denotes a redacted email in our docs."
+    b = "Now mail the real address bob@acme.com today."
+    (out_a, out_b), restore_map = _server_restore_map(a, b)
+    # the literal survived scrub() verbatim ...
+    assert out_a == a, out_a
+    # ... the real email got id 2, never colliding with the reserved literal id 1 ...
+    assert "⟦EMAIL:2⟧" in out_b and "⟦EMAIL:1⟧" not in out_b, out_b
+    assert "bob@acme.com" not in out_b, out_b
+    # ... and BOTH round-trip through the server-style restore map (the boundary path).
+    assert Scrubber.restore(out_a, restore_map) == a, Scrubber.restore(out_a, restore_map)
+    assert Scrubber.restore(out_b, restore_map) == b, Scrubber.restore(out_b, restore_map)
+
+
+def test_literal_placeholder_identity_is_in_returned_map():
+    # The protection lives in the RETURNED mapping (what the boundary consults), not just _mapping.
+    _, mapping = Scrubber("high").scrub("Doc marker ⟦PERSON:1⟧ explained.")
+    assert mapping.get("⟦PERSON:1⟧") == "⟦PERSON:1⟧", mapping
+
+
+def test_reset_clears_reserved_literal_namespace():
+    # reset() must also drop the cumulative reserved-literal set, or a fresh session would keep skipping
+    # numbers it has no reason to. (reset() is uncalled today; this pins its documented full-clear.)
+    sc = Scrubber("high")
+    sc.scrub("marker ⟦EMAIL:5⟧ here")
+    assert "⟦EMAIL:5⟧" in sc._reserved_placeholders
+    sc.reset()
+    assert sc._reserved_placeholders == set() and sc._mapping == {} and sc._counters == {}

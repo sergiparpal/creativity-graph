@@ -26,6 +26,34 @@ def _grep_version(rel: str, pattern: str, errors: list[str]) -> str | None:
     m = re.search(pattern, p.read_text(encoding="utf-8"), re.M)
     return m.group(1) if m else None
 
+
+_VERSION_LINE = re.compile(r'''^\s*version\s*=\s*["']([^"']+)["']''')
+_TOML_TABLE = re.compile(r"^\s*\[")
+
+
+def _grep_project_version(rel: str, errors: list[str]) -> str | None:
+    """Read pyproject.toml's version from the [project] table specifically.
+
+    A bare ``re.search`` is line-anchored, not table-anchored, so it would lock onto the FIRST
+    ``version = "..."`` line in the file — under any table (e.g. ``[build-system]`` or a ``[tool.*]``
+    block placed above ``[project]``), silently validating the wrong version. Scope the scan to the
+    ``[project]`` table body so the 4-file agreement check can't be defeated by table reordering.
+    """
+    p = ROOT / rel
+    if not p.exists():
+        errors.append(f"missing file: {rel}")
+        return None
+    in_project = False
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if _TOML_TABLE.match(line):
+            in_project = line.strip().startswith("[project]")
+            continue
+        if in_project:
+            m = _VERSION_LINE.match(line)
+            if m:
+                return m.group(1)
+    return None
+
 REQUIRED_AGENTS = ["extractor", "grounder", "annotator", "adversarial-grounder", "evaluator",
                    "generator"]
 REQUIRED_COMMANDS = ["kg-build", "kg-ground", "kg-query", "kg-eval", "kg-experiment", "kg-generate",
@@ -124,11 +152,15 @@ def _check_engine_versions(version: str | None, errors: list[str]) -> None:
     # can't pass CI.
     if version is None:
         return
-    for rel, pat, label in (
-        ("pyproject.toml", r'''^\s*version\s*=\s*["']([^"']+)["']''', "pyproject.toml"),
-        ("scripts/kg_engine/__init__.py", r'''__version__\s*=\s*["']([^"']+)["']''', "kg_engine.__version__"),
+    for rel, getter, label in (
+        # pyproject.toml's version is scoped to the [project] table (not the first matching line
+        # anywhere in the file), so a [tool.*]/[build-system] version line can't shadow it.
+        ("pyproject.toml", _grep_project_version, "pyproject.toml"),
+        ("scripts/kg_engine/__init__.py",
+         lambda rel, errs: _grep_version(rel, r'''__version__\s*=\s*["']([^"']+)["']''', errs),
+         "kg_engine.__version__"),
     ):
-        found = _grep_version(rel, pat, errors)
+        found = getter(rel, errors)
         if found is None:
             if (ROOT / rel).exists():  # file present but no parseable version line
                 errors.append(f"could not find a version string in {rel}")

@@ -190,8 +190,18 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
     ctx.restore();
   }
 
-  function frame() { for (var i = 0; i < 3; i++) step(); draw(); requestAnimationFrame(frame); }
-  frame();
+  // rAF loop that PARKS once the layout has cooled (alpha < ALPHA_FLOOR): step() already early-returns
+  // there, so without parking draw() would repaint an identical static frame ~60x/s forever, pinning a
+  // CPU/GPU core on an idle offline tab. We run one final draw() at the floor, then stop scheduling; the
+  // interaction handlers (which bump alpha or change view) call kick() to resume.
+  var running = false;
+  function frame() {
+    for (var i = 0; i < 3; i++) step();
+    draw();
+    if (alpha >= SIM.ALPHA_FLOOR) { requestAnimationFrame(frame); } else { running = false; }
+  }
+  function kick() { if (!running) { running = true; requestAnimationFrame(frame); } }
+  kick();
 
   // --- interactivity: pan (drag background), zoom (wheel), drag node, hover tooltip
   function toWorld(px, py) { return { x: (px - view.x) / view.k, y: (py - view.y) / view.k }; }
@@ -216,8 +226,8 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
     last = { x: e.clientX, y: e.clientY };
   });
   window.addEventListener("mousemove", function (e) {
-    if (dragNode) { var w = toWorld(e.clientX, e.clientY); dragNode.x = w.x; dragNode.y = w.y; dragNode.vx = dragNode.vy = 0; alpha = Math.max(alpha, 0.3); }
-    else if (panning && last) { view.x += e.clientX - last.x; view.y += e.clientY - last.y; last = { x: e.clientX, y: e.clientY }; }
+    if (dragNode) { var w = toWorld(e.clientX, e.clientY); dragNode.x = w.x; dragNode.y = w.y; dragNode.vx = dragNode.vy = 0; alpha = Math.max(alpha, 0.3); kick(); }
+    else if (panning && last) { view.x += e.clientX - last.x; view.y += e.clientY - last.y; last = { x: e.clientX, y: e.clientY }; kick(); }
     else {
       var n = pick(e.clientX, e.clientY);
       if (n) { showTooltip(n, e.clientX, e.clientY); } else { hideTooltip(); }
@@ -226,9 +236,9 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
   window.addEventListener("mouseup", function () { if (dragNode) dragNode.fixed = false; dragNode = null; panning = false; last = null; });
   canvas.addEventListener("wheel", function (e) {
     e.preventDefault(); var scale = e.deltaY < 0 ? 1.1 : 1 / 1.1, mx = e.clientX, my = e.clientY;
-    view.x = mx - (mx - view.x) * scale; view.y = my - (my - view.y) * scale; view.k *= scale;
+    view.x = mx - (mx - view.x) * scale; view.y = my - (my - view.y) * scale; view.k *= scale; kick();
   }, { passive: false });
-  window.addEventListener("resize", function () { resize(); });
+  window.addEventListener("resize", function () { resize(); kick(); });
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
 })();
 </script>

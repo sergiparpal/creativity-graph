@@ -187,6 +187,54 @@ def test_ensemble_with_second_graph_surfaces_cross_construction_bridge(canon: Ca
         assert c.section == "§9" and "exo bridge" in c.rationale
 
 
+def test_run_generators_dedups_reversed_orientation_bridge_from_exo(canon: Canon, tmp_path):
+    """review-M10: bridge orients an undirected bridge by G's node order while ensemble-exo orients the
+    SAME pair by the second construction's node order; with a directional dedup key both survivors slip
+    through. The orientation-independent BRIDGES_RELATION key must collapse them to one."""
+    import json
+
+    import networkx as nx
+
+    from kg_engine.generate import load_second_graph
+    from kg_engine.graphio import _node_link_data
+    # two triangles joined by one edge => two communities; bridge surfaces cross-community pairs
+    # oriented by G's node order (a-first for the {a1,b2} pair, since a1 precedes b2 in node iteration).
+    edges = [("a1", "a2"), ("a2", "a3"), ("a1", "a3"),
+             ("b1", "b2"), ("b2", "b3"), ("b1", "b3"), ("a1", "b1")]
+    G = _ranked(canon, edges)
+    # a SECOND construction adjacent on the SAME undirected bridge {a1,b2} but with b2 inserted FIRST,
+    # so ensemble-exo iterates b2 before a1 and emits the pair oriented (b2, a1) — the reverse of bridge.
+    g2 = nx.MultiDiGraph()
+    for n in ("b2", "a1"):                       # b2 before a1: reversed orientation vs G
+        g2.add_node(n, label=n)
+    g2.add_edge("b2", "a1", key="e1")
+    p = tmp_path / "graph2.json"
+    p.write_text(json.dumps(_node_link_data(g2)))
+    G2 = load_second_graph(str(p))
+    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=20,
+                             second_graph=G2)
+    bridges = [c for c in out if c.kind == "edge" and c.relation == "bridges"]
+    keys = [frozenset((c.source, c.target)) for c in bridges]
+    assert len(keys) == len(set(keys))                       # no orientation-swapped duplicate survives
+    assert keys.count(frozenset(("a1", "b2"))) == 1          # the cross-construction pair appears once
+
+
+def test_transplant_skips_hub_with_only_blank_relations(canon: Canon):
+    """The relation='' candidate transplant would emit is always QUARANTINED at the boundary, so a hub
+    whose out-edges all carry a blank/missing relation must yield NO candidates (treated like no out-edges)."""
+    edges = [("a1", "a2"), ("a2", "a3"), ("a1", "a3"),
+             ("b1", "b2"), ("b2", "b3"), ("b1", "b3"), ("a1", "b1")]
+    G = _ranked(canon, edges)
+    # transplant picks the highest-degree hub in a real community; blank every out-edge's relation on G.
+    hub = max((n for n in G.nodes() if G.nodes[n].get("community", -1) != -1),
+              key=lambda n: (float(G.nodes[n].get("degree", 0)), n))
+    for _, _, data in G.out_edges(hub, data=True):
+        data["relation"] = ""
+    cands = gen.transplant(G, pack=None, corpus=[_UNIFORM], failures=set(), k=10)
+    assert all(c.source != hub for c in cands)               # no candidate emitted from the blank-relation hub
+    assert all(c.relation != "" for c in cands)              # never a relation='' candidate
+
+
 def test_kg_ensemble_graph_summary_and_missing(engine, tmp_path):
     import json
 

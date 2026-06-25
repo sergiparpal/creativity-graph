@@ -32,6 +32,13 @@ CANON_SUBDIR = "canon"
 # Refresh the lease this many times per TTL while a long batch is in flight (write_nodes), so the
 # lease stays comfortably fresh inside the TTL window and a concurrent session never judges it stale.
 HEARTBEAT_REFRESHES_PER_TTL = 3
+# Bounded-retention housekeeping for the transient dotfiles the I/O paths can leave in the canon dir
+# (perf/housekeeping gap). Keep at most this many `.{name}.unreadable-*.bak` per note (newest first) so
+# the F28 recoverability intent is honored while the rest are pruned; reap crash-leftover `.tmp-*` and
+# sidelined lock files (`.kg-session-lock.stale-*`/`.release-*`) only once they are older than this many
+# seconds — long past any live atomic-write/lock-reclaim window — so the reaper never races a write.
+BACKUP_RETENTION_PER_NOTE = 3
+TRANSIENT_REAP_TTL = 3600.0
 # Grounding audit log (kg_ground tamper-evidence). Defined here — the lowest layer that must keep it
 # out of git — and re-exported by reconciler so server/tests have one source of truth.
 GROUND_AUDIT = ".kg-ground-audit.jsonl"
@@ -139,16 +146,41 @@ class LeaseLock:
         # back and lose the race rather than steal it (closes the residual reclaim TOCTOU).
         moved = self._read_path(sidelined, tolerant=True)
         if moved is not None and not self._rec_stale(moved, now):
-            try:
-                os.replace(sidelined, self.path)
-            except OSError:
-                pass
+            # Restore the live record. A transient OSError on the reverse rename (EIO/ENOSPC/EPERM —
+            # os.replace cannot raise on an existing target or EXDEV here, same parent dir) would
+            # otherwise orphan the live owner's only record at the sidelined path and leave self.path
+            # empty, so the live owner silently loses its lease until its NEXT acquire() re-O_EXCLs it.
+            # Don't blind-`pass`: fall back to writing the record's content back to self.path so the
+            # canonical path is never left empty, then drop the sideline. The reaper sweeps any leak.
+            self._restore_or_copy_back(sidelined, moved)
             return False
         try:
             os.unlink(sidelined)
         except OSError:
             pass
         return True
+
+    def _restore_or_copy_back(self, sidelined: Path, rec: dict) -> bool:
+        """Put a sidelined-but-LIVE lock record back at self.path. Try the atomic reverse rename first;
+        on a transient OSError (EIO/ENOSPC/EPERM) fall back to copying the record's content to self.path
+        (so the live owner's canonical path is never left empty) and dropping the sideline. Returns True
+        if self.path ends up holding the live record. Best-effort throughout — on total failure the live
+        owner re-O_EXCLs the path on its next acquire() and the reaper sweeps the sideline."""
+        try:
+            os.replace(sidelined, self.path)
+            return True
+        except OSError:
+            pass
+        # rename failed transiently — write the record's content back so self.path isn't left empty
+        try:
+            _atomic_write(self.path, json.dumps(rec))
+            try:
+                os.unlink(sidelined)
+            except OSError:
+                pass
+            return True
+        except OSError:
+            return False
 
     @staticmethod
     def _read_path(p: Path, *, tolerant: bool = False) -> dict | None:
@@ -411,6 +443,59 @@ class Canon:
         phantom node — canon-5). One place so every reader (here + reconciler) filters identically."""
         return [p for p in sorted(self.notes_dir.glob("*.md")) if not p.name.startswith(".")]
 
+    def reap_transient_files(self, *, now: float | None = None) -> int:
+        """Bounded-retention housekeeping for the transient dotfiles the I/O paths leave behind, so a
+        long-lived vault does not grow them without limit. Best-effort and idempotent: a failed unlink
+        is swallowed and retried next sweep. Returns the count removed.
+
+        - `.{name}.unreadable-*.bak` (F28 self-heal backups): keep the newest BACKUP_RETENTION_PER_NOTE
+          per note (so a foreign/corrupt note stays recoverable — the F28 intent) and prune the rest.
+        - crash-leftover `.tmp-*` (atomic-write temporaries) and sidelined locks
+          (`.kg-session-lock.stale-*`/`.release-*`): prune only once older than TRANSIENT_REAP_TTL —
+          well past any live atomic-write or lock-reclaim window — so the reaper never races a write.
+
+        Designed to be wired into the reconciler's periodic full sweep (which already walks the canon
+        dir); it lives here because Canon owns the transient-file naming. The lock sidelines sit under
+        `root`, the backups/temps under `notes_dir`."""
+        now = time.time() if now is None else now
+        removed = 0
+
+        def _unlink(p: Path) -> None:
+            nonlocal removed
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass  # best-effort — a vanished/locked file is retried next sweep
+
+        def _aged(p: Path) -> bool:
+            try:
+                return (now - p.stat().st_mtime) > TRANSIENT_REAP_TTL
+            except OSError:
+                return False  # cannot stat -> leave it for next sweep
+
+        # group `.{name}.unreadable-<ms>.bak` by the note they back up; the <ms> stamp sorts oldest-first.
+        backups: dict[str, list[Path]] = {}
+        try:
+            for p in self.notes_dir.glob(".*.unreadable-*.bak"):
+                stem = p.name[1:p.name.rindex(".unreadable-")]  # strip leading dot + ".unreadable-...bak"
+                backups.setdefault(stem, []).append(p)
+        except OSError:
+            backups = {}
+        for paths in backups.values():
+            for stale in sorted(paths, key=lambda q: q.name)[:-BACKUP_RETENTION_PER_NOTE]:
+                _unlink(stale)
+
+        # crash-leftover atomic-write temporaries (notes_dir) and sidelined lock records (root), TTL-gated.
+        for p in self.notes_dir.glob(".tmp-*"):
+            if _aged(p):
+                _unlink(p)
+        for pat in (".tmp-*", f"{LOCK_NAME}.stale-*", f"{LOCK_NAME}.release-*"):
+            for p in self.root.glob(pat):
+                if _aged(p):
+                    _unlink(p)
+        return removed
+
     def all_nodes(self) -> list[Node]:
         out = []
         for p in self.note_paths():
@@ -519,9 +604,19 @@ class Canon:
             # state, so its merges don't trip this either.
             if (prev is not None and prev.epistemic_state in GROUNDABLE_STATES
                     and e.epistemic_state == EpistemicState.UNVERIFIED):
+                # Preserve not just the verdict state but the evidence it rests on. The reachable path
+                # is a kg_propose re-proposal of an already-grounded edge (the hypothesized lane skips
+                # the verdict_ids check, boundary.py), whose bare incoming object would otherwise revert
+                # a PROMOTED hypothesis's provenance (e.g. back to `hypothesized`), blank its support
+                # span, and drop the verdict notes — the citation / falsification rationale §1.7 must
+                # survive forever. Carry prev's verdict-associated fields so the stored edge stays a
+                # consistent grounded/rejected/failed object, not a verdict floating over empty support.
                 e.epistemic_state = prev.epistemic_state
                 e.verdict_by = prev.verdict_by
                 e.verdict_at = prev.verdict_at
+                e.provenance = prev.provenance
+                e.span = prev.span
+                e.notes = prev.notes
             by_id[e.id] = e  # incoming wins (already validated)
         cur.edges = list(by_id.values())
         if node.body:

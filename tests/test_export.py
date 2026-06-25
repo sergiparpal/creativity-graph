@@ -108,6 +108,33 @@ def test_report_lists_falsification_stale_and_source_files():
     assert "`a.md`: 1 edge" in md and "`b.md`: 1 edge" in md                # R4 per-file counts
 
 
+def test_report_escapes_source_file_code_span_injection():
+    """source_file is agent-controlled free text — it must be routed through _escape_md like every other
+    untrusted field so a backtick/markup-bearing value cannot break the backtick code span or inject HTML
+    when GRAPH_REPORT.md is rendered (review-low)."""
+    evil = "x`</code><script>alert(1)</script>"
+    edges = [_e("e1", "a", "b", source_file=evil)]
+    md = _report_md({"nodes": 1, "edges": 1, "edges_by_epistemic_state": {}},
+                    [_n("a"), _n("b")], edges, [], 0)
+    # the raw breakout sequence (the backtick + raw markup) never reaches the rendered report
+    assert evil not in md
+    assert "`</code><script>" not in md and "<script>" not in md
+    # but the file is still listed (escaped lookalikes), keyed on the raw value so counts stay correct
+    assert "1 edge(s)" in md
+    assert "ʼ" in md and "‹script›" in md   # backtick + angle brackets neutralized to lookalikes
+
+
+def test_report_distinct_source_files_stay_distinct_after_escaping():
+    """Escaping happens at render time, not at Counter-key time, so two source_files differing only in a
+    backtick remain separate rows (escaping at key time would collapse them)."""
+    edges = [_e("e1", "a", "b", source_file="a`md"), _e("e2", "a", "b", source_file="amd")]
+    md = _report_md({"nodes": 2, "edges": 2, "edges_by_epistemic_state": {}},
+                    [_n("a"), _n("b")], edges, [], 0)
+    # both are present as separate single-edge rows (not merged into one 2-edge row)
+    assert "`aʼmd`: 1 edge(s)" in md and "`amd`: 1 edge(s)" in md
+    assert "2 edge(s)" not in md
+
+
 # --------------------------------------------------------------------------- engine path (read-only)
 
 
@@ -192,6 +219,25 @@ def test_html_escapes_script_data_double_escape_breakout(engine):
     assert "<!--<script>" not in htext         # the dangerous sequence never appears literally
     assert htext.count("</script>") == 1       # the template's close is not swallowed
     assert "\\u003c" in htext                   # angle brackets were unicode-escaped in the inlined data
+
+
+def test_animation_loop_parks_when_cooled_and_resumes_on_interaction():
+    """The rAF loop must STOP rescheduling once the layout has cooled (alpha < ALPHA_FLOOR) — otherwise
+    draw() repaints an identical static frame forever on an idle offline tab, pinning a CPU/GPU core. It
+    runs one final draw() at the floor, then parks; interaction handlers resume it via kick() (review-low,
+    performance)."""
+    t = HTML_TEMPLATE
+    # frame() reschedules ONLY while still above the cooling floor (guarded rAF, not unconditional)
+    assert "if (alpha >= SIM.ALPHA_FLOOR) { requestAnimationFrame(frame); }" in t
+    # the old unconditional "draw(); requestAnimationFrame(frame);" reschedule is gone
+    assert "draw(); requestAnimationFrame(frame); }" not in t
+    # a kick() seam guards against double-scheduling and is what resumes a parked loop
+    assert "function kick()" in t and "kick();" in t
+    # every interaction that changes the layout/view resumes the loop: drag, pan, wheel zoom, resize
+    assert "alpha = Math.max(alpha, 0.3); kick();" in t       # node drag bumps alpha + resumes
+    assert "last = { x: e.clientX, y: e.clientY }; kick();" in t  # background pan repaints
+    assert "view.k *= scale; kick();" in t                    # wheel zoom repaints
+    assert 'window.addEventListener("resize", function () { resize(); kick(); });' in t
 
 
 def test_export_dispatch_kinds(engine):

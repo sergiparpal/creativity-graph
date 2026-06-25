@@ -291,13 +291,25 @@ class Reconciler:
         for p in self.canon.note_paths():  # excludes .tmp-* atomic-write temporaries (canon-5)
             report.scanned += 1
             rel = p.name
-            st = p.stat()
+            # scan() holds no lease, so a lease-holding writer (kg_rename's unlink, an atomic
+            # temp+replace) can delete/rename a note BETWEEN note_paths()'s snapshot and these
+            # stat/hash syscalls. An unguarded raise here aborts the WHOLE §1.8 sweep before
+            # _save_state, silently disabling forge-detection for the session (reconciler-7). Skip a
+            # vanished/transiently-unreadable note instead: it is correctly absent from live_files (and
+            # pruned if truly gone), and re-examined next sweep if it still exists.
+            try:
+                st = p.stat()
+            except OSError:
+                continue  # deleted/renamed concurrently; not live this sweep
             prev = files_state.get(rel, {})
             # pre-filter: unchanged mtime+size and not a full sweep -> skip the expensive re-read
             prefilter_same = (prev.get("mtime") == st.st_mtime and prev.get("size") == st.st_size)
             if prefilter_same and not full_sweep:
                 continue  # cheap pre-gate: trust (mtime,size); the full-sweep prune below re-reads
-            digest = _sha256(p)
+            try:
+                digest = _sha256(p)
+            except OSError:
+                continue  # vanished/unreadable between stat and hash; retry next sweep
             if full_sweep and prefilter_same and prev.get("sha256") == digest:
                 # mtime/size AND hash matched -> genuinely unchanged even under sweep. Carry the cached
                 # keys forward (backfill once if absent) so live_keys stays complete without a re-parse.
@@ -322,20 +334,47 @@ class Reconciler:
                 live_files.add(rel)
                 continue  # leave its file_state untouched so it's retried next scan
 
-            mutated = self._requarantine_forged(node, epistemic, consumed, audit, report)
+            # A re-quarantine is a read->mutate->write; the reconciler holds no lease across it, so a
+            # concurrent kg_ground (separate process) could ground a SIBLING edge on this same node
+            # between our read and our write and our stale in-memory copy would clobber that verdict
+            # (lost update, reconciler-M2). Take the lease for the critical section and decide on a FRESH
+            # read under it — mirroring kg_ground's read-under-lease discipline — so we reset only what
+            # is STILL forged and never drop a concurrently-applied sibling verdict. If the lease can't
+            # be taken (another live writer), fall back to the snapshot read: correctness is unchanged
+            # (any clobbered verdict is re-applied by its own kg_ground; this note retries next sweep),
+            # and single-process callers (the lease is free) always take the fast lease path.
+            locked = self.canon.try_acquire_lock()
+            try:
+                if locked:
+                    try:
+                        node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
+                    except OSError:
+                        live_files.add(rel)  # vanished/unreadable under the lease; retry next sweep
+                        continue
+                    except Exception:  # noqa: BLE001 — became malformed; no parseable keys, retry next
+                        live_files.add(rel)
+                        continue
+                mutated = self._requarantine_forged(node, epistemic, consumed, audit, report)
 
-            if mutated:
-                relocated = self._relocate_to_canonical(node, p, rel, files_state, live_files)
-                if relocated is None:
-                    continue  # collision pre-check failed: keep the original, retry next sweep
-                p, rel = relocated
-                try:
-                    self.canon.write_one(node)
-                except Exception:  # noqa: BLE001 — one unwritable/colliding note must not abort the sweep
-                    live_files.add(rel)
-                    continue
-                st = p.stat()
-                digest = _sha256(p)
+                if mutated:
+                    relocated = self._relocate_to_canonical(node, p, rel, files_state, live_files)
+                    if relocated is None:
+                        continue  # collision pre-check failed: keep the original, retry next sweep
+                    p, rel = relocated
+                    try:
+                        self.canon.write_one(node)
+                    except Exception:  # noqa: BLE001 — one unwritable/colliding note must not abort sweep
+                        live_files.add(rel)
+                        continue
+                    try:
+                        st = p.stat()
+                        digest = _sha256(p)
+                    except OSError:
+                        live_files.add(rel)  # vanished right after our write; cache it next sweep
+                        continue
+            finally:
+                if locked:
+                    self.canon._release_lock()
             keys = self._node_keys(node)
             files_state[rel] = self._file_record(st, digest, keys)
             live_files.add(rel)
@@ -367,10 +406,20 @@ class Reconciler:
             del epistemic[k]
 
         self._save_state({"files": files_state, "epistemic": epistemic, "consumed": consumed})
+
+        # Housekeeping (full sweep only): reap bounded-retention transient dotfiles (old `.bak` self-heal
+        # backups beyond the retention cap, crash-leftover `.tmp-*`, sidelined lock records) that would
+        # otherwise accumulate unbounded in the canon dir (canon-reaper). Best-effort: reap_transient_files
+        # keeps the newest N backups per note, TTL-gates the .tmp-*/sideline removal so it never races a
+        # live atomic write/reclaim, and swallows its own OSErrors — so it can never abort the §1.8 sweep.
+        if full_sweep:
+            try:
+                self.canon.reap_transient_files()
+            except Exception:  # noqa: BLE001 — housekeeping must never break the sweep
+                pass
         return report
 
-    @staticmethod
-    def _forged(key: str, current: EpistemicState, epistemic: dict, consumed: dict,
+    def _forged(self, key: str, current: EpistemicState, epistemic: dict, consumed: dict,
                 audit: dict[str, int]) -> bool:
         """True if `current` is a policed state reached out-of-band: it differs from the last validated
         state for this key and there is no UNCONSUMED kg_ground audit record justifying a transition
@@ -382,12 +431,34 @@ class Reconciler:
         if current not in GROUNDABLE_STATES:
             return False
         last = epistemic.get(key)
-        if last == current.value:
-            return False  # unchanged since last validated — nothing new to justify
         pair = f"{key}||{current.value}"
+        if last == current.value:
+            # Unchanged since last validated — nothing new to justify. BUT an idempotent re-ground
+            # (kg_ground grounded->grounded) appends a fresh record on EVERY call, and the reconciler
+            # counts records by (key, to) only — so a re-ground to the SAME state leaves a spendable
+            # surplus this branch would otherwise never consume. A later out-of-band forgery back into
+            # this state could then spend that orphan surplus and slip past undetected (reconciler-H1).
+            # Drain any surplus for this pair into `consumed` so an idempotent re-ground can never leave
+            # a spendable record behind.
+            if audit.get(pair, 0) > consumed.get(pair, 0):
+                consumed[pair] = audit[pair]
+            return False
         if audit.get(pair, 0) > consumed.get(pair, 0):
             consumed[pair] = consumed.get(pair, 0) + 1  # spend exactly one record for this transition
             return False
+        # The snapshot `audit` (captured once at the top of the sweep) shows no record — but the
+        # per-session reconcile runs in a SEPARATE process concurrently with kg_ground, so a LEGITIMATE
+        # verdict (record appended + canon write) can land AFTER the snapshot yet before this note's
+        # read. Before declaring a forgery (which would permanently revert that just-applied verdict),
+        # re-fold the audit log FRESH to pick up any record appended mid-sweep; honor it if found
+        # (reconciler-H3/M2). The re-fold advances the incremental cache, so a later check in this same
+        # sweep sees the same counts.
+        fresh = self._audit_counts()
+        if fresh.get(pair, 0) > audit.get(pair, 0):
+            audit[pair] = fresh[pair]  # adopt the mid-sweep record into this sweep's working snapshot
+            if audit.get(pair, 0) > consumed.get(pair, 0):
+                consumed[pair] = consumed.get(pair, 0) + 1
+                return False
         return True
 
     # ---- post-reproject reattachment

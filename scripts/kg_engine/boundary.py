@@ -284,6 +284,11 @@ def validate_payload(
         # zero, so it must neither consume budget nor be flooded — otherwise an idempotent re-build that
         # re-emits existing edges would spuriously trip the limiter.
         if edge_budget is not None and r.written and not edge_budget.fits("deduped" in r.reason):
+            # mirror the node lane: an id only counts as `seen` (a free dedup) once a copy was actually
+            # written. A flood-rejected NET-NEW edge was provisionally added to `seen` by _validate_edge;
+            # discard it here so a SECOND identical copy can't take the zero-cost dedup branch and slip
+            # past the full budget (cap-bypass via in-payload duplication).
+            seen.discard(r.identity)
             r = _ok("edge", r.item, Disposition.REJECTED, "rate-limited-flood", False, r.identity)
         results.append(r)
 

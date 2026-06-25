@@ -8,12 +8,13 @@ import sys
 
 
 def _clean(value: "str | None") -> str:
-    """Mirror bootstrap._clean / the launchers' clean(): drop empty, whitespace, and unsubstituted
-    ${...} values so an unset/unsubstituted env var never sends us to a bogus path (review-low)."""
+    """Mirror bootstrap._clean / the launchers' clean(): drop empty, whitespace, unsubstituted
+    ${...}, and the bare-sentinel results of substituting an empty ${...} into a ${VAR}/.venv
+    template so an unset/unsubstituted env var never sends us to a bogus path (review-low)."""
     if not value:
         return ""
     v = value.strip()
-    if not v or v.startswith("${"):
+    if not v or v.startswith("${") or v in ("/.venv", "/venv"):
         return ""
     return v
 

@@ -33,7 +33,13 @@ try {
       : ["sh", [join(hooksDir, "provision.sh")]];
   // stdio ignored so the launcher never writes to the hook log; the launcher and
   // bootstrap.py handle their own (background) logging to provision.log.
-  spawnSync(cmd, args, { stdio: "ignore" });
+  // Defensive timeout: the never-block guarantee rests on bootstrap.py --background
+  // returning fast, but the OS launcher's own Python version probe is unbounded — a
+  // hanging shim (network-mounted interpreter, AV-scanned first run, a `py` launcher
+  // prompting) would block this synchronous spawn with no inner cutoff on a runtime
+  // without async hook support. Bound it so the dispatcher always returns; if the
+  // detached worker never spawned, the foreground MCP catch-up still self-heals.
+  spawnSync(cmd, args, { stdio: "ignore", timeout: 15000, killSignal: "SIGKILL" });
 } catch {
   // never surface an error from a background hook
 }

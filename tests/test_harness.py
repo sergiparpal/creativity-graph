@@ -9,6 +9,7 @@ import pytest
 
 from kg_engine.harness import (
     _key_terms,
+    _main,
     _score_condition,
     node_specificity,
     absorption,
@@ -180,3 +181,66 @@ def test_f4_sheet_rejects_nonpositive_n(tmp_path):
     assert not out.exists()  # nothing written on rejection
     with pytest.raises(SystemExit):
         f4_probe.sheet(str(graph), -3, str(out), include_extracted=True)
+
+
+# --------------------------------------------------------------------------- I_harness [1]
+
+
+def test_cli_malformed_json_clean_diagnostic_no_demo_fallback(tmp_path, capsys):
+    """A present-but-unparseable input file gets a one-line diagnostic and a non-zero exit — it must
+    NOT silently fall back to scoring the demo corpus (that would report a misleading number)."""
+    broken = tmp_path / "broken.json"
+    broken.write_text("{ broken json", encoding="utf-8")
+    rc = _main(["agreement", str(broken)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "failed to parse" in err and "broken.json" in err
+    # the demo would have printed a krippendorff_alpha line; a clean error must not
+    assert "krippendorff_alpha" not in err
+
+
+def test_cli_malformed_json_clean_for_all_subcommands(tmp_path, capsys):
+    broken = tmp_path / "broken.json"
+    broken.write_text("not json at all", encoding="utf-8")
+    for cmd in ("agreement", "specificity", "ideation"):
+        assert _main([cmd, str(broken)]) == 2
+        assert "failed to parse" in capsys.readouterr().err
+
+
+def test_cli_absent_file_still_falls_back_to_demo(tmp_path, capsys):
+    """The graceful demo fallback stays reserved for the genuinely-absent-file case."""
+    rc = _main(["agreement", str(tmp_path / "does-not-exist.json")])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "using demo label sets" in captured.err
+    assert "krippendorff_alpha" in captured.out
+
+
+# --------------------------------------------------------------------------- I_harness [2]
+
+
+def test_agreement_rejects_non_list_shape():
+    """A top-level JSON object (single dict) instead of a list of coder dicts must raise a usage
+    ValueError, not an opaque AttributeError from iterating dict keys as coders."""
+    with pytest.raises(ValueError):
+        agreement({"e1": "correct", "e2": "vague"})
+    with pytest.raises(ValueError):
+        agreement([{"u1": "correct"}, "not-a-dict"])
+
+
+def test_cli_agreement_object_input_clean_error(tmp_path, capsys):
+    labels = tmp_path / "labels.json"
+    labels.write_text('{"e1": "correct", "e2": "vague"}', encoding="utf-8")
+    rc = _main(["agreement", str(labels)])
+    assert rc == 2
+    assert "label_sets must be a list" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- I_harness [3]
+
+
+def test_agreement_whitespace_variants_are_one_category():
+    """Cosmetically-different but semantically-identical labels ('correct' vs 'correct ') must score
+    as agreement, not as two distinct nominal categories."""
+    a = agreement([{"u1": "correct "}, {"u1": "correct"}])
+    assert abs(a - 1.0) < 1e-9

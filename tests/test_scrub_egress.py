@@ -130,6 +130,85 @@ def test_preexisting_placeholder_round_trips_unchanged():
     assert Scrubber.restore(scrubbed, mapping) == src, "literal placeholder did not round-trip"
 
 
+# --- scrub-3-nl: natural-language "keyword is value" secrets are redacted (not only keyword=value) ---
+
+@pytest.mark.parametrize("text", [
+    "The admin password is hunter2 and that is it.",
+    "the password is hunter2",
+    "you can use api token abc123def to authenticate",
+    "My secret was SuperSecret last week",
+    "api_key is QWErty12345xyz now",
+    "the credential token equals abc123XYZ here",
+])
+def test_keyword_is_value_secret_redacted(text):
+    # The `[:=]`-anchored keyword rule can't span an intervening linking-verb word ("password is X"),
+    # and a low-entropy value ("hunter2") slips the >=32-char fallback, so the secret leaked verbatim at
+    # every tier. The natural-language branch must redact the value.
+    scrubbed, _ = Scrubber("low").scrub(text)
+    assert "⟦SECRET" in scrubbed, scrubbed
+    for leak in ("hunter2", "abc123def", "SuperSecret", "QWErty12345xyz", "abc123XYZ"):
+        assert leak not in scrubbed, scrubbed
+
+
+def test_keyword_is_value_does_not_over_redact_plain_prose():
+    # A REQUIRED linking verb plus a too-short value keeps ordinary prose intact (no false ⟦SECRET⟧).
+    for text in ("the token is to be used later", "password protects the realm"):
+        scrubbed, _ = Scrubber("low").scrub(text)
+        assert "⟦SECRET" not in scrubbed, (text, scrubbed)
+
+
+def test_keyword_is_value_no_redos_on_long_value():
+    # The natural-language value run is a bounded single-char-class quantifier (linear), not a backtracker.
+    run = "b1Cd2" * 20000  # ~100k chars, no whitespace
+    start = time.monotonic()
+    scrubbed, _ = Scrubber("low").scrub(f"the password is {run} trailing")
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"scrub took {elapsed:.2f}s (catastrophic backtracking)"
+    assert run not in scrubbed, "the long secret value leaked"
+
+
+# --- scrub-4: a bare base64 secret (slash/plus alphabet) is redacted, not split at the first '/' ----
+
+def test_bare_base64_aws_secret_key_redacted():
+    # An AWS *secret* access key (the named AWS rule covers only the AKIA/ASIA access key ID). Its '/'
+    # broke the `[A-Za-z0-9_]` high-entropy run, so it leaked verbatim with no keyword prefix.
+    key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # canonical AWS example secret (not a live key)
+    scrubbed, _ = Scrubber("high").scrub(f"deploy uses {key} for signing")
+    assert "⟦SECRET" in scrubbed, scrubbed
+    assert key not in scrubbed and "wJalrXUtnFEMI" not in scrubbed, scrubbed
+
+
+def test_base64_fallback_spares_ordinary_slashed_prose():
+    # All-letter slashed paths (no digit) must NOT be mass-redacted by the base64 fallback.
+    text = "see docs/guide/introduction for the full overview of the system"
+    scrubbed, _ = Scrubber("high").scrub(text)
+    assert scrubbed == text, scrubbed
+
+
+def test_base64_fallback_no_redos_on_long_slashed_run():
+    run = "ab/12" * 20000  # ~100k chars over the base64 alphabet
+    start = time.monotonic()
+    Scrubber("high").scrub(run)
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"scrub took {elapsed:.2f}s (catastrophic backtracking)"
+
+
+# --- scrub-5: a long machine-generated email local part is redacted as ONE ⟦EMAIL⟧, domain included --
+
+def test_long_local_part_email_redacted_as_single_unit():
+    # The >=32-char digit+letter local part was eaten by the SECRET fallback, leaving the @domain to
+    # leak. The fallback's trailing `(?!@)` now yields to the named EMAIL rule, which claims the whole.
+    addr = "abcdef1234567890abcdef1234567890ab@acme-internal.com"
+    scrubbed, _ = Scrubber("medium").scrub(f"mailbox {addr} bounced")
+    assert "⟦EMAIL" in scrubbed, scrubbed
+    assert "acme-internal.com" not in scrubbed and "⟦SECRET" not in scrubbed, scrubbed
+
+
+def test_ordinary_email_still_redacted():
+    scrubbed, _ = Scrubber("medium").scrub("mail real@example.com about it")
+    assert "⟦EMAIL" in scrubbed and "real@example.com" not in scrubbed, scrubbed
+
+
 # --- scrub-4: PERSON is conservative — concept bigrams survive, titled/known names are redacted ---
 
 def test_person_rule_spares_concept_bigram_at_high():

@@ -32,6 +32,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Node is required for the launcher tests (tests/test_launchers.py) — the Node-dependent
+      # cases skip silently when `node` is absent, so without this the .mjs parse/behavior
+      # coverage would vanish with the suite still green. Pin it so the coverage is guaranteed,
+      # not an accident of the runner image.
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
       - name: Install the engine + dev/backend extras
         run: |
           python -m pip install --upgrade pip

@@ -97,8 +97,11 @@ def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list
 
     - **Edges:** union by the deterministic ``edge_id`` (never lose an edge a side added, mirroring the
       single-canonical-edge rule + never-prune-failure-memory §1.7). An edge on both sides at the SAME
-      ``epistemic_state`` keeps ours; at a DIFFERENT state it demotes to ``unverified`` with
-      ``verdict_by``/``verdict_at`` cleared — never resolving to either verdict (never-forge-a-verdict).
+      ``epistemic_state`` takes THEIRS (incoming-wins, matching ``_merge_into_existing``'s
+      ``by_id[e.id] = e`` — so a theirs-side span/notes/confidence correction is not silently dropped;
+      no verdict is forged because the state is identical on both sides); at a DIFFERENT state it
+      demotes to ``unverified`` with ``verdict_by``/``verdict_at`` cleared — never resolving to either
+      verdict (never-forge-a-verdict).
     - **Scalar frontmatter** (label/type): base-aware 3-way, keeping ours on a true divergence.
     - **Node ``epistemic_state``:** demoted to ``unverified`` when the two sides disagree (forge-proof,
       same intent as the edge rule); ``base`` is consulted only for the scalar 3-way. This node-level
@@ -122,7 +125,12 @@ def merge_nodes(base: Node | None, ours: Node, theirs: Node) -> tuple[Node, list
             demoted.verdict_at = None
             by_id[e.id] = demoted
             demotions.append(_demotion_note(e.id, existing.epistemic_state, e.epistemic_state))
-        # else: equal verdict on both sides -> keep ours (already in by_id)
+        else:
+            # equal epistemic_state on both sides -> take THEIRS (incoming-wins, like
+            # _merge_into_existing): the state is identical so no verdict is forged, but a theirs-side
+            # edit to a non-identity field (span/notes/confidence/source_file) is preserved rather than
+            # silently dropped. The two mirrors now agree on which side's edge metadata survives.
+            by_id[e.id] = copy.deepcopy(e)
     merged.edges = list(by_id.values())
 
     # scalar frontmatter: base-aware 3-way, keep ours on divergence
@@ -178,6 +186,12 @@ def _git_merge_file(base_text: str, ours_text: str, theirs_text: str) -> tuple[s
                  "-L", "ours", "-L", "base", "-L", "theirs",
                  paths["ours"], paths["base"], paths["theirs"]],
                 capture_output=True, text=True,
+                # Decode git's stdout with the SAME codec the temp files were written in (UTF-8),
+                # not locale.getpreferredencoding() — on a non-UTF-8 host (cp1252/cp936 on Windows)
+                # text=True would mojibake the UTF-8 body bytes git echoes verbatim and commit a
+                # silently corrupted note as a clean merge (defeats byte-identical-canon). surrogate-
+                # escape round-trips any odd byte rather than raising into main's broad except.
+                encoding="utf-8", errors="surrogateescape",
             )
     except (FileNotFoundError, OSError):
         return _manual_conflict(ours_text, theirs_text)
@@ -234,7 +248,7 @@ def merge_note_files(base_text: str, ours_text: str, theirs_text: str) -> tuple[
 def _write_atomic(path: Path, text: str) -> None:
     """Atomic write (temp in the same dir + os.replace) so a crash mid-write never leaves git a
     half-written canon note (review-low)."""
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent or "."), prefix=".kgmerge-", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".kgmerge-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)

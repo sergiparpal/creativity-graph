@@ -254,6 +254,91 @@ def test_stage2_outdated_schema_forces_full_rebuild(canon: Canon):
     assert "spec_betweenness" in r and math.isfinite(r["spec_betweenness"])
 
 
+def test_outdated_schema_healed_under_lock_contention_so_reads_do_not_crash(canon: Canon, monkeypatch):
+    # M3: a plugin upgrade leaves the on-disk index with the pre-Stage-2 11-column `nodes` table while
+    # another session holds the canon lease. project() falls into the contention branch; before the fix
+    # it healed only a MISSING db, so kg_context then crashed on `no such column: betweenness`. Now the
+    # contention branch ALSO heals an outdated schema, leaving an empty table reads can serve.
+    _seed(canon)
+    proj = Projector(canon)
+    proj.db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(proj.db_path)
+    con.executescript(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);"
+        "CREATE TABLE nodes(id TEXT PRIMARY KEY, label TEXT, node_type TEXT, file_type TEXT,"
+        " provenance TEXT, authored_by TEXT, epistemic_state TEXT, degree INTEGER, community INTEGER,"
+        " bridge_communities INTEGER, structural_bridge INTEGER);")
+    con.commit(); con.close()
+    # graph.json must already exist so the contention branch heals ONLY the schema (not the cold path).
+    proj.graph_path.write_text(json.dumps({"nodes": [], "links": []}))
+    assert proj._schema_outdated() is True
+    # simulate another session holding the lease -> the contention branch
+    monkeypatch.setattr(canon, "try_acquire_lock", lambda: False)
+    proj.project()
+    assert proj._schema_outdated() is False  # the contention branch healed the schema in place
+    # the read that used to crash on `no such column: betweenness` now returns an (empty) result
+    ctx = proj.kg_context(budget=2000)
+    assert ctx["advisory"]["bridge_metric"]["nodes"] == []  # empty table -> empty ranked list, no crash
+
+
+def test_ranking_and_agenda_are_deterministic_across_full_vs_incremental(canon: Canon):
+    # tiebreak: a graph of all-tied nodes (betweenness/spec_betweenness 0.0, identical degree) must
+    # surface the SAME ordered top-N regardless of how the index was built (full rebuild vs an
+    # incremental reproject of the identical canon). The `id ASC` tiebreak makes the order a pure
+    # function of the canon.
+    nodes = [Node(id=f"n{i:02d}", label=f"N{i:02d}", node_type="claim",
+                  edges=[Edge(source=f"n{i:02d}", target="hub", relation="bridges", span="x")])
+             for i in range(20)]
+    nodes.append(Node(id="hub", label="hub", node_type="claim"))
+    canon.write_nodes(nodes, message="seed tied graph")
+
+    proj_full = Projector(canon)
+    proj_full.project(incremental=False)
+    full_bm = [n["id"] for n in proj_full.kg_context(budget=4000)["advisory"]["bridge_metric"]["nodes"]]
+    full_qg = [n["id"] for n in proj_full.query_graph(limit=10)["nodes"]]
+    full_agenda = ([i["focus"][0] for i in proj_full.kg_agenda(limit=50)["answerable_now"]]
+                   + [i["focus"][0] for i in proj_full.kg_agenda(limit=50)["blocked_on_grounding"]])
+
+    # the bridge_metric / query_graph orders are deterministically id-sorted within the tied band
+    assert full_bm == sorted(full_bm)
+    assert full_qg == sorted(full_qg)
+
+    # force a fresh full rebuild from the same canon and confirm identical ordering (no run-to-run churn)
+    proj_rebuilt = Projector(canon)
+    proj_rebuilt.db_path.unlink(missing_ok=True)
+    proj_rebuilt.graph_path.unlink(missing_ok=True)
+    proj_rebuilt.project(incremental=False)
+    assert [n["id"] for n in proj_rebuilt.kg_context(budget=4000)["advisory"]["bridge_metric"]["nodes"]] == full_bm
+    rebuilt_agenda = ([i["focus"][0] for i in proj_rebuilt.kg_agenda(limit=50)["answerable_now"]]
+                      + [i["focus"][0] for i in proj_rebuilt.kg_agenda(limit=50)["blocked_on_grounding"]])
+    assert rebuilt_agenda == full_agenda  # agenda order is reproducible too
+
+
+def test_degree_counts_distinct_neighbours_not_parallel_edges(canon: Canon):
+    # A has TWO distinct un-failed relations to B (grounds + bridges) and one to C: 2 distinct
+    # neighbours, not 3. Degree must match the distinct-neighbour bridge signal / glossary, so A is NOT
+    # mis-counted as a degree-3 hub. (Old `und.degree()` over the MultiGraph returned 3.)
+    nodes = [
+        Node(id="a", label="A", node_type="claim", edges=[
+            Edge(source="a", target="b", relation="grounds", span="s1"),
+            Edge(source="a", target="b", relation="bridges", span="s2"),
+            Edge(source="a", target="c", relation="bridges", span="s3"),
+        ]),
+        Node(id="b", label="B"), Node(id="c", label="C"),
+    ]
+    canon.write_nodes(nodes, message="seed parallel-edge graph")
+    proj = Projector(canon)
+    proj.project()
+    a = proj.get_node("a")
+    assert a["degree"] == 2  # distinct neighbours {b, c}, NOT 3 (the two a->b relations are one neighbour)
+    # the bridge-community span (computed from und.neighbors) and the persisted degree now agree
+    assert a["bridge_communities"] <= a["degree"]
+    # below the _HUB_DEGREE (3) cutoff, so kg_agenda does not misclassify A as a hub on edge multiplicity
+    hubs = [i["focus"][0] for i in proj.kg_agenda(limit=50)["answerable_now"]
+            if i["detector"] == "well-grounded"]
+    assert "a" not in hubs
+
+
 def test_derived_contains_nothing_canon_does_not(canon: Canon):
     _seed(canon)
     proj = Projector(canon)

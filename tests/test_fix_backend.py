@@ -141,6 +141,90 @@ def test_mixed_rolled_back_and_clean_sections_only_count_clean(engine, tmp_path,
     assert out["dispositions"].get("ACCEPTED", 0) >= 1  # the second section's accepts only
 
 
+# --------------------------------------------------------------------------- truncation message honesty
+
+
+def _truncating_client():
+    """A fake client whose every create() reports a max_tokens truncation (no text block)."""
+    class _Messages:
+        def create(self, **kwargs):
+            return SimpleNamespace(stop_reason="max_tokens", content=[])
+
+    return SimpleNamespace(messages=_Messages())
+
+
+def test_truncation_message_when_clamped_does_not_advise_raising_flag(engine):
+    """When --max-tokens was already clamped below the requested value (effective cap < requested), the
+    truncation error must NOT advise 'raise --max-tokens' (futile — the clamp pins it back) and must
+    instead report the effective cap and point at split/streaming."""
+    over = BackendExtractor(engine, client=_truncating_client(), max_tokens=50000)
+    with pytest.raises(RuntimeError) as ei:
+        over.extract_section("dense section text")
+    msg = str(ei.value)
+    assert "raise --max-tokens" not in msg          # the futile advice is gone on the clamped path
+    assert "split" in msg and "streaming" in msg    # the actionable path is offered instead
+    assert str(_NONSTREAMING_TIME_FLOOR) in msg     # the real ceiling is named
+    assert str(over._effective_max_tokens()) in msg  # the effective cap is reported
+
+
+def test_truncation_message_when_not_clamped_still_advises_raising_flag(engine):
+    """When the request was NOT clamped (effective cap == requested), the original 'raise --max-tokens'
+    advice is honest and preserved."""
+    under = BackendExtractor(engine, client=_truncating_client(), max_tokens=16000)
+    with pytest.raises(RuntimeError, match="raise --max-tokens") as ei:
+        under.extract_section("dense section text")
+    assert "split" not in str(ei.value)
+
+
+# --------------------------------------------------------------------------- None content guard
+
+
+def test_none_content_degrades_to_no_text_block(engine):
+    """A content-less response on a non-refusal/non-max_tokens stop_reason must degrade to the
+    intended 'no text block' RuntimeError, not a TypeError from iterating None.content."""
+    class _Messages:
+        def create(self, **kwargs):
+            return SimpleNamespace(stop_reason="end_turn", content=None)
+
+    client = SimpleNamespace(messages=_Messages())
+    extractor = BackendExtractor(engine, client=client)
+    with pytest.raises(RuntimeError, match="no text block"):
+        extractor.extract_section("some section text")
+
+
+# --------------------------------------------------------------------------- source_file_name fallback
+
+
+def test_source_file_name_returns_basename_for_single_file(engine):
+    """A single-file source_path stamps the real basename (the conftest source is `source.md`)."""
+    extractor = BackendExtractor(engine)
+    assert extractor.source_file_name() == "source.md"
+
+
+def test_source_file_name_empty_for_directory_source(engine, tmp_path):
+    """A directory source_path (R4) must NOT stamp the directory name as a basename — with more than one
+    member it returns '' so the boundary takes its explicit empty-source any-source path rather than a
+    fabricated basename the boundary's has_file() would miss."""
+    d = tmp_path / "srcdir"
+    d.mkdir()
+    (d / "a.md").write_text("A compression grounds the claims.\n", encoding="utf-8")
+    (d / "b.md").write_text("Betweenness is confounded by the generality confound.\n", encoding="utf-8")
+    engine.source_path = d
+    extractor = BackendExtractor(engine)
+    assert extractor.source_file_name() == ""
+
+
+def test_source_file_name_single_member_dir_returns_that_basename(engine, tmp_path):
+    """A directory source with exactly one resolvable member returns that single basename, not the
+    directory name."""
+    d = tmp_path / "onedir"
+    d.mkdir()
+    (d / "only.md").write_text("A compression grounds the claims.\n", encoding="utf-8")
+    engine.source_path = d
+    extractor = BackendExtractor(engine)
+    assert extractor.source_file_name() == "only.md"
+
+
 # --------------------------------------------------------------------------- F20
 
 

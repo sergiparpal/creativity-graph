@@ -58,10 +58,12 @@ import hashlib
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import venv
 from pathlib import Path
 
@@ -229,6 +231,75 @@ def _heartbeat_file(venv_dir: Path) -> Path:
     return _lock_dir(venv_dir) / "heartbeat"
 
 
+# The owner token this process wrote into each lock it currently holds, keyed by the lock
+# dir path. release() only rmtrees a lock whose ``info`` still carries OUR token — so a
+# holder that was falsely stolen (suspend/resume past STALE_LOCK_SECS) never deletes the
+# thief's fresh lock (mirrors canon.LeaseLock.release's ownership re-check, F15). Cleared on
+# release; a token surviving here for a lock we no longer own simply never matches the info.
+_OWNED_TOKENS: dict[str, str] = {}
+_HOST = socket.gethostname()
+
+
+def _new_token() -> str:
+    return uuid.uuid4().hex
+
+
+def _info_record(token: str) -> str:
+    # host+pid drive the liveness probe; the nonce token proves ownership across a stolen lock.
+    return f"pid={os.getpid()} host={_HOST} token={token} t={time.time():.0f}\n"
+
+
+def _parse_info_dir(lock: Path) -> dict[str, str]:
+    """Parse the ``info`` record inside lock dir `lock` into a {key: value} map.
+
+    Works on the live lock OR a sidelined copy, so the steal/release re-checks re-read the
+    exact dir they moved aside. Missing/unreadable -> {}.
+    """
+    try:
+        text = (lock / "info").read_text("utf-8")
+    except OSError:
+        return {}
+    rec: dict[str, str] = {}
+    for tok in text.split():
+        key, sep, val = tok.partition("=")
+        if sep:
+            rec[key] = val
+    return rec
+
+
+def _read_info(venv_dir: Path) -> dict[str, str]:
+    """Parse the live lock's ``info`` record into a {key: value} map. Missing/unreadable -> {}."""
+    return _parse_info_dir(_lock_dir(venv_dir))
+
+
+def _pid_probe(rec: dict[str, str]) -> bool:
+    """True if the lock's recorded holder is (possibly) alive. Mirrors canon._pid_probe: a
+    pid on another host (or no host recorded) is treated as alive, and the probe is skipped
+    on Windows (os.kill(pid, 0) there is CTRL_C_EVENT, not a no-op existence check)."""
+    try:
+        pid = int(rec.get("pid", "0"))
+    except ValueError:
+        pid = 0
+    if not pid:
+        return False
+    host = rec.get("host", "")
+    if host and host != _HOST:
+        return True
+    if not host:
+        return True  # an old info record without a host can't be probed — assume alive
+    if os.name == "nt":
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except OSError:
+        return False
+
+
 def _lock_age(venv_dir: Path) -> float:
     """Seconds since the holder last proved it is alive.
 
@@ -249,9 +320,25 @@ def _lock_age(venv_dir: Path) -> float:
             return 0.0
 
 
+def _is_stealable(venv_dir: Path) -> bool:
+    """Whether the existing lock may be reclaimed: either its liveness signal has aged past
+    STALE_LOCK_SECS, OR a cheap PID-liveness probe shows the recorded holder is dead on this
+    host (mirrors canon.LeaseLock._rec_stale: TTL OR a failed os.kill probe). The probe makes
+    a crashed background worker reclaimable in milliseconds instead of the full 30-min window.
+    """
+    if _lock_age(venv_dir) > STALE_LOCK_SECS:
+        return True
+    return not _pid_probe(_read_info(venv_dir))
+
+
 def heartbeat(venv_dir: Path) -> None:
     """Stamp the lock as alive. Called periodically by the install loop so a slow but
-    healthy build is never mistaken for an abandoned lock and stolen."""
+    healthy build is never mistaken for an abandoned lock and stolen.
+
+    If the heartbeat write fails (read-only fs, ENOSPC, AV/permission hiccup), touch the
+    lock dir as a backstop so ``_lock_age``'s fallback path still advances for a live holder
+    instead of freezing at the mkdir-time mtime and getting the live build stolen (review-low).
+    """
     hb = _heartbeat_file(venv_dir)
     try:
         if hb.exists():
@@ -259,17 +346,20 @@ def heartbeat(venv_dir: Path) -> None:
         else:
             hb.write_text(f"pid={os.getpid()} t={time.time():.0f}\n", "utf-8")
     except OSError:
-        pass
+        try:
+            os.utime(_lock_dir(venv_dir), None)
+        except OSError:
+            pass
 
 
 def try_acquire(venv_dir: Path) -> bool:
     lock = _lock_dir(venv_dir)
     lock.parent.mkdir(parents=True, exist_ok=True)
+    token = _new_token()
     try:
         lock.mkdir()
     except FileExistsError:
-        age = _lock_age(venv_dir)
-        if age > STALE_LOCK_SECS:
+        if _is_stealable(venv_dir):
             # Steal discipline mirrors canon.LeaseLock.acquire's reclaim path (the lease-file
             # twin of this mkdir-dir lock); the two are parallel by design — keep in sync.
             # Steal atomically: renaming a directory is atomic, so exactly one racer
@@ -282,13 +372,24 @@ def try_acquire(venv_dir: Path) -> bool:
             # bare PID-only name would then hit ENOTEMPTY on os.replace (masked as a lost
             # race) and never reclaim. ``time_ns()`` makes every steal target unique, and we
             # sweep any pre-existing ``*.stale-*`` orphans first so they can't accumulate.
-            for orphan in lock.parent.glob(f"{LOCK_NAME}.stale-*"):
-                shutil.rmtree(orphan, ignore_errors=True)
+            for pattern in (f"{LOCK_NAME}.stale-*", f"{LOCK_NAME}.release-*"):
+                for orphan in lock.parent.glob(pattern):
+                    shutil.rmtree(orphan, ignore_errors=True)
             sidelined = lock.parent / f"{LOCK_NAME}.stale-{os.getpid()}-{time.time_ns()}"
             try:
                 os.replace(lock, sidelined)
             except OSError:
                 return False  # lost the steal race; caller re-loops and waits
+            # Re-validate the lock we actually moved: if the holder refreshed its heartbeat in
+            # the window between our staleness read and this move, we just sidelined a LIVE
+            # lock. Put it back and lose the race rather than destroy a live build's heartbeat
+            # (closes the residual reclaim TOCTOU, mirroring LeaseLock._reclaim_stale).
+            if not _is_stealable_dir(sidelined):
+                try:
+                    os.replace(sidelined, lock)
+                except OSError:
+                    shutil.rmtree(sidelined, ignore_errors=True)
+                return False
             shutil.rmtree(sidelined, ignore_errors=True)
             try:
                 lock.mkdir()
@@ -297,15 +398,60 @@ def try_acquire(venv_dir: Path) -> bool:
         else:
             return False
     try:
-        (lock / "info").write_text(f"pid={os.getpid()} t={time.time():.0f}\n", "utf-8")
+        (lock / "info").write_text(_info_record(token), "utf-8")
+        _OWNED_TOKENS[str(lock)] = token
     except OSError:
         pass
     heartbeat(venv_dir)  # seed liveness immediately so a just-acquired lock is never stale
     return True
 
 
+def _is_stealable_dir(lock: Path) -> bool:
+    """Staleness re-check against a SPECIFIC (already sidelined) lock dir, by its own
+    heartbeat/dir mtime and PID probe — so the reclaim path re-validates the exact dir it
+    moved aside rather than whatever now sits at the live path."""
+    hb = lock / "heartbeat"
+    try:
+        age = time.time() - hb.stat().st_mtime
+    except OSError:
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            return True  # vanished under us — nothing live to protect
+    if age > STALE_LOCK_SECS:
+        return True
+    return not _pid_probe(_parse_info_dir(lock))
+
+
 def release(venv_dir: Path) -> None:
-    shutil.rmtree(_lock_dir(venv_dir), ignore_errors=True)
+    """Release the lock — but ONLY if it is still the one THIS process acquired.
+
+    Mirror canon.LeaseLock.release's ownership re-check (F15): a holder that was falsely
+    stolen (laptop suspend/resume spanning STALE_LOCK_SECS froze its heartbeat) must not
+    rmtree the thief's brand-new lock on its way out. We rename the lock aside (only one
+    mover wins), confirm the MOVED ``info`` still carries our token, and only then remove
+    it; otherwise we put it back untouched.
+    """
+    lock = _lock_dir(venv_dir)
+    token = _OWNED_TOKENS.get(str(lock))
+    if token is None:
+        return  # we never recorded ownership of this lock — leave it alone
+    sidelined = lock.parent / f"{LOCK_NAME}.release-{os.getpid()}-{time.time_ns()}"
+    try:
+        os.replace(lock, sidelined)
+    except OSError:
+        _OWNED_TOKENS.pop(str(lock), None)
+        return  # already gone/reclaimed — nothing of ours to release
+    if _parse_info_dir(sidelined).get("token") == token:
+        shutil.rmtree(sidelined, ignore_errors=True)
+        _OWNED_TOKENS.pop(str(lock), None)
+        return
+    # We moved a foreign/changed lock aside (a successor reclaimed the path) — restore it.
+    try:
+        os.replace(sidelined, lock)
+    except OSError:
+        shutil.rmtree(sidelined, ignore_errors=True)
+    _OWNED_TOKENS.pop(str(lock), None)
 
 
 # --------------------------------------------------------------------------- #

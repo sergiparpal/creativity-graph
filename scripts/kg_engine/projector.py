@@ -281,7 +281,14 @@ class Projector:
                prior_betweenness: dict | None = None) -> Ranks:
         und = self._live_subgraph(G)
         comm = _leiden(und)
-        degree = dict(und.degree())
+        # Degree is the DISTINCT-neighbour count, not the edge-multiplicity count. `und` is a MultiGraph
+        # (to_undirected of a MultiDiGraph retains parallel edges), so `und.degree()` would count two
+        # distinct relations between the same pair (e.g. A `grounds` B and A `bridges` B, both legal +
+        # un-failed) as degree 2 for one neighbour — diverging from the bridge signal just below (which
+        # uses `und.neighbors`, deduped) and from the glossary ("count of a node's connections" =
+        # neighbours). The persisted `degree` drives query_graph ranking, the bridge advisory, and the
+        # kg_agenda hub detector, so the two co-located signals must agree on what a connection is.
+        degree = {n: len(set(und.neighbors(n))) for n in und.nodes()}
         bridges = {}
         for n in G.nodes():
             neigh_comms = {comm.get(nb) for nb in und.neighbors(n)}
@@ -354,8 +361,14 @@ class Projector:
             # first read under contention there is no derived layer yet — create an empty schema'd
             # index + graph so the read tools return an empty graph instead of crashing on a missing
             # table (the next uncontended read reprojects for real). Schema creation is idempotent
-            # (CREATE TABLE IF NOT EXISTS) and WAL-safe against a concurrent projector.
-            if not self.db_path.exists():
+            # (CREATE TABLE IF NOT EXISTS) and WAL-safe against a concurrent projector. ALSO heal an
+            # OUTDATED schema here (not just a missing DB): after a plugin upgrade the DB may still
+            # carry the pre-Stage-2 11-column `nodes` table, and _connect() is the only schema-heal
+            # path (it drops/recreates the table with the full column set). Without this, a read under
+            # contention would crash on `no such column: betweenness` for as long as the other session
+            # holds the lease; the heal leaves the table empty until the next uncontended full reproject
+            # repopulates it, so reads return an empty graph instead of crashing.
+            if not self.db_path.exists() or self._schema_outdated():
                 self._connect().close()
             if not self.graph_path.exists():
                 _atomic_write(self.graph_path, json.dumps(_node_link_data(nx.MultiDiGraph())))
@@ -834,7 +847,7 @@ class Projector:
                 conds.append("epistemic_state=?"); na.append(epistemic_state)
             if conds:
                 nq += " WHERE " + " AND ".join(conds)
-            nq += " ORDER BY degree DESC LIMIT ?"; na.append(limit)
+            nq += " ORDER BY degree DESC, id ASC LIMIT ?"; na.append(limit)  # id tiebreak: deterministic top-N
             nodes = [dict(r) for r in con.execute(nq, na)]
             eq, ea = "SELECT * FROM edges", []
             if relation:
@@ -914,8 +927,12 @@ class Projector:
         grow = con.execute("SELECT value FROM meta WHERE key='gate_on'").fetchone()
         gate_on = int(grow[0]) if grow and grow[0] is not None and str(grow[0]).isdigit() else 0
         ranked_by, rank_cols = gate_ranking(gate_on)
+        # `id ASC` is the deterministic final tiebreak: in a typical graph most nodes share
+        # betweenness == spec_betweenness == 0.0 and a small integer degree, so the rank columns leave
+        # the top-10 heavily tied — without a unique tiebreak WHICH 10 surface is not reproducible
+        # across reprojections / SQLite versions / planner changes.
         bm_sql = ("SELECT id,label,degree,betweenness,spec_betweenness,specificity FROM nodes ORDER BY "
-                  + ", ".join(f"{c} DESC" for c in rank_cols) + " LIMIT 10")
+                  + ", ".join(f"{c} DESC" for c in rank_cols) + ", id ASC LIMIT 10")
         return {
             "gate_on": gate_on,
             "ranked_by": ranked_by,
@@ -938,10 +955,13 @@ class Projector:
                 "failed_or_rejected_edges": con.execute(
                     f"SELECT COUNT(*) FROM edges WHERE epistemic_state IN ({qmarks})", fail_states).fetchone()[0],
             }
-            # priority fill: grounded -> span-present -> inferred
+            # priority fill: grounded -> span-present -> inferred. The trailing `id ASC` is a deterministic
+            # tiebreak so WHICH tied edges survive a budget truncation in _fill is a pure function of the
+            # canon (SQLite gives no stable order among rows equal under the ORDER BY key; row order can
+            # flip between a full rebuild and an incremental reproject of the identical canon).
             order = ("epistemic_state='grounded' DESC, "
                      "CASE provenance WHEN 'span-present' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, "
-                     "confidence_score DESC")
+                     "confidence_score DESC, id ASC")
             cols = ("id,source,target,relation,provenance,authored_by,epistemic_state,span,"
                     "confidence,confidence_score")
             term_clause, term_args = self._query_term_clause(query)
@@ -974,10 +994,10 @@ class Projector:
             hargs = list(term_args)
             if term_clause:
                 hwhere += " AND " + term_clause
-            hypotheses, hused = _fill(hwhere, hargs, "confidence_score DESC", budget - used)
+            hypotheses, hused = _fill(hwhere, hargs, "confidence_score DESC, id ASC", budget - used)
             bridges = [dict(r) for r in con.execute(
                 "SELECT id,label,degree,bridge_communities FROM nodes WHERE structural_bridge=1 "
-                "ORDER BY degree DESC LIMIT 10")]
+                "ORDER BY degree DESC, id ASC LIMIT 10")]
             bridge_metric = self._bridge_metric_block(con)
             stale_verdicts, stale_total = self._read_stale_advisory(con)
             return {
@@ -1073,7 +1093,7 @@ def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
     def rank_key(n: dict):  # mirror kg_context's gate switch via the shared rank_cols
         return tuple(_RANK_COERCE[c][0](n.get(c) or _RANK_COERCE[c][1]) for c in rank_cols)
 
-    gaps: list = []  # (rank_key, item)
+    gaps: list = []  # (rank_key, id, item) — the id is the deterministic tiebreak (see the final sort)
     emitted: set = set()  # node ids already surfaced by a node-level detector (one detector per node)
 
     for n in nodes:
@@ -1105,7 +1125,7 @@ def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
         else:
             continue
         item["signals"] = _agenda_signals(n)
-        gaps.append((rank_key(n), item))
+        gaps.append((rank_key(n), nid, item))
         emitted.add(nid)  # this node is now covered — don't re-surface it in an edgeless-communities item
 
     # edgeless communities: a disconnected cluster (>=2 nodes, no LIVE inter-community edge) — a coverage
@@ -1132,17 +1152,23 @@ def _agenda_from_rows(nodes: list, edges: list, *, limit: int = 5) -> dict:
             rep = max(fresh, key=lambda m: m.get("degree") or 0)
             labels = ", ".join((m.get("label") or m["id"]) for m in fresh[:3])
             more = "…" if len(fresh) > 3 else ""
-            gaps.append((rank_key(rep), {
+            gaps.append((rank_key(rep), rep["id"], {
                 "detector": "edgeless-communities", "lane": "blocked_on_grounding",
                 "focus": [m["id"] for m in fresh],
                 "question": f"The '{rep.get('label') or rep['id']}' cluster ({labels}{more}) is disconnected "
                             f"from the rest of the graph — what relation bridges it?",
                 "signals": _agenda_signals(rep)}))
 
+    # Deterministic order: rank_key DESC, then node id ASC as the unique tiebreak — the input `nodes`
+    # arrive from an unordered `SELECT * FROM nodes`, so without the id the order among rank-tied
+    # suggestions (the common case: most nodes share betweenness/spec_betweenness 0.0 and a small degree)
+    # is not reproducible across reprojections. A stable pre-sort by id ASC, then a stable sort by
+    # rank_key DESC (reverse=True), leaves ties ordered by id ASC.
+    gaps.sort(key=lambda gi: gi[1])           # id ASC (stable base order for ties)
     gaps.sort(key=lambda gi: gi[0], reverse=True)
     answerable: list = []
     blocked: list = []
-    for _, item in gaps:
+    for _, _id, item in gaps:
         bucket = answerable if item["lane"] == "answerable_now" else blocked
         if len(bucket) < limit:
             bucket.append(item)

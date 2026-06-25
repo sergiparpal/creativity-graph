@@ -11,14 +11,19 @@ guarantee the docstring now states, so the doc can't drift back to overclaiming.
 """
 from __future__ import annotations
 
-from kg_engine.boundary import merge_results_into_nodes, validate_payload
+import pytest
+
+from kg_engine.boundary import MIN_EDGE_BUDGET, merge_results_into_nodes, validate_payload
 from kg_engine.model import (
     Disposition,
     Edge,
     EpistemicState,
     Node,
     edge_id,
+    node_from_markdown,
+    normalize_text,
     slug,
+    span_verifies,
 )
 
 
@@ -238,3 +243,92 @@ def test_slug_keeps_separated_inputs_distinct_from_concatenation():
     assert slug("a/b") != slug("ab")
     assert slug("I/O") != slug("IO")
     assert slug("foo.bar") != slug("foobar")
+
+
+# --------------------------------------------------------------------------- M1 (flood cap bypass)
+
+
+def _budget_filling_edges(n: int, span: str):
+    """n DISTINCT net-new span-present edges sharing one verifying span."""
+    return [{"source": "a", "target": f"n{i}", "relation": "grounds", "span": span,
+             "authored_by": "agent"} for i in range(n)]
+
+
+def test_duplicated_overflow_edge_cannot_bypass_flood_cap():
+    """M1: the flood cap must not be bypassable by listing an over-budget edge TWICE. Fill the floor
+    budget exactly, then append one extra NET-NEW edge listed twice. Without the fix the first copy is
+    flood-rejected but its id is left in `seen`, so the second copy takes the zero-cost dedup branch and
+    is WRITTEN — exceeding the documented cap. After the fix, BOTH copies are flood-rejected."""
+    span = "x grounds y"  # short span -> budget falls to the floor
+    overflow = {"source": "a", "target": "OVER", "relation": "grounds", "span": span,
+                "authored_by": "agent"}
+    payload = {"edges": _budget_filling_edges(MIN_EDGE_BUDGET, span) + [overflow, dict(overflow)]}
+    res = validate_payload(payload, pack=None, source_text=span)
+    written = [r for r in res if r.kind == "edge" and r.written]
+    flooded = [r for r in res if r.reason == "rate-limited-flood"]
+    # the budget cap holds: never more than MIN_EDGE_BUDGET writable edges, and BOTH overflow copies rejected
+    assert len(written) == MIN_EDGE_BUDGET, [r.identity for r in written]
+    assert len(flooded) == 2
+    over_id = edge_id("a", "grounds", "OVER")
+    assert all(r.identity == over_id for r in flooded)
+    # the overflow edge was never written under any disposition
+    assert over_id not in {r.identity for r in written}
+
+
+def test_genuine_dedup_of_preexisting_edge_still_free_under_full_budget():
+    """The fix must NOT break idempotent re-build dedup: an edge ALREADY in the canon is a real dedup
+    (cost zero) even when the budget is exhausted — it grows the canon by nothing."""
+    span = "x grounds y"
+    existing = [Edge(source="a", target=f"n{i}", relation="grounds", span=span,
+                     provenance="span-present") for i in range(MIN_EDGE_BUDGET)]
+    # re-emit one of the existing edges: it is a genuine dedup, must be ACCEPTED `deduped`, not flooded
+    payload = {"edges": [{"source": "a", "target": "n0", "relation": "grounds", "span": span,
+                          "authored_by": "agent"}]}
+    res = validate_payload(payload, pack=None, source_text=span, existing=existing)
+    r = _edge_result(res)
+    assert r.disposition == Disposition.ACCEPTED
+    assert "deduped" in r.reason
+
+
+def test_in_payload_duplicate_under_budget_still_dedups():
+    """And an in-payload duplicate that DOES fit the budget still dedups (the first copy is written and
+    charged; the second is a zero-cost dedup) — the fix only withholds `seen` from flood-REJECTED copies."""
+    span = "x grounds y"
+    dup = {"source": "a", "target": "b", "relation": "grounds", "span": span, "authored_by": "agent"}
+    res = validate_payload({"edges": [dict(dup), dict(dup)]}, pack=None, source_text=span)
+    edges = [r for r in res if r.kind == "edge"]
+    assert edges[0].disposition == Disposition.ACCEPTED and "deduped" not in edges[0].reason
+    assert edges[1].disposition == Disposition.ACCEPTED and "deduped" in edges[1].reason
+
+
+# --------------------------------------------------------------------------- model: U+0130 casefold
+
+
+def test_dotted_capital_i_span_verifies_case_insensitively():
+    """A source written with U+0130 (İ) must still match a lowercased verbatim span — the §1.5 gate's
+    case-insensitive contract. Without the fix, casefold(İ) = 'i' + U+0307 (a non-NFC sequence NFC
+    can't recompose), so 'istanbul' fails to substring-match and the honest span is wrongly rejected."""
+    source = "The city of İstanbul sits on two continents"
+    span = "istanbul sits on two continents"  # the verbatim span, lowercased
+    assert span_verifies(span, source)
+    # both forms collapse to the same dotless 'i' under normalization, and contain no stray combining dot
+    assert "i̇" not in normalize_text("İstanbul")
+    assert normalize_text("İstanbul") == normalize_text("istanbul")
+
+
+# --------------------------------------------------------------------------- model: non-dict frontmatter
+
+
+def test_non_dict_frontmatter_raises_valueerror_not_attributeerror():
+    """A hand-edited note whose frontmatter parses to a YAML list (not a mapping) must fail through the
+    documented ValueError path, never leak a raw AttributeError from `fm.get(...)`."""
+    text = "---\n- id: x\n- stray list entry\n---\n\nbody\n"
+    with pytest.raises(ValueError):
+        node_from_markdown(text)
+
+
+def test_scalar_frontmatter_also_raises_valueerror():
+    """A bare scalar between the fences is likewise non-mapping frontmatter -> ValueError."""
+    text = "---\njust a scalar\n---\n\nbody\n"
+    with pytest.raises(ValueError):
+        node_from_markdown(text)

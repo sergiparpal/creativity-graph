@@ -368,10 +368,15 @@ def transplant(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
     if hub is None:
         return []
     hub_comm = _attr(G, hub, "community", NO_COMMUNITY)
-    # the hub's dominant outgoing relation (its reorganising pattern)
+    # the hub's dominant outgoing relation (its reorganising pattern). Blank/missing relations are
+    # dropped first: a relation='' candidate is always QUARANTINED at the boundary (never in pack
+    # edge_types), so emitting it only wastes candidate/k budget and prints a nonsensical rationale. A
+    # hub whose out-edges are all blank is treated like a hub with no out-edges (the `if not …` guard).
     rel_counts: dict = defaultdict(int)
     for _, _, data in G.out_edges(hub, data=True):
-        rel_counts[data.get("relation", "")] += 1
+        rel = data.get("relation", "")
+        if rel:
+            rel_counts[rel] += 1
     if not rel_counts:
         return []
     dominant_relation = max(sorted(rel_counts), key=lambda r: rel_counts[r])
@@ -566,11 +571,22 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
     # surface the same edge. Keep the FIRST occurrence (highest-priority mechanism by run order). NODE
     # candidates (e.g. compressions) are left untouched — their label is blank until Stage 6 names them,
     # so they carry no stable identity to dedup on and must not be collapsed by an empty-label key.
+    #
+    # BRIDGES_RELATION candidates (bridge/seed/regroup/ensemble) are treated as semantically symmetric
+    # throughout this layer (the dual-orientation _is_failure check, ensemble's frozenset `seen`, the
+    # hypothesized lane's check_reverse=True), so an orientation-swapped pair is a logical duplicate. The
+    # ensemble exo path orients pairs by the SECOND construction's node order, which differs from G's, so
+    # bridge can emit (a,b) while ensemble-exo emits (b,a) for the same undirected bridge — a directional
+    # key would let both survive (review-M10). Key those orientation-independently; keep the directional
+    # key for transplant, whose dominant_relation is genuinely directional.
     seen: set = set()
     deduped: list = []
     for c in out:
         if c.kind == "edge":
-            key = (c.source, c.target, c.relation)
+            if c.relation == BRIDGES_RELATION:
+                key = (frozenset((c.source, c.target)), c.relation)
+            else:
+                key = (c.source, c.target, c.relation)
             if key in seen:
                 continue
             seen.add(key)

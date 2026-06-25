@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 
-from kg_engine.canon import _atomic_write
+from kg_engine import reconciler as reconciler_mod
+from kg_engine.canon import GROUND_AUDIT, _atomic_write
+from kg_engine.groundaudit import GroundAuditLog
 from kg_engine.model import Edge, EpistemicState, Node, edge_id, node_to_markdown
 from kg_engine.reconciler import Reconciler
 
@@ -116,3 +118,158 @@ def test_noncanonical_correction_unlinks_original_before_writing(canon, monkeypa
     assert [p.name for p in canon.note_paths()] == [canon.node_path("Foo").name]
     edges = [e for e in canon.all_edges() if e.id == forged.id]
     assert len(edges) == 1 and edges[0].epistemic_state == EpistemicState.UNVERIFIED
+
+
+def _seed_grounded_edge(engine) -> str:
+    """Write one span-verifying edge and ground it (audited). Returns its edge id."""
+    engine.kg_write({"edges": [
+        {"source": "degree", "target": "importance", "relation": "approximates",
+         "span": "Degree approximates importance", "authored_by": "agent"}]})
+    eid = edge_id("degree", "approximates", "importance")
+    engine.kg_ground(eid, "grounded", by="agent")
+    return eid
+
+
+def test_idempotent_reground_surplus_cannot_later_justify_a_forgery(engine):
+    """H1/[2]: an idempotent re-ground (grounded->grounded) appends a SECOND audit record the
+    `last == current` branch never spends, leaving a spendable surplus. A later out-of-band forgery
+    back into `grounded` must NOT be able to spend that surplus and slip past — the reconciler must
+    drain the surplus so the forgery is still caught (§1.8 forge-detection bypass)."""
+    eid = _seed_grounded_edge(engine)            # audit grounded=1
+    recon = Reconciler(engine.canon)
+    recon.scan(full_sweep=True)                  # baseline grounded, consumes record #1
+
+    engine.kg_ground(eid, "grounded", by="agent")  # legitimate idempotent re-verify: audit grounded=2
+    recon.scan(full_sweep=True)                  # last==grounded: must DRAIN the surplus (consumed->2)
+
+    # the baseline legitimately moves OFF grounded (an OOB edit to unverified, which reconcile permits)
+    node = engine.canon.read_node("degree")
+    next(e for e in node.edges if e.id == eid).epistemic_state = EpistemicState.UNVERIFIED
+    next(e for e in node.edges if e.id == eid).verdict_by = None
+    next(e for e in node.edges if e.id == eid).verdict_at = None
+    engine.canon.write_one(node)
+    recon.scan(full_sweep=True)                  # baseline now unverified
+
+    # now FORGE grounded out-of-band (no kg_ground, no new audit record)
+    node = engine.canon.read_node("degree")
+    next(e for e in node.edges if e.id == eid).epistemic_state = EpistemicState.GROUNDED
+    engine.canon.write_one(node)
+
+    report = recon.scan(full_sweep=True)
+    # the drained surplus is gone, so the forged grounded has no record to justify it -> re-quarantined
+    assert eid in report.requarantined
+    after = next(e for e in engine.canon.all_edges() if e.id == eid)
+    assert after.epistemic_state == EpistemicState.UNVERIFIED
+
+
+def test_verdict_applied_mid_sweep_is_not_reverted(engine):
+    """H3+M2/[1]: the audit snapshot is captured ONCE at the top of scan(); the per-session reconcile
+    runs in a separate process concurrently with kg_ground. A legitimate verdict whose audit record
+    lands AFTER the snapshot but before this note is read must NOT be re-quarantined — _forged must
+    re-read the audit log fresh before declaring a forgery."""
+    # an edge grounded on disk whose audit record does NOT yet exist in the snapshot
+    engine.kg_write({"edges": [
+        {"source": "degree", "target": "importance", "relation": "approximates",
+         "span": "Degree approximates importance", "authored_by": "agent"}]})
+    eid = edge_id("degree", "approximates", "importance")
+    node = engine.canon.read_node("degree")
+    next(e for e in node.edges if e.id == eid).epistemic_state = EpistemicState.GROUNDED
+    engine.canon.write_one(node)
+
+    recon = Reconciler(engine.canon)
+    log = GroundAuditLog(engine.canon.root / GROUND_AUDIT)
+    real_audit_counts = recon._audit_counts
+    state = {"n": 0}
+
+    def racing_audit_counts():
+        # FIRST call is the top-of-sweep snapshot: model the concurrent kg_ground landing its record
+        # right AFTER the snapshot (so the snapshot is stale/empty for this pair). Subsequent calls
+        # (the fresh re-read inside _forged) then observe the just-appended record.
+        state["n"] += 1
+        if state["n"] == 1:
+            out = real_audit_counts()
+            log.append(eid, "unverified", "grounded", "agent")  # verdict lands mid-sweep
+            return out
+        return real_audit_counts()
+
+    recon._audit_counts = racing_audit_counts
+    report = recon.scan(full_sweep=True)
+
+    # the mid-sweep record is honored on the fresh re-read -> the legitimate verdict survives
+    assert eid not in report.requarantined
+    after = next(e for e in engine.canon.all_edges() if e.id == eid)
+    assert after.epistemic_state == EpistemicState.GROUNDED
+
+
+def test_reconcile_does_not_clobber_a_concurrent_sibling_verdict(engine, monkeypatch):
+    """M2/[3]: re-quarantining edge A on node N is a read->mutate->write. A concurrent kg_ground that
+    grounds a SIBLING edge B on N between the reconciler's read and write must not be clobbered by the
+    reconciler writing its stale copy. The fix re-reads N fresh UNDER THE LEASE before writing."""
+    # A: forged grounded (no audit) -> will be re-quarantined.  B: starts unverified.
+    engine.kg_write({"edges": [
+        {"source": "degree", "target": "importance", "relation": "approximates",
+         "span": "Degree approximates importance", "authored_by": "agent"},
+        {"source": "degree", "target": "trust", "relation": "grounds",
+         "span": "The canon grounds trust", "authored_by": "agent"}]})
+    a_eid = edge_id("degree", "approximates", "importance")
+    b_eid = edge_id("degree", "grounds", "trust")
+    node = engine.canon.read_node("degree")
+    next(e for e in node.edges if e.id == a_eid).epistemic_state = EpistemicState.GROUNDED  # forged
+    engine.canon.write_one(node)
+
+    recon = Reconciler(engine.canon)
+    log = GroundAuditLog(engine.canon.root / GROUND_AUDIT)
+
+    # simulate the concurrent kg_ground on B landing between the reconciler's snapshot read and its
+    # under-lease re-read: the FIRST node_from_markdown (the snapshot read) also writes B grounded +
+    # its audit record to disk, so the real under-lease re-read observes B grounded and legitimate.
+    real_parse = reconciler_mod.node_from_markdown
+    state = {"n": 0}
+
+    def racing_parse(text, *a, **k):
+        state["n"] += 1
+        parsed = real_parse(text, *a, **k)
+        if state["n"] == 1 and any(e.id == a_eid for e in parsed.edges):
+            disk = engine.canon.read_node("degree")
+            be = next(e for e in disk.edges if e.id == b_eid)
+            be.epistemic_state = EpistemicState.GROUNDED
+            be.verdict_by = "agent"
+            engine.canon.write_one(disk)
+            log.append(b_eid, "unverified", "grounded", "agent")  # B legitimately audited
+        return parsed
+
+    monkeypatch.setattr(reconciler_mod, "node_from_markdown", racing_parse)
+    report = recon.scan(full_sweep=True)
+
+    # A's forgery is reset; B's concurrently-applied, audited verdict is NOT lost
+    assert a_eid in report.requarantined
+    assert b_eid not in report.requarantined
+    after = {e.id: e.epistemic_state for e in engine.canon.all_edges()}
+    assert after[a_eid] == EpistemicState.UNVERIFIED
+    assert after[b_eid] == EpistemicState.GROUNDED
+
+
+def test_concurrent_note_delete_does_not_crash_the_sweep(canon, monkeypatch):
+    """[7]: scan() holds no lease, so a lease-holding writer can unlink/rename a note between
+    note_paths()'s snapshot and the per-note stat()/hash. An unguarded raise would abort the WHOLE
+    §1.8 sweep before _save_state (silently disabling forge-detection). A vanished note must be skipped,
+    not crash the sweep."""
+    canon.write_one(Node(id="alpha", label="alpha", edges=[]))
+    canon.write_one(Node(id="beta", label="beta", edges=[]))
+
+    recon = Reconciler(canon)
+    gone = canon.node_path("alpha")
+    real_sha256 = reconciler_mod._sha256
+
+    def vanishing_sha256(p):
+        # model a concurrent unlink (kg_rename) landing right before this note's hash read
+        if p == gone and gone.exists():
+            gone.unlink()
+        return real_sha256(p)
+
+    monkeypatch.setattr(reconciler_mod, "_sha256", vanishing_sha256)
+    report = recon.scan(full_sweep=True)  # must not raise
+
+    # the sweep COMPLETED (state was saved) and the surviving note was still processed
+    assert json.loads(recon.state_path.read_text(encoding="utf-8"))  # _save_state ran
+    assert canon.node_path("beta").name in json.loads(recon.state_path.read_text(encoding="utf-8"))["files"]

@@ -84,13 +84,37 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("SECRET", re.compile(
         r"(?i)(?<![\w.-])[\w.-]{0,40}?(?:api[_-]?key|secret|token|password|passwd|pwd)[\w.-]{0,40}?\s*[:=]\s*"
         r"(?:\"[^\"]{4,}\"|'[^']{4,}'|[^\s'\"⟦⟧]{6,})")),
+    # Natural-language keyword forms the `[:=]`-anchored rule above can't span (an intervening linking
+    # verb or a plain space breaks its bounded `[\w.-]{0,40}?` key fragment): "the password is hunter2",
+    # "api token abc123def" (scrub-3-nl). Same keyword list; the value is a single bounded run excluding
+    # placeholder brackets. To keep prose over-redaction low, the value is taken only when EITHER a
+    # linking-verb connector signals intent ("<kw> is/was/equals <value>"), OR — for the connector-less
+    # "<kw> <value>" form — the value carries a digit (an entropy signal, so "the token works" is spared
+    # while "token abc123def" is not). Anchored at the keyword (no floating prefix), so it stays linear.
+    ("SECRET", re.compile(
+        r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd)\s+(?:"
+        r"(?:is|was|are|were|equals?)\s+([^\s'\"⟦⟧]{6,})"          # linking verb -> permissive value
+        r"|(?=[^\s'\"⟦⟧]*\d)([^\s'\"⟦⟧]{6,})"                     # bare space -> value must carry a digit
+        r")")),
     # Generic high-entropy fallback: a long unbroken (>=32 char) token the named rules above didn't
     # catch, so a bespoke key never falls through to a weaker PII rule that would redact only a digit
     # fragment of it (scrub-3). REQUIRES a digit AND a letter (an actual high-entropy mix) and excludes
     # hyphens, so ordinary long prose — hyphenated compounds, all-letter CamelCase / snake_case
     # identifiers — is NOT mass-redacted (that over-redaction degraded extraction; the digit+letter
-    # requirement keeps key/base64/hex tokens while sparing words).
-    ("SECRET", re.compile(r"\b(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{32,}\b")),
+    # requirement keeps key/base64/hex tokens while sparing words). The trailing `(?!@)` keeps it from
+    # eating a long machine-generated EMAIL local part and leaving the @domain to leak (scrub-5): the
+    # named EMAIL rule below then claims the whole address as one ⟦EMAIL⟧.
+    ("SECRET", re.compile(r"\b(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{32,}\b(?!@)")),
+    # Base64-shaped high-entropy fallback (scrub-4): a >=32-char run over the base64 alphabet (incl. the
+    # '/' and '+' the `[A-Za-z0-9_]` fallback above excludes), with optional '=' padding, so a bare
+    # base64 secret — e.g. an AWS *secret* access key like "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    # which the named AWS rule (access key ID only) misses — is consumed whole instead of being split at
+    # the first '/' and leaking. REQUIRES a digit AND a letter (same anti-prose guard as above), and at
+    # least one '/'/'+' so it doesn't merely duplicate the `_`-alphabet fallback (which already fires on
+    # pure-alnum runs). The `(?!@)` mirrors scrub-5 so an email is never half-eaten.
+    ("SECRET", re.compile(
+        r"(?<![A-Za-z0-9+/=])(?=[A-Za-z0-9+/]*[0-9])(?=[A-Za-z0-9+/]*[A-Za-z])(?=[A-Za-z0-9]*[+/])"
+        r"[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/=@])")),
     ("CREDURL", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@[^\s]+", re.I)),  # creds in URL
     ("EMAIL", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
     ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
@@ -146,6 +170,11 @@ class Scrubber:
         self._counters: dict[str, int] = {}
         self._value_to_ph: dict[tuple[str, str], str] = {}
         self._mapping: dict[str, str] = {}
+        # Every ⟦CAT:N⟧-shaped string that has appeared as a LITERAL in any call's source prose, kept
+        # CUMULATIVELY across calls. The allocator skips any of these so a freshly-issued placeholder can
+        # never collide with a literal a later restore would over-expand (scrub-2/M4). It also drives the
+        # identity entries emitted into each call's returned mapping (see scrub()).
+        self._reserved_placeholders: set[str] = set()
         # Precompile caller-supplied literal terms ONCE per instance instead of re.compile-per-term
         # per scrub() call (perf-#21). Each term becomes re.compile(re.escape(term)) — byte-identical
         # match semantics to the old `re.sub(re.escape(term), ...)` — and the longest-first ordering
@@ -160,8 +189,15 @@ class Scrubber:
         ]
 
     def reset(self) -> None:
-        """Clear the accumulated placeholder namespace (start a fresh scrubbing session)."""
+        """Clear the accumulated placeholder namespace (start a fresh scrubbing session).
+
+        WARNING: this INVALIDATES every previously-issued placeholder — after reset() the counter
+        restarts at 1, so ``⟦EMAIL:1⟧`` may be re-issued for a different value. A consumer that keeps a
+        SEPARATE restore accumulator (e.g. the MCP server's ``_scrub_map``) MUST clear it in lockstep, or
+        a reused placeholder will restore to the wrong original (scrub-reset). It is currently uncalled.
+        """
         self._counters, self._value_to_ph, self._mapping = {}, {}, {}
+        self._reserved_placeholders = set()
 
     def _active(self) -> set[str]:
         return SENSITIVITY.get(self.sensitivity, SENSITIVITY["medium"])
@@ -203,24 +239,37 @@ class Scrubber:
         active = self._active()
         new_mapping: dict[str, str] = {}
 
-        # scrub-2: a ⟦CAT:N⟧-shaped substring already present in the SOURCE prose must round-trip
-        # unchanged. Reserve every pre-existing placeholder string as identity-mapped so (a) restore()
-        # never rewrites a literal placeholder in the prose into a redacted value (canon corruption),
-        # and (b) placeholder() below never hands a freshly-allocated ⟦CAT:N⟧ that already occurs in
-        # the input (which restore() would then over-expand).
+        # scrub-2/M4: a ⟦CAT:N⟧-shaped substring already present in the SOURCE prose must round-trip
+        # unchanged. The consumer (the MCP server) restores ONLY from the mapping each call RETURNS, so
+        # protecting a literal requires an IDENTITY entry in `new_mapping` itself — writing it solely to
+        # self._mapping (which the boundary never consults) leaves the literal unprotected at restore
+        # time. Reserve every literal CUMULATIVELY so (a) restore() never rewrites a literal placeholder
+        # into a redacted value (canon corruption), and (b) placeholder() below never hands a freshly
+        # allocated ⟦CAT:N⟧ that has EVER occurred as a literal (which restore() would then over-expand).
         preexisting = {m.group(0) for m in _PLACEHOLDER_RE.finditer(text)}
+        self._reserved_placeholders |= preexisting
         for ph in preexisting:
-            self._mapping.setdefault(ph, ph)
+            existing = self._mapping.get(ph)
+            if existing is None or existing == ph:
+                # Not yet (or only identity-) mapped: protect it by identity-mapping in BOTH the
+                # accumulated map and this call's RETURNED map, so the consumer's restore leaves it alone.
+                self._mapping[ph] = ph
+                new_mapping[ph] = ph
+            # else: an UNAVOIDABLE collision — this string was already allocated as a real redaction in
+            # an EARLIER call (so the consumer already maps it to that value). We cannot retroactively
+            # un-map it; per the scrub-2 contract we leave it ambiguous rather than (re)mapping it here,
+            # and the allocator's reserved-set skip prevents this collision from ever recurring forward.
 
         def placeholder(cat: str, value: str) -> str:
             key = (cat, value)
             if key in self._value_to_ph:
                 return self._value_to_ph[key]
-            # Skip any number already taken by a literal placeholder in the source (scrub-2).
+            # Skip any number whose placeholder string has EVER been a literal in the source (scrub-2/M4),
+            # so the two namespaces can never overlap and restore can never expand a literal.
             while True:
                 self._counters[cat] = self._counters.get(cat, 0) + 1
                 ph = f"⟦{cat}:{self._counters[cat]}⟧"
-                if ph not in preexisting:
+                if ph not in self._reserved_placeholders:
                     break
             self._value_to_ph[key] = ph
             self._mapping[ph] = value

@@ -220,7 +220,10 @@ def _source_file_lines(edges: list) -> list:
     lines.append("")
     lines.append("## Source files (R4 — edges per declared source)")
     for f, n in sorted(by_file.items()):
-        lines.append(f"- `{f}`: {n} edge(s)")
+        # escape at render time (the Counter is keyed on the raw source_file so distinct files stay
+        # distinct); source_file is agent-controlled free text — the one untrusted field that had skipped
+        # _escape_md, so a backtick/markup-bearing value could break the code span (review-low).
+        lines.append(f"- `{_escape_md(f)}`: {n} edge(s)")
     lines.append("")
     return lines
 

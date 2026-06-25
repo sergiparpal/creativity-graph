@@ -29,10 +29,15 @@ class PackContract(BaseModel):
     @field_validator("node_types", "edge_types")
     @classmethod
     def _nonempty_unique(cls, v: list[str]) -> list[str]:
+        # Strip BEFORE the uniqueness/empty checks and store the stripped form: the boundary matches
+        # types by exact set membership, so a YAML-preserved stray space (e.g. quoted `"claim "` or a
+        # trailing NBSP) must not survive into the stored vocabulary — otherwise every item of that
+        # type is silently QUARANTINED, and the whitespace variant would also defeat the dup guard.
+        v = [t.strip() for t in v]
+        if any(not t for t in v):
+            raise ValueError("type names must be non-empty")
         if len(set(v)) != len(v):
             raise ValueError("types must be unique")
-        if any(not t or not t.strip() for t in v):
-            raise ValueError("type names must be non-empty")
         return v
 
     @field_validator("domain")
@@ -81,7 +86,10 @@ def coverage(pack: PackContract, source_text: str) -> dict:
     glossary_in_source = sum(1 for t in glossary_norms if _term_in_text(t, norm_src))
     return {
         "source_defined_terms": len(defined),
-        "glossary_terms": len(pack.glossary),
+        # the count must match the population `glossary_grounded_in_source` is scored over: report the
+        # non-empty post-normalization terms, not the raw dict (a whitespace-only key was excluded from
+        # the ratio's denominator and would otherwise inflate the count against the ratio).
+        "glossary_terms": len(glossary_norms),
         "source_terms_in_glossary": in_glossary,
         "source_coverage": _safe_ratio(in_glossary, len(defined)),
         "glossary_grounded_in_source": _safe_ratio(glossary_in_source, len(glossary_norms)),
@@ -133,15 +141,17 @@ def _main(argv: list[str]) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"PACK INVALID: {e}", file=sys.stderr)
         return 1
-    print(f"PACK OK: domain={pack.domain!r} node_types={len(pack.node_types)} "
-          f"edge_types={len(pack.edge_types)} glossary={len(pack.glossary)}")
     src = argv[2] if len(argv) > 2 else None
     # `validate` also reports coverage when a source is supplied (the optional `[source]` arg); the
-    # `coverage` command always does, requiring one.
-    if cmd == "coverage" or src:
-        if not src:
-            print("coverage needs a source path", file=sys.stderr)
-            return 2
+    # `coverage` command always does, requiring one. Validate the required source path BEFORE printing
+    # the PACK OK success line, so a failed `coverage` run never emits a success signal to stdout.
+    want_coverage = cmd == "coverage" or src
+    if want_coverage and not src:
+        print("coverage needs a source path", file=sys.stderr)
+        return 2
+    print(f"PACK OK: domain={pack.domain!r} node_types={len(pack.node_types)} "
+          f"edge_types={len(pack.edge_types)} glossary={len(pack.glossary)}")
+    if want_coverage:
         # R4: accept a file, directory, or glob of .md/.txt (a single file still works, byte-identical).
         from .sources import SourceSet
         source_set = SourceSet(src)

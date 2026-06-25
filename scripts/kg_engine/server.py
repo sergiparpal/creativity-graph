@@ -288,10 +288,20 @@ class KGEngine:
         `support_span` (a verbatim substring of the source) → `span-present`; `support_note` (an external
         citation, no span) → `inferred`. Without either, grounding a hypothesis to `grounded` is refused
         with `hypothesis-needs-support` — generated ideas become grounded knowledge only by earning it.
-        `support_*` are ignored for non-hypothesized edges and for any verdict other than `grounded`."""
+        The same gate applies to a hypothesized NODE (a compression node / primitive from the propose
+        lane): it too earns grounding only with support, restated into the node body (a Node has no span
+        field). `support_*` are ignored for non-hypothesized items and for any verdict other than `grounded`.
+
+        `note` is appended to the EDGE's `notes` and is **edge-only**: a Node has no notes field, so a
+        `note` passed with `kind='node'` is ignored (the verdict's audit record still captures `by`)."""
         verdict = verdict.lower()
         if verdict not in VALID_VERDICTS:
             return {"ok": False, "error": f"invalid verdict {verdict!r}"}
+        # `kind` selects the dispatch branch; reject anything outside {node,edge} up front (mirroring the
+        # verdict clamp) so a typo'd `kind` (e.g. 'Node', 'edges', '') can't fall through the else into the
+        # edge path and surface a misleading 'edge not found' for what was meant as a node verdict.
+        if kind not in ("node", "edge"):
+            return {"ok": False, "error": f"invalid kind {kind!r}; expected node|edge"}
         # `by` is provenance, not a free-text field: clamp to the known actors so a stray value can't
         # masquerade as a verdict author (the MCP tool surface already pins this to "agent").
         by = by if by in VALID_ACTORS else "agent"
@@ -312,6 +322,14 @@ class KGEngine:
                     node = self.canon.read_node(target_id)  # corrupt/invalid-UTF-8 note → structured error (F13/L1)
                 except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
                     return {"ok": False, "error": f"node unreadable: {e}"}
+                # the hypothesized→grounded promotion gate applies to NODES too: kg_operate writes
+                # hypothesized compression nodes/primitives via the propose lane, so a generated node must
+                # earn grounding with support, not become grounded knowledge for free (mirrors the edge
+                # gate; decided BEFORE any state change so a refusal leaves the node untouched).
+                if node.provenance == Provenance.HYPOTHESIZED and state == EpistemicState.GROUNDED:
+                    promoted_to, err = self._promote_hypothesis_node(node, support_span, support_note)
+                    if err:
+                        return {"ok": False, "error": err}
                 frm = node.epistemic_state.value
                 node.epistemic_state = state
                 key = f"node:{node.id}"
@@ -384,6 +402,37 @@ class KGEngine:
             edge.notes = self._append_note(edge.notes, f"citation: {support_note.strip()}")
             return Provenance.INFERRED.value, None
         return None, "hypothesis-needs-support"
+
+    def _promote_hypothesis_node(self, node, support_span: str, support_note: str):
+        """The node counterpart of `_promote_hypothesis`: a hypothesized NODE (a generated compression
+        node / primitive from the propose lane) earns grounding only with support, which UPGRADES its
+        provenance. A Node has no `span`/`notes` field, so the support is restated into the node BODY (the
+        only persisted free-text — ARCHITECTURE: "Body prose … may restate cited spans") rather than a
+        stray span attr. Mutates `node` in place on success and returns (promoted_to, None); on a refusal
+        it leaves the node UNTOUCHED and returns (None, error). `support_span` (a verbatim source
+        substring) → span-present; `support_note` (an external citation) → inferred; neither →
+        `hypothesis-needs-support`."""
+        restore = self._restore_fn()
+        if support_span and support_span.strip():
+            check = restore(support_span) if restore else support_span
+            if not self.source_set().verifies(check):
+                return None, "support-span-not-in-source"
+            if len(normalize_text(check).replace(" ", "")) < MIN_SPAN_CHARS:
+                return None, "support-span-too-short"
+            node.body = self._append_body(node.body, f"grounding span: {check}")
+            node.provenance = Provenance.SPAN_PRESENT       # upgraded: now citable
+            return Provenance.SPAN_PRESENT.value, None
+        if support_note and support_note.strip():
+            node.body = self._append_body(node.body, f"citation: {support_note.strip()}")
+            node.provenance = Provenance.INFERRED            # upgraded: asserted via external citation
+            return Provenance.INFERRED.value, None
+        return None, "hypothesis-needs-support"
+
+    @staticmethod
+    def _append_body(existing: str, addition: str) -> str:
+        """Append `addition` as its own paragraph to a node body, preserving any existing prose."""
+        existing = (existing or "").rstrip("\n")
+        return (existing + "\n\n" if existing else "") + addition
 
     def _owner_of_edge(self, edge_id: str) -> Node | None:
         # O(1) lookup via the derived index (id -> source) instead of an O(N) full-canon scan per
@@ -777,10 +826,11 @@ def _register(mcp, engine: KGEngine) -> None:
                   support_span: str = "", support_note: str = "") -> dict:
         """Apply a grounding verdict (grounded|rejected|failed|obsolete) to an edge or node. Verdicts
         applied via this tool are always attributed to the agent — a human verdict cannot be forged
-        through the tool surface (§1.4). To PROMOTE a hypothesized edge to grounded you MUST supply
+        through the tool surface (§1.4). To PROMOTE a hypothesized edge OR node to grounded you MUST supply
         support, which upgrades its provenance: `support_span` (a verbatim source substring → span-present)
         or `support_note` (an external citation → inferred); without either, the promotion is refused with
-        `hypothesis-needs-support`."""
+        `hypothesis-needs-support`. `note` is appended to the edge's `notes` and is **edge-only** — it is
+        ignored for kind='node' (a Node has no notes field)."""
         return engine.kg_ground(target_id, verdict, by="agent", kind=kind, note=note,
                                 support_span=support_span, support_note=support_note)
 

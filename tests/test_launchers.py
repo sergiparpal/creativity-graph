@@ -276,3 +276,36 @@ def test_pythonpath_dedup_is_separator_canonical(mjs):
 def test_mjs_parses(mjs):
     r = subprocess.run([NODE, "--check", str(mjs)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+# --------------------------------------------------------------------------- #
+# (5) precontext.py._clean is an EXACT mirror of bootstrap._clean — including the
+#     bare-sentinel `/.venv` / `/venv` results of substituting an empty ${...} into a
+#     ${VAR}/.venv template (M_tooling-5).
+# --------------------------------------------------------------------------- #
+def _load_precontext():
+    spec = importlib.util.spec_from_file_location("kg_precontext_clean", _PRECONTEXT_PY)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("", ""),
+        ("   ", ""),
+        ("${CLAUDE_PLUGIN_DATA}", ""),
+        ("/.venv", ""),           # bare sentinel: empty ${VAR}/.venv -> /.venv
+        ("/venv", ""),            # bare sentinel: empty ${VAR}/venv -> /venv
+        ("/real/path", "/real/path"),
+        ("  /real/path  ", "/real/path"),
+    ],
+)
+def test_precontext_clean_mirrors_bootstrap(raw, expected):
+    precontext = _load_precontext()
+    # precontext._clean and bootstrap._clean are documented mirrors; assert they AGREE on every case,
+    # so the cleaning rule stays in lock-step (the bare sentinels were the drift this fix closes).
+    assert precontext._clean(raw) == expected
+    assert precontext._clean(raw) == bootstrap._clean(raw)

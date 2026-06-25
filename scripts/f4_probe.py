@@ -153,7 +153,9 @@ def sheet(path, n, out, include_extracted):
         w.writeheader()
         for i, e in pick:
             w.writerow({
-                "edge_id": i,
+                # the deterministic edge_id (e_{slug(src)}__{slug(rel)}__{slug(tgt)}) is the stable
+                # handle back to the canon; fall back to the positional index only if a link lacks it.
+                "edge_id": e.get("id", i),
                 "source_label": id2label.get(e.get("source"), e.get("source")),
                 "target_label": id2label.get(e.get("target"), e.get("target")),
                 "relation": e.get("relation", ""),

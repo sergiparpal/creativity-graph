@@ -185,7 +185,23 @@ class BackendExtractor:
         return parts
 
     def source_file_name(self) -> str:
-        return self.engine.source_path.name if self.engine.source_path else "source.md"
+        # Only a real single FILE has a meaningful basename. Under R4 source_path may be a directory
+        # (.name = the dir name, e.g. `src`) or a glob (Path('src/**/*.md').name = `*.md`) — neither is
+        # a declared-source basename, and stamping one would make the boundary's has_file() miss and
+        # silently take the lenient any-source path instead of failing loudly. Prefer the single resolved
+        # source when there is exactly one; else return "" so the boundary's empty-source any-source path
+        # is taken explicitly rather than via a fabricated basename. (Only reached as the _stamp fallback
+        # when no explicit source_file is passed; run() always passes one.)
+        sp = self.engine.source_path
+        if sp and sp.is_file():
+            return sp.name
+        try:
+            sources = self.engine.source_set()
+            if len(sources) == 1:
+                return sources.basenames[0]
+        except Exception:  # noqa: BLE001 — never let a fallback name-lookup crash a stamp
+            pass
+        return ""
 
     # ---- model-aware max_tokens clamp -------------------------------------
     def _effective_max_tokens(self) -> int:
@@ -253,10 +269,20 @@ class BackendExtractor:
                 + (f": {refusal_explanation}" if refusal_explanation else ""))
         if stop == "max_tokens":
             # structured output truncated mid-JSON; surface a diagnosable error rather than a raw
-            # JSONDecodeError on the partial payload.
+            # JSONDecodeError on the partial payload. If the effective cap was already clamped below the
+            # requested max_tokens (non-streamed creates are bounded at ~_NONSTREAMING_TIME_FLOOR), a
+            # higher --max-tokens won't help — say so and point at the actionable path (split the section
+            # or use a streaming create) instead of advising a futile flag bump.
+            eff = self._effective_max_tokens()
+            if eff < self.max_tokens:
+                advice = (f"effective cap was clamped to {eff} (non-streamed creates are bounded at "
+                          f"~{_NONSTREAMING_TIME_FLOOR}), so a higher --max-tokens won't help; split "
+                          f"this section or use a streaming path")
+            else:
+                advice = "raise --max-tokens"
             raise RuntimeError(
-                f"extraction truncated at max_tokens for section {title!r}; raise --max-tokens")
-        text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), None)
+                f"extraction truncated at max_tokens ({eff}) for section {title!r}; {advice}")
+        text = next((b.text for b in (resp.content or []) if getattr(b, "type", None) == "text"), None)
         if text is None:
             raise RuntimeError(f"no text block in model response for section {title!r}")
         try:

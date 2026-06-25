@@ -136,6 +136,23 @@ def test_merge_never_yields_a_forged_verdict(s1: EpistemicState, s2: EpistemicSt
         assert e.verdict_by is None and e.verdict_at is None
 
 
+def test_equal_state_edge_takes_theirs_metadata():
+    """An edge at the SAME epistemic_state on both sides takes THEIRS' non-identity fields (span/notes/
+    confidence) — incoming-wins, matching Canon._merge_into_existing — so a theirs-side span correction
+    is not silently dropped. No verdict is forged: the state is identical on both sides."""
+    eid = edge_id("n1", "grounds", "b")
+    ours = _node([_edge(EpistemicState.UNVERIFIED, span="alpha")])
+    theirs_edge = _edge(EpistemicState.UNVERIFIED, span="alpha corrected")
+    theirs_edge.notes = "fixed a typo in the span"
+    theirs = _node([theirs_edge])
+    merged, demotions = merge_nodes(None, ours, theirs)
+    e = _find(merged, eid)
+    assert e.span == "alpha corrected"          # theirs' span correction survives, not silently dropped
+    assert e.notes == "fixed a typo in the span"
+    assert e.epistemic_state is EpistemicState.UNVERIFIED  # state unchanged (no disagreement)
+    assert demotions == []                       # equal-state metadata merge is not a demotion
+
+
 def test_obsolete_pairs_are_covered_by_the_groundable_set():
     """OBSOLETE participates in the forge-proof guarantee too (GROUNDABLE_STATES = verdicts ∪ obsolete)."""
     assert EpistemicState.OBSOLETE in GROUNDABLE_STATES
@@ -229,6 +246,43 @@ def test_unparseable_base_preserves_one_sided_body_edit():
     text, conflicts, ok = merge_note_files(raw_base, ours, theirs)
     assert ok and conflicts == []                        # one-sided edit -> no spurious conflict
     assert "ours appended a line" in node_from_markdown(text).body
+
+
+def test_git_merge_file_decodes_stdout_as_utf8_not_locale(monkeypatch):
+    """Regression (H2): _git_merge_file must decode git's stdout as UTF-8 — the same codec the temp
+    files were written in — NOT locale.getpreferredencoding(). On a non-UTF-8 host (Windows cp1252)
+    text=True without encoding= mojibakes the UTF-8 body bytes git echoes verbatim and commits a
+    silently corrupted note as a clean merge. We assert the subprocess.run call pins encoding='utf-8'
+    (and errors='surrogateescape'), which makes the decode host-locale-independent."""
+    import kg_engine.canonmerge as cm
+
+    captured: dict = {}
+    real_run = subprocess.run
+
+    def spy_run(*args, **kwargs):
+        captured.update(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(cm.subprocess, "run", spy_run)
+    # genuinely-diverged bodies force the git merge-file path (not the in-process trivial shortcuts)
+    cm._merge_body("base body\n", "ours edit\n", "theirs edit\n")
+    assert captured.get("encoding") == "utf-8"
+    assert captured.get("errors") == "surrogateescape"
+
+
+@pytest.mark.skipif(GIT is None, reason="git not on PATH")
+def test_body_3way_non_ascii_survives_round_trip():
+    """Regression (H2): a body with non-ASCII (curly quotes, accented Latin, em-dash) that goes through
+    the real `git merge-file` path is NOT corrupted — the UTF-8 bytes git echoes are decoded as UTF-8.
+    (On a UTF-8 CI host this guards against a future regression to a wrong/locale codec.)"""
+    accents = "café — “naïve” résumé"
+    base = f"line one\n{accents}\nline three\n"
+    ours = f"LINE ONE\n{accents}\nline three\n"
+    theirs = f"line one\n{accents}\nLINE THREE\n"
+    body, conflicts, ok = _merge_body(base, ours, theirs)
+    assert ok and conflicts == []
+    assert accents in body  # non-ASCII line preserved verbatim, no mojibake
+    assert "LINE ONE" in body and "LINE THREE" in body
 
 
 # --------------------------------------------------------------------------- fallbacks

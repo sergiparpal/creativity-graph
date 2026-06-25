@@ -23,12 +23,20 @@ def agreement(label_sets: list[dict]) -> float:
     `label_sets`: one dict per coder, mapping unit_id -> label. Units rated by <2 coders are ignored.
     Returns alpha in (-inf, 1]; 1.0 = perfect agreement, 0 = chance, <0 = systematic disagreement.
     """
+    # shape guard: label_sets is a list of per-coder {unit: label} dicts. A top-level JSON object
+    # (a single dict) would otherwise iterate its KEYS as "coders" and raise an opaque AttributeError
+    # on coder.items() — surface a usage error instead.
+    if not isinstance(label_sets, list) or not all(isinstance(c, dict) for c in label_sets):
+        raise ValueError("label_sets must be a list of {unit: label} dicts")
     # gather ratings per unit
     per_unit: dict = defaultdict(list)
     for coder in label_sets:
         for unit, label in coder.items():
-            if label is not None and str(label).strip() != "":
-                per_unit[unit].append(str(label))
+            # store the SAME stripped form used for the emptiness test, so cosmetic whitespace
+            # variants of a label ("correct" vs "correct ") aren't scored as distinct categories.
+            s = str(label).strip() if label is not None else ""
+            if s != "":
+                per_unit[unit].append(s)
     units = {u: vals for u, vals in per_unit.items() if len(vals) >= 2}
     if not units:
         return float("nan")
@@ -307,12 +315,22 @@ def _demo_corpus() -> list[str]:
             "specificity weights betweenness by term rarity", "the generality confound inflates vague nodes"]
 
 
+class _LoadError(Exception):
+    """A supplied input file exists but could not be read/parsed. Distinct from the absent-file
+    case so the CLI never silently scores demo data while the user believes their file was measured."""
+
+
 def _load_json_or_demo(path, demo, *, notice: str):
     """Load JSON from `path` if it exists, else return `demo` and print the standard fallback `notice`.
 
-    Returns (parsed_or_demo, used_demo). `path` may be None (no arg supplied)."""
+    Returns (parsed_or_demo, used_demo). `path` may be None (no arg supplied). A present-but-unparseable
+    file raises `_LoadError` rather than falling back to `demo` — silently reporting metrics over demo
+    data on a real-but-broken input would be a misleading number, worse than a clean error."""
     if path and Path(path).exists():
-        return json.loads(Path(path).read_text()), False
+        try:
+            return json.loads(Path(path).read_text()), False
+        except (json.JSONDecodeError, OSError) as e:
+            raise _LoadError(f"failed to parse {path}: {e}") from e
     print(f"[harness] {notice}", file=sys.stderr)
     return demo, True
 
@@ -322,6 +340,14 @@ def _main(argv: list[str]) -> int:
         print("usage: python -m kg_engine.harness {agreement|specificity|ideation} [path...]", file=sys.stderr)
         return 2
     cmd = argv[0]
+    try:
+        return _dispatch(cmd, argv)
+    except (_LoadError, ValueError) as e:
+        print(f"[harness] {e}", file=sys.stderr)
+        return 2
+
+
+def _dispatch(cmd: str, argv: list[str]) -> int:
     if cmd == "agreement":
         path = argv[1] if len(argv) > 1 else None
         demo = [{"e1": "correct", "e2": "vague", "e3": "correct"},

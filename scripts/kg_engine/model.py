@@ -122,6 +122,14 @@ def normalize_text(s: str) -> str:
     if s is None:
         return ""
     s = unicodedata.normalize("NFC", s)
+    # U+0130 (İ, LATIN CAPITAL LETTER I WITH DOT ABOVE) casefolds to 'i' + U+0307 (COMBINING DOT
+    # ABOVE), a non-NFC sequence that NFC — already applied above, and not idempotent across casefold —
+    # will NOT recompose back to a bare 'i'. So a source written with 'İ' would fold to a 9-char form
+    # that a lowercased verbatim span ('istanbul') can't substring-match, falsely rejecting an honest
+    # span (the §1.5 gate promises case-insensitive matching, ARCHITECTURE.md). Fold it to 'i' BEFORE
+    # casefold (so the spurious combining dot is never introduced); applied to span and source alike
+    # via this shared function, so the symmetry the substring test relies on holds.
+    s = s.replace("İ", "i")
     # drop zero-width / format controls (Cf) that are invisible but break a substring match
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
     s = (
@@ -282,6 +290,12 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     if not m:
         raise ValueError("note has no YAML frontmatter")
     fm = yaml.load(m.group(1), Loader=_YamlLoader) or {}
+    # The frontmatter between the fences must be a mapping. A valid-but-non-mapping YAML document (a
+    # top-level list or scalar from a hand-edit, e.g. a stray `- foo`) would otherwise reach `fm.get(...)`
+    # below and leak a raw AttributeError; fail through the SAME documented ValueError as a missing
+    # frontmatter so every caller sees one malformed-note error type (§1.2).
+    if not isinstance(fm, dict):
+        raise ValueError("note frontmatter is not a mapping")
     body = m.group(2).strip("\n")
     # Skip a malformed edge entry (e.g. a hand-edited `- just a string` scalar instead of a mapping)
     # rather than letting it raise and take the whole node — including its failed/rejected counter-

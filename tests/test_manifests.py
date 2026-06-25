@@ -15,6 +15,7 @@ These pin the packaging + plugin manifest + CI invariants that drifted from real
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -22,6 +23,15 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_validate_plugin():
+    spec = importlib.util.spec_from_file_location(
+        "kg_validate_plugin_fix", ROOT / "scripts" / "validate_plugin.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _pyproject_text() -> str:
@@ -84,6 +94,58 @@ def test_ci_matrix_covers_windows_and_macos():
     matrix = ci["jobs"]["test"]["strategy"]["matrix"]
     declared = set(matrix.get("os", [])) | {row["os"] for row in matrix.get("include", [])}
     assert {"windows-latest", "macos-latest"} <= declared, f"CI is not cross-OS: {declared}"
+
+
+# ---- M_tooling-2: the `test` job sets up Node so the launcher tests actually run ----
+def test_ci_test_job_sets_up_node():
+    pytest.importorskip("yaml")
+    import yaml
+
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    steps = ci["jobs"]["test"]["steps"]
+    # the Node-dependent launcher tests skip silently when node is absent; the job must provision it
+    # itself rather than rely on the runner image happening to preinstall it.
+    assert any(str(s.get("uses", "")).startswith("actions/setup-node") for s in steps), \
+        "the `test` job must set up Node so tests/test_launchers.py is not silently skipped"
+
+
+# ---- M_tooling-3: pyproject version cross-check is scoped to the [project] table ----
+def test_pyproject_version_check_is_project_table_scoped(tmp_path, monkeypatch):
+    vp = _load_validate_plugin()
+    # a stray `version = "9.9.9"` line under another table ABOVE [project] must NOT shadow the
+    # [project] version: a line-anchored re.search would lock onto 9.9.9 and validate the wrong line.
+    toml = (
+        '[build-system]\n'
+        'requires = ["hatchling"]\n'
+        'version = "9.9.9"\n'   # stray line that the old regex would have matched first
+        '\n'
+        '[project]\n'
+        'name = "kg-engine"\n'
+        'version = "0.3.3"\n'
+    )
+    (tmp_path / "pyproject.toml").write_text(toml, encoding="utf-8")
+    monkeypatch.setattr(vp, "ROOT", tmp_path)
+    errors: list[str] = []
+    assert vp._grep_project_version("pyproject.toml", errors) == "0.3.3"
+    assert errors == []
+
+
+def test_pyproject_version_check_missing_project_version_is_none(tmp_path, monkeypatch):
+    vp = _load_validate_plugin()
+    # [project] present but carrying no version line -> None (the caller turns that into an error,
+    # never a silent pass on a stray line elsewhere).
+    toml = '[tool.foo]\nversion = "1.2.3"\n\n[project]\nname = "kg-engine"\n'
+    (tmp_path / "pyproject.toml").write_text(toml, encoding="utf-8")
+    monkeypatch.setattr(vp, "ROOT", tmp_path)
+    assert vp._grep_project_version("pyproject.toml", []) is None
+
+
+def test_pyproject_version_check_matches_real_repo():
+    # sanity: the scoped getter still finds the real [project] version in the shipped pyproject.
+    vp = _load_validate_plugin()
+    found = vp._grep_project_version("pyproject.toml", [])
+    plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    assert found == plugin["version"]
 
 
 # ---- generative-layer manifests: the new command/agent are discovered and declare only real tools ----

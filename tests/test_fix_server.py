@@ -18,7 +18,7 @@ import typing
 import pytest
 
 from kg_engine.canon import RollbackInfo
-from kg_engine.model import Node, Provenance
+from kg_engine.model import EpistemicState, Node, Provenance
 from kg_engine.server import _register, build_engine_from_env
 
 # env vars that feed source/project resolution in build_engine_from_env — cleared so the host
@@ -213,6 +213,116 @@ def test_f31_explicit_member_collapse_reachable_through_wrapper(engine):
     rels = {e.relation for e in engine.canon.all_edges()}
     assert "collapses_into" in rels
     assert any(e.provenance == Provenance.HYPOTHESIZED for e in engine.canon.all_edges())
+
+
+# ---- node-promotion gate: a hypothesized NODE earns grounding only with support --------------------
+def _seed_hypothesized_node(engine, nid="comp-x"):
+    engine.canon.write_one(Node(id=nid, label=nid.title(), node_type="compression",
+                                provenance=Provenance.HYPOTHESIZED))
+    return nid
+
+
+def test_hypothesized_node_grounded_without_support_is_refused(engine):
+    """A hypothesized node grounded to `grounded` with no support is refused — a generated idea must
+    earn grounding, mirroring the edge gate (the node path previously skipped this and left the node
+    state=grounded / provenance=hypothesized)."""
+    nid = _seed_hypothesized_node(engine)
+    out = engine.kg_ground(nid, "grounded", kind="node")
+    assert out["ok"] is False
+    assert out["error"] == "hypothesis-needs-support"
+    # the node was left UNTOUCHED — still hypothesized, still unverified
+    node = engine.canon.read_node(nid)
+    assert node.provenance == Provenance.HYPOTHESIZED
+    assert node.epistemic_state == EpistemicState.UNVERIFIED
+
+
+def test_hypothesized_node_promoted_with_span_upgrades_provenance(engine):
+    """A verbatim source span promotes a hypothesized node: provenance upgrades to span-present and the
+    node lands grounded (no stray `span` attr; the span is restated in the body)."""
+    nid = _seed_hypothesized_node(engine)
+    out = engine.kg_ground(nid, "grounded", kind="node",
+                           support_span="A compression stands in for many observations")
+    assert out["ok"] is True
+    assert out["provenance_upgraded_to"] == "span-present"
+    node = engine.canon.read_node(nid)
+    assert node.provenance == Provenance.SPAN_PRESENT
+    assert node.epistemic_state == EpistemicState.GROUNDED
+    assert not hasattr(node, "span")  # no stray span attribute leaked onto the Node
+    assert "A compression stands in for many observations" in node.body
+
+
+def test_hypothesized_node_promoted_with_note_upgrades_to_inferred(engine):
+    nid = _seed_hypothesized_node(engine)
+    out = engine.kg_ground(nid, "grounded", kind="node", support_note="see external ref [42]")
+    assert out["ok"] is True
+    assert out["provenance_upgraded_to"] == "inferred"
+    node = engine.canon.read_node(nid)
+    assert node.provenance == Provenance.INFERRED
+    assert node.epistemic_state == EpistemicState.GROUNDED
+    assert "see external ref [42]" in node.body
+
+
+def test_hypothesized_node_promotion_span_not_in_source_is_refused(engine):
+    nid = _seed_hypothesized_node(engine)
+    out = engine.kg_ground(nid, "grounded", kind="node",
+                           support_span="this phrase is nowhere in the source text at all")
+    assert out["ok"] is False
+    assert out["error"] == "support-span-not-in-source"
+    node = engine.canon.read_node(nid)
+    assert node.provenance == Provenance.HYPOTHESIZED  # untouched
+
+
+def test_non_grounded_verdict_on_hypothesized_node_skips_the_gate(engine):
+    """The gate only fires for grounded — a hypothesized node can be rejected/obsoleted with no support
+    (negative information / housekeeping, not a promotion)."""
+    nid = _seed_hypothesized_node(engine)
+    out = engine.kg_ground(nid, "rejected", kind="node")
+    assert out["ok"] is True
+    node = engine.canon.read_node(nid)
+    assert node.epistemic_state == EpistemicState.REJECTED
+    assert node.provenance == Provenance.HYPOTHESIZED  # not upgraded — no support, no promotion
+
+
+def test_non_hypothesized_node_grounds_without_support(engine):
+    """A normal (span-present) node still grounds with no support — the gate is hypothesized-only."""
+    engine.canon.write_one(Node(id="plain", label="Plain", provenance=Provenance.SPAN_PRESENT))
+    out = engine.kg_ground("plain", "grounded", kind="node")
+    assert out["ok"] is True
+    assert engine.canon.read_node("plain").epistemic_state == EpistemicState.GROUNDED
+
+
+# ---- kind validation: a non-{node,edge} kind is rejected up front, not silently routed to edge ------
+def test_invalid_kind_is_rejected_not_routed_to_edge(engine):
+    out = engine.kg_ground("thermo-arrow", "grounded", kind="Node")
+    assert out["ok"] is False
+    assert "invalid kind" in out["error"]
+    assert "expected node|edge" in out["error"]
+
+
+def test_empty_kind_is_rejected(engine):
+    out = engine.kg_ground("anything", "grounded", kind="")
+    assert out["ok"] is False
+    assert "invalid kind" in out["error"]
+
+
+# ---- note-on-node: documented edge-only; passing it with kind='node' is accepted and ignored --------
+def test_note_on_node_verdict_is_ignored_not_an_error(engine):
+    """A `note` passed on a node verdict is documented edge-only (a Node has no notes field). It is
+    silently ignored — the verdict still succeeds and the node carries no notes attribute."""
+    nid = _seed_hypothesized_node(engine, "comp-note")
+    out = engine.kg_ground(nid, "rejected", kind="node", note="vague: true only because generic")
+    assert out["ok"] is True
+    node = engine.canon.read_node(nid)
+    assert not hasattr(node, "notes")  # Node has no notes field; the note is not persisted there
+
+
+def test_kg_ground_wrapper_docstring_marks_note_edge_only(engine):
+    """The MCP wrapper docstring must disclaim that `note` is edge-only (the inconsistency the finding
+    flagged — the reference tools.md already documents it as edge-only)."""
+    tools = _wrappers(engine)
+    doc = (tools["kg_ground"].__doc__ or "").lower()
+    assert "edge-only" in doc
+    assert "note" in doc
 
 
 def test_unsubstituted_source_path_placeholder_falls_back_not_taken_literally(tmp_path, monkeypatch):

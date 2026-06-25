@@ -330,6 +330,175 @@ def test_orphan_sideline_does_not_block_steal(tmp_path):
     assert not list(lock.parent.glob(f"{bootstrap.LOCK_NAME}.stale-*"))
 
 
+def _write_info(venv_dir, *, pid, host, token="tok", t=None):
+    """Plant a lock-dir ``info`` record (the steal/release ownership + liveness signal)."""
+    lock = bootstrap._lock_dir(venv_dir)
+    lock.mkdir(parents=True, exist_ok=True)
+    when = bootstrap.time.time() if t is None else t
+    (lock / "info").write_text(
+        f"pid={pid} host={host} token={token} t={when:.0f}\n", encoding="utf-8"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# M7 — PID-liveness probe: a crashed holder is reclaimable in ms, not 30 min
+# --------------------------------------------------------------------------- #
+def test_dead_pid_lock_is_stolen_before_stale_window(tmp_path):
+    # M7: a hard-killed background worker freezes its heartbeat, so the age signal stays
+    # FRESH for the full 30-min STALE_LOCK_SECS. A cheap os.kill(pid, 0) probe must reclaim
+    # it in milliseconds instead — mirroring canon._pid_probe.
+    venv_dir = tmp_path / "venv"
+    # A held, FRESH lock (heartbeat just now) whose recorded holder is a dead pid on THIS host.
+    bootstrap._lock_dir(venv_dir).mkdir(parents=True)
+    bootstrap.heartbeat(venv_dir)
+    _write_info(venv_dir, pid=_dead_pid(), host=bootstrap._HOST)
+    assert bootstrap._lock_age(venv_dir) < bootstrap.STALE_LOCK_SECS  # NOT stale by age
+    assert bootstrap.try_acquire(venv_dir) is True  # ...but the dead-pid probe reclaims it
+    bootstrap.release(venv_dir)
+
+
+def test_live_pid_fresh_lock_is_not_stolen(tmp_path):
+    # The probe must not over-reclaim: a FRESH lock held by a LIVE pid (our own) stays held.
+    venv_dir = tmp_path / "venv"
+    assert bootstrap.try_acquire(venv_dir) is True  # records our live pid in info
+    age = bootstrap._lock_age(venv_dir)
+    assert age < bootstrap.STALE_LOCK_SECS
+    assert bootstrap.try_acquire(venv_dir) is False  # live holder is not stolen
+    bootstrap.release(venv_dir)
+
+
+def test_foreign_host_pid_is_treated_as_alive(tmp_path):
+    # A pid recorded on ANOTHER host can't be probed locally; treat it as alive (so a fresh
+    # lock from a different machine on a shared FS is not stolen by the probe). Only age can
+    # reclaim it — exactly canon._pid_probe's cross-host rule.
+    venv_dir = tmp_path / "venv"
+    bootstrap._lock_dir(venv_dir).mkdir(parents=True)
+    bootstrap.heartbeat(venv_dir)
+    _write_info(venv_dir, pid=_dead_pid(), host="some-other-host")
+    assert bootstrap.try_acquire(venv_dir) is False  # foreign-host pid -> assumed alive
+    bootstrap.release(venv_dir)  # we don't own it -> no-op
+    assert bootstrap._lock_dir(venv_dir).exists()
+
+
+# --------------------------------------------------------------------------- #
+# M8 — reclaim TOCTOU: a holder that refreshes in the steal window keeps its lock
+# --------------------------------------------------------------------------- #
+def test_steal_restores_lock_that_became_fresh_in_the_window(tmp_path, monkeypatch):
+    # M8: the steal decision reads age, then os.replace()s the lock aside. If the holder's
+    # heartbeat fires in that window the MOVED dir is now LIVE; the stealer must re-validate
+    # the sidelined dir and put it back (lose the race) instead of destroying a live build's
+    # heartbeat. Simulate the window by re-validating against a LIVE pid + fresh heartbeat.
+    venv_dir = tmp_path / "venv"
+    bootstrap._lock_dir(venv_dir).mkdir(parents=True)
+    # Make the lock look stealable to the FIRST check (aged heartbeat + a dead pid)...
+    lock = bootstrap._lock_dir(venv_dir)
+    hb = bootstrap._heartbeat_file(venv_dir)
+    hb.write_text("x\n", encoding="utf-8")
+    old = bootstrap.time.time() - bootstrap.STALE_LOCK_SECS - 60
+    os.utime(lock, (old, old))
+    os.utime(hb, (old, old))
+    _write_info(venv_dir, pid=_dead_pid(), host=bootstrap._HOST)
+
+    # ...but the holder "refreshes" in the steal window: re-validation of the SIDELINED dir
+    # sees a fresh heartbeat + live pid, so the steal must back off and restore the lock.
+    real_replace = bootstrap.os.replace
+    state = {"moved": False}
+
+    def replace_then_refresh(src, dst, *a, **k):
+        real_replace(src, dst, *a, **k)
+        if not state["moved"] and bootstrap.LOCK_NAME + ".stale-" in str(dst):
+            state["moved"] = True
+            now = bootstrap.time.time()
+            os.utime(Path(dst), (now, now))
+            os.utime(Path(dst) / "heartbeat", (now, now))
+            (Path(dst) / "info").write_text(
+                f"pid={os.getpid()} host={bootstrap._HOST} token=live t={now:.0f}\n",
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(bootstrap.os, "replace", replace_then_refresh)
+    assert bootstrap.try_acquire(venv_dir) is False  # lost the race -> live holder preserved
+    # The lock is back at the live path and still carries the holder's live record.
+    assert lock.exists()
+    assert bootstrap._parse_info_dir(lock).get("token") == "live"
+
+
+# --------------------------------------------------------------------------- #
+# M9 — release() verifies ownership before rmtree (false-steal-then-revive)
+# --------------------------------------------------------------------------- #
+def test_release_does_not_destroy_a_foreign_lock(tmp_path):
+    # M9: a holder falsely judged stale (suspend/resume past STALE_LOCK_SECS) is stolen by a
+    # successor that now holds a BRAND-NEW lock at the same path. When the original holder
+    # finally resumes and calls release(), it must NOT rmtree the successor's lock — release
+    # only removes a lock whose info still carries OUR token (mirrors LeaseLock.release F15).
+    venv_dir = tmp_path / "venv"
+    assert bootstrap.try_acquire(venv_dir) is True            # original holder (token A)
+    our_token = bootstrap._OWNED_TOKENS[str(bootstrap._lock_dir(venv_dir))]
+
+    # A successor steals the path and writes its OWN token, as a real steal+reacquire would.
+    lock = bootstrap._lock_dir(venv_dir)
+    (lock / "info").write_text(
+        f"pid={os.getpid()} host={bootstrap._HOST} token=successor t={bootstrap.time.time():.0f}\n",
+        encoding="utf-8",
+    )
+    assert our_token != "successor"
+
+    bootstrap.release(venv_dir)  # the original holder releases on its way out
+    # The successor's lock survives, with its token intact.
+    assert lock.exists()
+    assert bootstrap._parse_info_dir(lock).get("token") == "successor"
+    # Clean up the successor lock (no recorded ownership -> manual rmtree).
+    bootstrap.shutil.rmtree(lock, ignore_errors=True)
+
+
+def test_release_removes_our_own_lock(tmp_path):
+    # The happy path still works: a lock we own (our token in info) is removed by release().
+    venv_dir = tmp_path / "venv"
+    assert bootstrap.try_acquire(venv_dir) is True
+    lock = bootstrap._lock_dir(venv_dir)
+    assert lock.exists()
+    bootstrap.release(venv_dir)
+    assert not lock.exists()
+    assert str(lock) not in bootstrap._OWNED_TOKENS  # ownership forgotten on release
+    assert not list(lock.parent.glob(f"{bootstrap.LOCK_NAME}.release-*"))  # no sideline leaked
+
+
+# --------------------------------------------------------------------------- #
+# low — heartbeat write failure backstops onto the lock-dir mtime
+# --------------------------------------------------------------------------- #
+def test_heartbeat_failure_touches_lock_dir_as_backstop(tmp_path, monkeypatch):
+    # low/edge-case: if the heartbeat file write keeps failing (read-only fs / ENOSPC / AV),
+    # the live holder must still advance _lock_age's FALLBACK signal (the lock-dir mtime) so a
+    # genuine >30-min build is not judged stale and stolen. The except branch touches the dir.
+    venv_dir = tmp_path / "venv"
+    lock = bootstrap._lock_dir(venv_dir)
+    lock.mkdir(parents=True)
+    # No heartbeat file exists yet and every write_text raises -> the else branch is taken and
+    # fails, so the backstop os.utime(lock) must run instead.
+    monkeypatch.setattr(bootstrap.Path, "write_text", _raise_oserror)
+    old = bootstrap.time.time() - 100
+    os.utime(lock, (old, old))
+    before = lock.stat().st_mtime
+    bootstrap.heartbeat(venv_dir)
+    assert not bootstrap._heartbeat_file(venv_dir).exists()  # the hb file never landed
+    assert lock.stat().st_mtime > before                     # ...but the dir mtime advanced
+
+
+def _raise_oserror(*a, **k):
+    raise OSError("simulated read-only fs")
+
+
+def _dead_pid() -> int:
+    """A pid that is (almost certainly) not running: spawn a trivial child and reap it."""
+    p = subprocess.Popen(
+        [bootstrap.sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    p.wait()
+    return p.pid
+
+
 # --------------------------------------------------------------------------- #
 # --check (launcher freshness probe; node-launchers-2)
 # --------------------------------------------------------------------------- #
