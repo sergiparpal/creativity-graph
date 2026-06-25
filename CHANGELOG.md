@@ -14,6 +14,8 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-25
+
 ### Added
 
 - **Semantic git merge driver for the canon (the safe half of multi-machine support).** Two machines or
