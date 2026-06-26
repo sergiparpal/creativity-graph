@@ -484,45 +484,53 @@ class KGEngine:
     def kg_rename(self, old_id: str, new_id: str, *, message: str = "kg_rename") -> dict:
         """Rename a node and rewrite every edge endpoint referencing it (single-canonical-edge safe)."""
         old, new = slug(old_id), slug(new_id)
-        if not self.canon.exists(old):
-            return {"ok": False, "error": "node not found"}
-        if self.canon.exists(new):
-            return {"ok": False, "error": "target id exists"}
-        try:
-            node = self.canon.read_node(old)  # corrupt/invalid-UTF-8 note → structured error (F13/L1)
-        except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
-            return {"ok": False, "error": f"node unreadable: {e}", "old": old, "new": new}
-        # A rename recomputes edge ids (and the node id), but the kg_ground audit record + reconciler
-        # baseline are keyed by those ids. Collect every policed-state (verdict OR obsolete) item whose
-        # id CHANGES so we can write a migrating audit record for the NEW id — otherwise the reconciler
-        # sees a verdict at an id with no audit record and re-quarantines it, silently erasing the
-        # grounding/failure memory (integration-1).
-        migrations: list[tuple[str, str]] = []  # (new_key, state_value)
-        if node.epistemic_state in GROUNDABLE_STATES:
-            migrations.append((f"node:{new}", node.epistemic_state.value))
-        node.id = new
-        for e in node.edges:
-            _, mig = self._rewrite_endpoints(e, old, new)
-            if mig:
-                migrations.append(mig)
-        touched = [node]
-        for other in self.canon.all_nodes():
-            if other.id == old:
-                continue
-            node_changed = False
-            for e in other.edges:
-                changed, mig = self._rewrite_endpoints(e, old, new)
-                node_changed |= changed
-                if mig:
-                    migrations.append(mig)
-            if node_changed:
-                touched.append(other)
-        # Hold the lease across the whole audit + write + unlink + commit sequence so the migrating
-        # audit records and their compensating truncate are atomic w.r.t. other writers (server-3).
+        # Acquire the single-writer lease FIRST, then read the canon FRESH under the lease and compute
+        # the migration set + touched notes, all before write_nodes. Reading BEFORE locking (the old
+        # order) let a concurrent cross-process kg_ground stamp a verdict on a SIBLING edge of a touched
+        # node in the gap; this rename then wrote its stale in-memory copy verbatim (merge=False) and
+        # silently clobbered that just-stamped verdict — a lost update of grounding memory the reconciler
+        # can't recover (it only re-quarantines forgeries, never resurrects a lost legitimate verdict).
+        # Same fix as kg_ground (F17/L5); the lease also stays held across the whole audit + write +
+        # unlink + commit sequence so the migrating records and their compensating truncate are atomic
+        # w.r.t. other writers (server-3). write_nodes/_acquire_lock are re-entrant, so the inner write
+        # still works.
         if not self.canon.try_acquire_lock():
             return {"ok": False, "error": "canon vault is locked by another live session",
                     "old": old, "new": new}
         try:
+            if not self.canon.exists(old):
+                return {"ok": False, "error": "node not found"}
+            if self.canon.exists(new):
+                return {"ok": False, "error": "target id exists"}
+            try:
+                node = self.canon.read_node(old)  # corrupt/invalid-UTF-8 note → structured error (F13/L1)
+            except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
+                return {"ok": False, "error": f"node unreadable: {e}", "old": old, "new": new}
+            # A rename recomputes edge ids (and the node id), but the kg_ground audit record + reconciler
+            # baseline are keyed by those ids. Collect every policed-state (verdict OR obsolete) item whose
+            # id CHANGES so we can write a migrating audit record for the NEW id — otherwise the reconciler
+            # sees a verdict at an id with no audit record and re-quarantines it, silently erasing the
+            # grounding/failure memory (integration-1).
+            migrations: list[tuple[str, str]] = []  # (new_key, state_value)
+            if node.epistemic_state in GROUNDABLE_STATES:
+                migrations.append((f"node:{new}", node.epistemic_state.value))
+            node.id = new
+            for e in node.edges:
+                _, mig = self._rewrite_endpoints(e, old, new)
+                if mig:
+                    migrations.append(mig)
+            touched = [node]
+            for other in self.canon.all_nodes():
+                if other.id == old:
+                    continue
+                node_changed = False
+                for e in other.edges:
+                    changed, mig = self._rewrite_endpoints(e, old, new)
+                    node_changed |= changed
+                    if mig:
+                        migrations.append(mig)
+                if node_changed:
+                    touched.append(other)
             # Emit the migrating audit records (compensated by truncation if the batch rolls back, like
             # kg_ground), then write the corrected nodes VERBATIM (merge=False): merging would
             # re-introduce each note's pre-rename edges (different id -> not deduped) and leave dangling

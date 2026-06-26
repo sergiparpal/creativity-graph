@@ -59,10 +59,20 @@ def main() -> int:
     if not source:
         guess = pathlib.Path(project) / "examples" / "source.md"
         source = str(guess) if guess.exists() else None
+    # Resolve the pack the SAME way the server's KG_PACK_PATH does — prefer the PLUGIN-ROOT bundled
+    # pack before the project-relative fallback. On an installed plugin the project dir is not the
+    # plugin root and has no pack/pack.yaml, so a project-only lookup would resolve to None and wire
+    # EMPTY specificity_seeds; the hook would then persist a seed-less projection the server serves as
+    # fresh, defeating the read_only_projector parity this whole block exists to guarantee. `root` is
+    # CLAUDE_PLUGIN_ROOT, already parsed at module load (the same value .mcp.json feeds KG_PACK_PATH).
     pack_path = _clean(os.environ.get("KG_PACK_PATH"))
     if not pack_path:
-        guess = pathlib.Path(project) / "pack" / "pack.yaml"
-        pack_path = str(guess) if guess.exists() else None
+        for base in (root, project):
+            if base:
+                guess = pathlib.Path(base) / "pack" / "pack.yaml"
+                if guess.exists():
+                    pack_path = str(guess)
+                    break
     metrics_mode = (os.environ.get("CLAUDE_PLUGIN_OPTION_METRICS_MODE") or "").strip() or "structure_only"
     try:
         from kg_engine.server import KGEngine

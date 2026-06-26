@@ -87,6 +87,21 @@ def test_effective_max_tokens_clamps_to_sdk_time_floor(engine):
     assert under._effective_max_tokens() == 16000
 
 
+def test_effective_max_tokens_falls_back_when_sdk_table_missing(engine, monkeypatch):
+    """The per-model non-streaming cap comes from a PRIVATE SDK internal
+    (anthropic._constants.MODEL_NONSTREAMING_TOKENS); a future SDK release could move/rename/remove it
+    without a deprecation cycle. The import is guarded, so its failure must DEGRADE to the time-floored
+    value, never raise into extract_section. Force the import to fail (a _constants stub lacking the
+    symbol) and assert the fallback, so a future SDK move is caught by CI rather than silently."""
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "anthropic", types.ModuleType("anthropic"))
+    # _constants present but WITHOUT the symbol -> `from ... import MODEL_NONSTREAMING_TOKENS` raises
+    monkeypatch.setitem(sys.modules, "anthropic._constants", types.ModuleType("anthropic._constants"))
+    ext = BackendExtractor(engine, client=SimpleNamespace(), max_tokens=22000)
+    assert ext._effective_max_tokens() == min(22000, _NONSTREAMING_TIME_FLOOR)
+
+
 def test_mixed_rolled_back_and_clean_sections_only_count_clean(engine, tmp_path, monkeypatch):
     """With two sections where the FIRST rolls back and the SECOND writes cleanly, only the clean
     section is counted and only its dispositions accumulate."""

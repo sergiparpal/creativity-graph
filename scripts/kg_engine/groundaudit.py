@@ -36,11 +36,17 @@ class GroundAuditLog:
         self.path = Path(path)
 
     def size(self) -> int:
-        """Byte size of the log (0 if absent). Captured BEFORE an append so ``audited_write`` can
-        truncate an orphan record back on a failed write."""
+        """Byte size of the log (0 only if genuinely absent). Captured BEFORE an append so
+        ``audited_write`` can truncate an orphan record back on a failed write.
+
+        ONLY ``FileNotFoundError`` maps to 0 — the one legitimate empty case. A different ``OSError``
+        (EIO/ESTALE/read-only remount) on an EXISTING, populated log must NOT be reported as 0: that
+        false floor would let ``audited_write``'s compensating ``truncate(offset)`` wipe every prior
+        record on a subsequent write failure (silently re-quarantining all legitimate verdicts). Let
+        such errors propagate so ``audited_write`` aborts before appending instead."""
         try:
             return self.path.stat().st_size
-        except OSError:
+        except FileNotFoundError:
             return 0
 
     def append(self, key: str, frm: str, to: str, by: str) -> None:

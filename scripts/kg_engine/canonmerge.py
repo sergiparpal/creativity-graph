@@ -250,7 +250,12 @@ def _write_atomic(path: Path, text: str) -> None:
     half-written canon note (review-low)."""
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".kgmerge-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # newline="" suppresses newline translation: in default text mode Windows rewrites every '\n' to
+        # '\r\n', so the merge driver would emit a CRLF note while every engine write (atomicio, binary)
+        # emits LF — defeating byte-identical canon (clean git diffs / canonmerge byte-stability) and
+        # producing churn the next engine touch rewrites back to LF. node_to_markdown builds the text with
+        # literal '\n', so writing it verbatim keeps the note LF-terminated on every platform.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         os.replace(tmp, path)
     except BaseException:

@@ -121,7 +121,6 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
     spec = {n: node_specificity(labels[n], seeds, default) for n in G.nodes()}
 
     btw = precomputed_betweenness if precomputed_betweenness is not None else nx.betweenness_centrality(G)
-    deg = dict(G.degree())
     weighted = {n: btw[n] * spec[n] for n in G.nodes()}
 
     def topk(d, k=5):
@@ -366,7 +365,16 @@ def _dispatch(cmd: str, argv: list[str]) -> int:
                 "links": [{"source": "a", "target": "b"}, {"source": "a", "target": "c"},
                           {"source": "b", "target": "d"}, {"source": "c", "target": "d"}]}
         gdata, _ = _load_json_or_demo(gpath, demo, notice="no graph.json; using demo graph")
-        corpus = [Path(spath).read_text()] if spath and Path(spath).exists() else _demo_corpus()
+        # Split the source into per-section IDF documents, mirroring projector._corpus(). Feeding the
+        # whole file as ONE document makes n=1, every term's document-frequency d=1, so every term
+        # gets an identical IDF — specificity collapses to a single value, spread≈0, and the gate
+        # verdict is ALWAYS the degenerate "corpus too small / no IDF spread", never reflecting the
+        # real graph. The production projector path already splits; this standalone CLI must too.
+        if spath and Path(spath).exists():
+            text = Path(spath).read_text(encoding="utf-8")
+            corpus = [s for s in text.split("\n## ") if s.strip()] or [text]
+        else:
+            corpus = _demo_corpus()
         res = specificity(gdata, corpus)
         print(json.dumps(res, indent=2))
         return 0

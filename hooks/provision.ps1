@@ -15,6 +15,11 @@ if (-not $root) {
   $root = Split-Path -Parent $PSScriptRoot
 }
 
+# Prepend uv's usual install dir so a standalone-installed uv that is not yet on the inherited process
+# PATH is still found by bootstrap's `shutil.which('uv')` and the faster `uv sync` path is taken — the
+# parity mirror of provision.sh's $HOME/.local/bin prepend. Harmless if the dir is absent.
+if ($env:USERPROFILE) { $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH" }
+
 $boot = Join-Path $root 'scripts/bootstrap.py'
 if (-not (Test-Path $boot)) { exit 0 }
 

@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .atomicio import atomic_write_bytes, atomic_write_text
+from .atomicio import _fsync_dir, atomic_write_bytes, atomic_write_text
 from .model import (
     Edge,
     EpistemicState,
@@ -232,18 +232,28 @@ class LeaseLock:
         _atomic_write(self.path, json.dumps(self._record(now)))
 
     def heartbeat(self, now: float | None = None) -> None:
-        rec = self._read()
-        # Refresh, never acquire: a heartbeat only extends a lock we VERIFIABLY hold. If the record is
-        # gone (rec is None) or owned by someone else, do nothing — blind-writing a fresh self-owned
-        # record here would be an un-CAS'd acquisition that could steal a path a successor reclaimed
-        # after our lease lapsed. Acquisition goes solely through acquire()'s O_EXCL/reclaim CAS (F16).
-        if rec is None or not self._owned_by_self(rec):
+        # A heartbeat is BEST-EFFORT: lease correctness comes from the TTL + the CAS acquire/reclaim,
+        # not from any single refresh landing. So a transient read/write OSError (most often a Windows
+        # sharing violation while another process momentarily holds the lock file open) must NOT
+        # propagate: heartbeat() is called mid-batch by write_nodes, and a raw OSError there would
+        # trigger a spurious full-batch rollback of otherwise-healthy writes. A missed refresh is
+        # harmless — the next one, or the still-valid TTL, covers it.
+        try:
+            rec = self._read()
+            # Refresh, never acquire: a heartbeat only extends a lock we VERIFIABLY hold. If the record
+            # is gone (rec is None) or owned by someone else, do nothing — blind-writing a fresh
+            # self-owned record here would be an un-CAS'd acquisition that could steal a path a successor
+            # reclaimed after our lease lapsed. Acquisition goes solely through acquire()'s O_EXCL/reclaim
+            # CAS (F16).
+            if rec is None or not self._owned_by_self(rec):
+                return
+            now = time.time() if now is None else now
+            merged = dict(rec)
+            merged.update({"pid": self.pid, "host": self.host, "ttl": self.ttl, "heartbeat_at": now})
+            merged.setdefault("acquired_at", now)
+            _atomic_write(self.path, json.dumps(merged))
+        except OSError:
             return
-        now = time.time() if now is None else now
-        merged = dict(rec)
-        merged.update({"pid": self.pid, "host": self.host, "ttl": self.ttl, "heartbeat_at": now})
-        merged.setdefault("acquired_at", now)
-        _atomic_write(self.path, json.dumps(merged))
 
     def release(self) -> None:
         # Read-then-unlink would be a TOCTOU: if our lease lapsed past TTL and a successor reclaimed the
@@ -423,8 +433,17 @@ class Canon:
         """Non-raising acquire for best-effort callers (the lazy projector): take the single-writer
         lease if free/ours, else return False so the caller can serve what it has instead of blocking
         or crashing. Re-entrant within this process like _acquire_lock."""
-        if self._lock_depth == 0 and not self.lock.acquire():
-            return False
+        if self._lock_depth == 0:
+            try:
+                if not self.lock.acquire():
+                    return False
+            except OSError:
+                # acquire() reads/creates the lock file and can raise OSError (most often a Windows
+                # sharing violation while another writer momentarily holds it open). For this NON-raising
+                # best-effort path that must read as "didn't get the lease this attempt" — the same
+                # fail-closed posture as the blocking writer (_acquire_lease_blocking) — never crash the
+                # read tool that triggered the lazy reproject; the caller serves the stale derived layer.
+                return False
         self._lock_depth += 1
         return True
 
@@ -590,12 +609,16 @@ class Canon:
         repo = self.root
         self._acquire_lock()
         try:
-            # snapshot every target file BEFORE writing so a non-git/pre-commit vault can still roll back
             snapshot = {}
-            for n in nodes:
-                p = self.node_path(n.id)
-                snapshot[p] = p.read_bytes() if p.exists() else None
             try:
+                # snapshot every target file BEFORE writing so a non-git/pre-commit vault can still roll
+                # back. INSIDE the rollback try: a present-but-unreadable note (permission error, or a
+                # transient Windows sharing violation) then returns RollbackInfo, not a raw exception, to
+                # the boundary — no write has happened yet, so restoring the partial snapshot of untouched
+                # files is a safe no-op.
+                for n in nodes:
+                    p = self.node_path(n.id)
+                    snapshot[p] = p.read_bytes() if p.exists() else None
                 from .model import utcnow
                 # Throttle the lease heartbeat: each heartbeat is a full durable lock rewrite
                 # (mkstemp+fsync+replace+dir-fsync). Lease correctness comes from the TTL + CAS
@@ -695,6 +718,11 @@ class Canon:
             for p, original in snapshot.items():
                 if original is None:
                     p.unlink(missing_ok=True)  # file was newly created by this batch -> remove it
+                    # fsync the parent so the dirent REMOVAL is as durable as the create it reverses
+                    # (atomic_write_bytes dir-fsyncs after os.replace). Without this, a crash right after
+                    # rollback can resurrect the just-deleted note's dirent, leaving a phantom node the
+                    # projector treats as real — the restore branch below is already durable.
+                    _fsync_dir(p.parent)
                 else:
                     # atomic + fsynced restore, consistent with the rest of the module — a crash mid
                     # rollback must not leave a half-written note (review-low: rollback non-atomic).

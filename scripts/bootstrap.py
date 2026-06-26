@@ -379,8 +379,20 @@ def try_acquire(venv_dir: Path) -> bool:
             # bare PID-only name would then hit ENOTEMPTY on os.replace (masked as a lost
             # race) and never reclaim. ``time_ns()`` makes every steal target unique, and we
             # sweep any pre-existing ``*.stale-*`` orphans first so they can't accumulate.
+            # Reap only STALE orphans (mtime older than STALE_LOCK_SECS). A FRESH `.stale-*`/`.release-*`
+            # dir may be the IN-FLIGHT sideline of a CONCURRENT stealer/releaser (names are unique by
+            # pid+time_ns, so a fresh one isn't ours and isn't a crash orphan yet). rmtree-ing it out from
+            # under that racer would make its own re-validation see the dir "vanished" and STEAL a lock it
+            # meant to RESTORE — destroying a live holder. Gating on age spares the live racer while still
+            # reaping genuine crash orphans (the unique names already prevent the ENOTEMPTY collision).
+            now = time.time()
             for pattern in (f"{LOCK_NAME}.stale-*", f"{LOCK_NAME}.release-*"):
                 for orphan in lock.parent.glob(pattern):
+                    try:
+                        if (now - orphan.stat().st_mtime) <= STALE_LOCK_SECS:
+                            continue  # too fresh — may be a concurrent racer's in-flight sideline
+                    except OSError:
+                        continue  # vanished/unreadable under us — nothing to reap
                     shutil.rmtree(orphan, ignore_errors=True)
             sidelined = lock.parent / f"{LOCK_NAME}.stale-{os.getpid()}-{time.time_ns()}"
             try:
@@ -408,7 +420,13 @@ def try_acquire(venv_dir: Path) -> bool:
         (lock / "info").write_text(_info_record(token), "utf-8")
         _OWNED_TOKENS[str(lock)] = token
     except OSError:
-        pass
+        # The info write failed (ENOSPC, a transient AV/permission hold). Do NOT return success holding
+        # an UNOWNED lock: without the token, release() can't remove it (it leaks until the TTL), and
+        # with no `info` record _pid_probe reads pid=0, so a concurrent provisioner judges this
+        # just-acquired lock dead and STEALS it mid-build — two builds clobbering one venv, the exact
+        # race this lock prevents. Abandon cleanly (remove the dir we hold) so the caller re-loops.
+        shutil.rmtree(lock, ignore_errors=True)
+        return False
     heartbeat(venv_dir)  # seed liveness immediately so a just-acquired lock is never stale
     return True
 
@@ -570,6 +588,15 @@ def do_install(venv_dir: Path) -> Path:
     # Did this dir already exist (and look like an unrelated user path) before we touched
     # it? If so, never rmtree it on failure (bootstrap-4: --venv may point at user data).
     preexisting_foreign = venv_dir.exists() and not _looks_like_our_venv(venv_dir)
+    # Whether the dir was absent or EMPTY before we touched it — i.e. WE are populating it. On failure
+    # such a dir is safe to rmtree even if the install died before pyvenv.cfg/markers exist (a partial
+    # pre-config scaffold), without the _looks_like_our_venv check. Without this, a partial scaffold is
+    # neither cleaned (no markers) nor buildable next run (the preexisting_foreign guard below then sees a
+    # populated non-venv dir and SystemExits), wedging the venv path until a human deletes it (bootstrap).
+    try:
+        ours_to_clean = not venv_dir.exists() or not any(venv_dir.iterdir())
+    except OSError:
+        ours_to_clean = False
     # Refuse to SCAFFOLD a venv into a populated dir we don't own, BEFORE writing anything — so we
     # neither delete (handled below) nor pollute user data with pyvenv.cfg/bin/lib. An empty foreign
     # dir is fine to build into.
@@ -608,7 +635,7 @@ def do_install(venv_dir: Path) -> Path:
         # KG_ENGINE_VENV pointed at a pre-existing populated user dir is left untouched.
         # The lock lives BESIDE the venv (_lock_dir), so this never deletes the lock this
         # process still holds.
-        if not preexisting_foreign and _looks_like_our_venv(venv_dir):
+        if not preexisting_foreign and (ours_to_clean or _looks_like_our_venv(venv_dir)):
             shutil.rmtree(venv_dir, ignore_errors=True)
         raise
     finally:

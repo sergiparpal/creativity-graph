@@ -69,6 +69,20 @@ def test_collapse_missing_target_is_signalled_not_auto_picked():
     assert payload is None and "not in the graph" in msg
 
 
+def test_explode_missing_target_is_signalled_not_auto_picked():
+    """review (explode/collapse parity): an explicit explode target absent from the graph is a caller
+    error (typo / stale id), not a request to explode the default max-degree hub. Mirrors
+    collapse_payload's discipline so a missing target is surfaced, not silently substituted."""
+    G = nx.MultiDiGraph()
+    G.add_node("a", community=0, degree=5)
+    G.add_node("b", community=0, degree=1)
+    payload, msg = explode_payload(G, target="not-a-node")
+    assert payload is None and "not in the graph" in msg
+    # with NO target the hub fallback still applies (the default "explode the hub" behavior is intact)
+    payload, t = explode_payload(G, target=None)
+    assert payload is not None and t == "a"
+
+
 def test_collapse_dedups_explicit_members():
     """review-low: duplicate explicit members collapse to one, so ['a','a'] does not pass the >=2 guard
     as a fake two-member cluster."""

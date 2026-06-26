@@ -10,6 +10,7 @@ Enforces, in the deterministic tier (§1.4):
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable
 
@@ -296,7 +297,12 @@ def validate_payload(
 
 
 def _canon_node(node_in: NodeIn) -> Node:
-    nid = node_in.id or _slug_label(node_in.label)
+    # Slug the resolved id so the node lane, the edge-source attachment key, and node_path's filename
+    # all agree on ONE canonical key. A caller-supplied non-slug id (e.g. "FEP") was previously stored
+    # RAW while the edge lane keyed its source on slug() — the two then diverge ("FEP" vs "fep") onto
+    # the same fep.md and trip _check_slug_collision, rolling back the whole kg_write batch. node_path
+    # already slugs the id for the filename, so the raw id was never honored on disk anyway.
+    nid = _slug_label(node_in.id or node_in.label)
     return Node(
         id=nid, label=node_in.label, node_type=node_in.node_type, file_type=node_in.file_type,
         provenance=node_in.provenance, authored_by=node_in.authored_by,
@@ -369,6 +375,14 @@ def _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids,
     canonical_id = edge.id  # the canonical (slugged) identity used by dedup, the canon merge, and disk
     is_hypothesized = edge.provenance == Provenance.HYPOTHESIZED
 
+    # reject a degenerate endpoint: an empty / whitespace / punctuation-only source, relation, or
+    # target has NO word character, so slug() falls back to the literal "node" and edge_id aliases
+    # distinct edges onto one canonical id/file (e.g. edge_id('', 'grounds', '') == edge_id('---',
+    # 'grounds', '---')). Reject before that aliasing can dedup-merge unrelated claims (§1.4).
+    for role, value in (("source", edge.source), ("relation", edge.relation), ("target", edge.target)):
+        if not re.search(r"\w", value or "", re.UNICODE):
+            return _ok("edge", edge, Disposition.REJECTED, f"empty-{role}", False, canonical_id)
+
     # clamp the confidence hint into [0,1]; drop NaN/inf so it can't poison downstream calibration
     if edge.confidence_score is not None:
         edge.confidence_score = (min(1.0, max(0.0, edge.confidence_score))
@@ -421,10 +435,17 @@ def _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids,
         disp = Disposition.QUARANTINED
         reason = (reason + ";" if reason else "") + "undeclared-edge-type"
 
-    # single-canonical-edge rule: dedup
-    if canonical_id in seen and disp in (Disposition.ACCEPTED, Disposition.DEMOTED):
+    # single-canonical-edge rule: dedup. Only a WRITABLE disposition seeds `seen` (mirroring the node
+    # lane's `seen_nodes`, which adds only on a net-new written+fitting node). A QUARANTINED/REJECTED
+    # edge is never merged into trusted canon, so it must NOT seed the dedup set: otherwise a later
+    # same-canonical-id WRITABLE edge takes the zero-cost "deduped" branch and slips past the §Stage-9
+    # flood cap — e.g. a QUARANTINED case-variant twin (relation "Grounds" vs declared "grounds", both
+    # slugging to "grounds") would buy a free real edge.
+    writable = disp in (Disposition.ACCEPTED, Disposition.DEMOTED)
+    if canonical_id in seen and writable:
         reason = (reason + ";" if reason else "") + "deduped"
-    seen.add(canonical_id)
+    if writable:
+        seen.add(canonical_id)
 
     return _ok("edge", edge, disp, reason, retryable=False, identity=canonical_id)
 

@@ -363,9 +363,10 @@ def test_fresh_but_long_lock_is_not_stolen(tmp_path):
 
 def test_orphan_sideline_does_not_block_steal(tmp_path):
     # F24: a crash between os.replace() and rmtree() in the steal path orphans a non-empty
-    # ``.kg-provision.lock.stale-<...>`` dir. A later stealer must not be wedged by it: the
-    # steal target is now collision-proof (PID + time_ns) and pre-existing ``*.stale-*``
-    # orphans are swept first, so the steal still succeeds.
+    # ``.kg-provision.lock.stale-<...>`` dir. A later stealer must not be wedged by it: the steal target
+    # is collision-proof (PID + time_ns), and a GENUINELY STALE orphan (mtime older than STALE_LOCK_SECS)
+    # is reaped first, so the steal succeeds AND the leftover is cleaned. (A FRESH orphan — possibly a
+    # concurrent racer's in-flight sideline — is intentionally spared; see test_fresh_orphan_is_spared.)
     venv_dir = tmp_path / "venv"
     assert bootstrap.try_acquire(venv_dir) is True
     lock = bootstrap._lock_dir(venv_dir)
@@ -377,18 +378,48 @@ def test_orphan_sideline_does_not_block_steal(tmp_path):
     orphan.mkdir()
     (orphan / "leftover").write_text("crashed mid-steal\n", encoding="utf-8")
 
-    # Age the live lock + heartbeat past the stale threshold so it is genuinely stealable.
+    # Age the live lock + heartbeat past the stale threshold so it is genuinely stealable, and age the
+    # orphan too so the mtime-gated sweep treats it as a real crash leftover (not a live racer's sideline).
     old = time.time() - bootstrap.STALE_LOCK_SECS - 60
     os.utime(lock, (old, old))
     if hb.exists():
         os.utime(hb, (old, old))
+    os.utime(orphan, (old, old))
 
-    # The steal must succeed despite the orphan, and the orphan must be swept away.
+    # The steal must succeed despite the orphan, and the stale orphan must be swept away.
     assert bootstrap.try_acquire(venv_dir) is True
     assert not orphan.exists()
     bootstrap.release(venv_dir)
     # No stale sidelines leaked after a clean steal.
     assert not list(lock.parent.glob(f"{bootstrap.LOCK_NAME}.stale-*"))
+
+
+def test_fresh_orphan_is_spared(tmp_path):
+    # The orphan-sweep must NOT reap a FRESH ``*.stale-*`` dir: it may be the in-flight sideline of a
+    # CONCURRENT stealer/releaser (unique pid+time_ns name). rmtree-ing it out from under that racer
+    # would make its own re-validation see the dir "vanished" and STEAL a lock it meant to RESTORE,
+    # destroying a live holder. The steal still succeeds despite the fresh orphan (collision-proof
+    # naming); the orphan is simply left to age out, not clobbered mid-flight.
+    venv_dir = tmp_path / "venv"
+    assert bootstrap.try_acquire(venv_dir) is True
+    lock = bootstrap._lock_dir(venv_dir)
+    hb = bootstrap._heartbeat_file(venv_dir)
+
+    # A fresh (just-created) orphan stands in for a concurrent racer's in-flight sideline.
+    fresh = lock.parent / f"{bootstrap.LOCK_NAME}.stale-999999-{time.time_ns()}"
+    fresh.mkdir()
+    (fresh / "info").write_text("a live racer's sideline\n", encoding="utf-8")
+
+    # Age the live lock + heartbeat so it is genuinely stealable, but leave the orphan FRESH.
+    old = time.time() - bootstrap.STALE_LOCK_SECS - 60
+    os.utime(lock, (old, old))
+    if hb.exists():
+        os.utime(hb, (old, old))
+
+    # The steal succeeds despite the fresh orphan, and the fresh orphan is left untouched (not clobbered).
+    assert bootstrap.try_acquire(venv_dir) is True
+    assert fresh.exists()
+    bootstrap.release(venv_dir)
 
 
 def _write_info(venv_dir, *, pid, host, token="tok", t=None):

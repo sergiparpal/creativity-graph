@@ -419,6 +419,18 @@ class Reconciler:
                 pass
         return report
 
+    @staticmethod
+    def _drain_key_ledger(key: str, consumed: dict, audit: dict[str, int]) -> None:
+        """Mark EVERY audit record for `key` as consumed (consumed[pair] = audit[pair] for each of the
+        key's pairs). Called once `key`'s current canon state is validated as legitimate: that state is
+        authoritative, so all historical records that led here are spent and none may justify a FUTURE
+        out-of-band transition. Pair keys are `f"{key}||{state}"`, and ids/slugs never contain '|', so the
+        `||` prefix isolates exactly this key's pairs."""
+        prefix = f"{key}||"
+        for pair, count in audit.items():
+            if pair.startswith(prefix) and count > consumed.get(pair, 0):
+                consumed[pair] = count
+
     def _forged(self, key: str, current: EpistemicState, epistemic: dict, consumed: dict,
                 audit: dict[str, int]) -> bool:
         """True if `current` is a policed state reached out-of-band: it differs from the last validated
@@ -433,31 +445,38 @@ class Reconciler:
         last = epistemic.get(key)
         pair = f"{key}||{current.value}"
         if last == current.value:
-            # Unchanged since last validated — nothing new to justify. BUT an idempotent re-ground
-            # (kg_ground grounded->grounded) appends a fresh record on EVERY call, and the reconciler
-            # counts records by (key, to) only — so a re-ground to the SAME state leaves a spendable
-            # surplus this branch would otherwise never consume. A later out-of-band forgery back into
-            # this state could then spend that orphan surplus and slip past undetected (reconciler-H1).
-            # Drain any surplus for this pair into `consumed` so an idempotent re-ground can never leave
-            # a spendable record behind.
-            if audit.get(pair, 0) > consumed.get(pair, 0):
-                consumed[pair] = audit[pair]
+            # Unchanged since last validated — nothing new to justify, and the current state is
+            # authoritative, so drain the WHOLE ledger for this key into `consumed`. An idempotent
+            # re-ground appends a fresh record on every call (reconciler-H1), AND an edge that passed
+            # through an intermediate policed state before settling here leaves records for those states
+            # too — any such surplus is a record a later out-of-band forgery back into that state could
+            # spend and slip past undetected. Draining ALL of the key's pairs (not just `pair`) leaves no
+            # spendable record behind.
+            self._drain_key_ledger(key, consumed, audit)
             return False
         if audit.get(pair, 0) > consumed.get(pair, 0):
-            consumed[pair] = consumed.get(pair, 0) + 1  # spend exactly one record for this transition
+            # A legitimate transition: an unconsumed record justifies reaching `current`. The current
+            # state is now authoritative, so drain the ENTIRE ledger for this key — INCLUDING records for
+            # intermediate states the sweep never observed-as-current (e.g. a `grounded` record on an edge
+            # that went unverified->grounded->failed within a prior session). Spending only ONE record for
+            # `pair` (the old behavior) left every such intermediate record as a permanent spendable
+            # surplus a later out-of-band forgery into that state could replay to evade re-quarantine.
+            self._drain_key_ledger(key, consumed, audit)
             return False
         # The snapshot `audit` (captured once at the top of the sweep) shows no record — but the
         # per-session reconcile runs in a SEPARATE process concurrently with kg_ground, so a LEGITIMATE
         # verdict (record appended + canon write) can land AFTER the snapshot yet before this note's
         # read. Before declaring a forgery (which would permanently revert that just-applied verdict),
         # re-fold the audit log FRESH to pick up any record appended mid-sweep; honor it if found
-        # (reconciler-H3/M2). The re-fold advances the incremental cache, so a later check in this same
-        # sweep sees the same counts.
+        # (reconciler-H3/M2). Adopt ALL of this key's fresh pair counts into the working snapshot so the
+        # subsequent ledger drain also spends any mid-sweep intermediate records.
         fresh = self._audit_counts()
         if fresh.get(pair, 0) > audit.get(pair, 0):
-            audit[pair] = fresh[pair]  # adopt the mid-sweep record into this sweep's working snapshot
+            for p, c in fresh.items():
+                if p.startswith(f"{key}||") and c > audit.get(p, 0):
+                    audit[p] = c  # adopt mid-sweep records for this key into the working snapshot
             if audit.get(pair, 0) > consumed.get(pair, 0):
-                consumed[pair] = consumed.get(pair, 0) + 1
+                self._drain_key_ledger(key, consumed, audit)
                 return False
         return True
 

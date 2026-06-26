@@ -15,7 +15,31 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
+
+_REPLACE_RETRIES = 5
+_REPLACE_BACKOFF = 0.05  # seconds, grows linearly per attempt
+
+
+def _replace_with_retry(tmp: str, path: Path) -> None:
+    """``os.replace(tmp, path)`` with a small bounded retry for the Windows sharing-violation case.
+
+    On Windows, replacing a destination another process holds open WITHOUT ``FILE_SHARE_DELETE`` raises
+    ``PermissionError`` (ERROR_SHARING_VIOLATION): e.g. a lease-free canon reader (a second session, the
+    per-session reconcile worker, the headless backend) mid-reading the note, or the AV/search indexer
+    briefly opening the freshly-renamed file. The lease lock file already retries the same transient
+    class (``canon._acquire_lease_blocking``); mirror it here so a momentary concurrent open does not
+    fail an otherwise-valid canon write — which, via ``canon.write_nodes``, would spuriously roll back
+    the whole batch. A no-op on POSIX, where ``os.replace`` over an open file succeeds."""
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRIES - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF * (attempt + 1))
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -52,7 +76,16 @@ def atomic_write_bytes(
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        # Preserve the destination's existing permission bits across the inode-replacing os.replace.
+        # mkstemp fixes the temp at 0o600, so without this every write would silently reset the canon
+        # note (a "human-editable" vault file) to owner-only, stripping any group/other bit a user or
+        # umask had granted. A brand-new file keeps the 0o600 default — a sensible private default for
+        # potentially-sensitive scrubbed content, and there is no prior mode to preserve.
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        except OSError:
+            pass  # destination absent (new file) or chmod unsupported — keep the mkstemp default
+        _replace_with_retry(tmp, path)
         if fsync_dir:
             _fsync_dir(path.parent)  # make the rename itself durable, not just the contents
     finally:

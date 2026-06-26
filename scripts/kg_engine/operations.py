@@ -103,8 +103,14 @@ def collapse_payload(G, *, target=None, members=None, label="", body=""):
 
 
 def explode_payload(G, *, target=None, k=None, label="", body=""):
+    # Mirror collapse_payload's discipline: a target supplied but absent from the graph is a CALLER
+    # error (an agent typo or a stale node id), NOT a request to explode the default hub. Only fall
+    # back to the max-degree hub when no target was given; otherwise surface the missing target so the
+    # boundary reports it, instead of silently exploding an unrelated node and reporting ok:True.
+    if target is not None and target not in G:
+        return None, f"explode target {target!r} is not in the graph"
     node = target
-    if node is None or node not in G:
+    if node is None:
         node = max(G.nodes(), key=lambda n: (float(node_attr(G, n, "degree", 0)), n), default=None)
     if node is None:
         return None, "no node to explode"

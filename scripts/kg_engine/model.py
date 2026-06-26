@@ -172,6 +172,12 @@ def slug(s: str) -> str:
     # which differ by a SEPARATING mark stay distinct ('a/b' vs 'ab', 'I/O' vs 'IO', 'foo.bar' vs
     # 'foobar' do NOT collapse onto one id/filename, as deletion would conflate them).
     s = re.sub(r"[^\w\s-]", "-", s)
+    # The final `or "node"` fallback means ANY input that reduces to empty — '' or a
+    # punctuation/separator-only string ('---', '!!!') — collapses to the literal slug "node", which
+    # also collides with a node legitimately labelled 'node' (and, via edge_id, conflates distinct
+    # empty-endpoint edges onto one id/file). The write boundary rejects empty/punctuation-only edge
+    # endpoints (no word character) before edge_id is built so this fallback can't silently alias
+    # distinct edges; callers that slug elsewhere should be aware of the collapse.
     return re.sub(r"[\s_-]+", "-", s).strip("-") or "node"
 
 

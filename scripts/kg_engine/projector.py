@@ -60,6 +60,18 @@ _RANK_DIFF_COLUMNS = ("degree", "community", "bridge_communities",
 # from its derived value, just never used to decide WHETHER to write).
 _RANK_UPDATE_COLUMNS = ("degree", "community", "bridge_communities", "structural_bridge",
                         "betweenness", "spec_betweenness", "specificity", "gate_on")
+# The `edges` table columns, single-sourced exactly like _NODE_COLUMNS so the DDL, the INSERT VALUES
+# placeholder count, the incremental-diff SELECT column list, and _edge_row's value order all derive
+# from ONE definition — a column add/reorder is one edit here, and the positional contract between the
+# diff SELECT and _edge_row can't silently desync into a false 'unchanged'/'changed' persistence bug.
+# (kg_context reads edges by NAME via sqlite3.Row with its own deliberately-different column subset, so
+# it is not part of this positional contract and intentionally does not derive from here.)
+_EDGE_COLUMNS = (
+    ("id", "TEXT PRIMARY KEY"), ("source", "TEXT"), ("target", "TEXT"), ("relation", "TEXT"),
+    ("provenance", "TEXT"), ("authored_by", "TEXT"), ("epistemic_state", "TEXT"), ("span", "TEXT"),
+    ("source_file", "TEXT"), ("confidence", "TEXT"), ("confidence_score", "REAL"),
+)
+_EDGE_COLUMN_NAMES = tuple(name for name, _ in _EDGE_COLUMNS)
 # Hard ceiling on the kg_context token budget so a client passing a huge value can't make the engine
 # serialize the entire edge table into one response (server-4). The limit clamp on query_graph is the
 # row-count analogue.
@@ -434,7 +446,16 @@ class Projector:
         # full rebuild we pass nothing (the table is about to be rewritten from scratch → always compute).
         prior_topo_sig = None if do_full else prior.get("topo_sig", "")
         prior_betweenness = None if do_full else self._read_prior_betweenness()
+        # Keep the single-writer lease fresh across the expensive critical section. project() holds the
+        # lease for this whole read+compute+write span, and _ranks runs an O(V·E) pure-Python betweenness
+        # pass; without a refresh a reprojection that outlives the lease TTL would be judged stale and
+        # STOLEN by a concurrent writer mid-projection — breaking single-writer (the same hazard
+        # write_nodes heartbeats against on a long batch). Refresh right before the betweenness pass and
+        # again before the derived write, bounding the unheartbeated gap to a single betweenness pass.
+        # heartbeat() is best-effort and swallows transient errors, so this never raises into projection.
+        self.canon.lock.heartbeat()
         ranks = self._ranks(G, prior_topo_sig=prior_topo_sig, prior_betweenness=prior_betweenness)
+        self.canon.lock.heartbeat()
 
         # graph.json is always written in full (cheap projection, must round-trip). Write atomically
         # (temp + os.replace) so a concurrent reader never observes a half-written file.
@@ -461,6 +482,14 @@ class Projector:
                   + ", ".join(f"{name} {sqltype}" for name, sqltype in _NODE_COLUMNS) + ")")
     _NODES_INSERT = ("INSERT OR REPLACE INTO nodes VALUES ("
                      + ",".join("?" * len(_NODE_COLUMNS)) + ")")
+    # Same single-source treatment for `edges` (DDL / INSERT placeholder / incremental-diff SELECT),
+    # all derived from _EDGE_COLUMNS so the column set/order lives in one place.
+    _EDGES_DDL = ("CREATE TABLE IF NOT EXISTS edges("
+                  + ", ".join(f"{name} {sqltype}" for name, sqltype in _EDGE_COLUMNS) + ")")
+    _EDGES_INSERT = ("INSERT OR REPLACE INTO edges VALUES ("
+                     + ",".join("?" * len(_EDGE_COLUMNS)) + ")")
+    _EDGES_SELECT_BY_SOURCE = ("SELECT " + ",".join(_EDGE_COLUMN_NAMES)
+                               + " FROM edges WHERE source=?")
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
@@ -474,10 +503,7 @@ class Projector:
             -- authoritatively in the canon frontmatter + audit log (reconciler reads them from there).
             -- "derived contains nothing the canon does not" is one-directional — the derived layer MAY
             -- omit canon fields, so this is contractually allowed, not a gap.
-            CREATE TABLE IF NOT EXISTS edges(
-                id TEXT PRIMARY KEY, source TEXT, target TEXT, relation TEXT,
-                provenance TEXT, authored_by TEXT, epistemic_state TEXT, span TEXT,
-                source_file TEXT, confidence TEXT, confidence_score REAL);
+            {self._EDGES_DDL};
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
             CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree);
@@ -488,8 +514,26 @@ class Projector:
         # _schema_outdated — repopulates it). Done here so every connect path heals the schema.
         cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
         if not _NEW_NODE_COLUMNS <= cols:
-            con.executescript(f"DROP TABLE IF EXISTS nodes; {self._NODES_DDL};"
-                              "CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree);")
+            # Heal a pre-Stage-2 schema by dropping + recreating `nodes` empty (a full reproject, forced
+            # by _schema_outdated, repopulates it). Do the DROP+CREATE inside ONE IMMEDIATE transaction so
+            # a concurrent lease-free WAL reader sees either the old table or the new one — never the
+            # intermediate no-`nodes`-table state, which would raise "no such table: nodes". executescript
+            # auto-commits between statements (reopening that window), so drive explicit statements under
+            # manual transaction control instead.
+            prior_iso = con.isolation_level
+            con.isolation_level = None  # autocommit: BEGIN/COMMIT are explicit + predictable cross-version
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                try:
+                    con.execute("DROP TABLE IF EXISTS nodes")
+                    con.execute(self._NODES_DDL)
+                    con.execute("CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree)")
+                    con.execute("COMMIT")
+                except Exception:
+                    con.execute("ROLLBACK")
+                    raise
+            finally:
+                con.isolation_level = prior_iso
         return con
 
     def _schema_outdated(self) -> bool:
@@ -530,9 +574,18 @@ class Projector:
         return tuple(row[name] for name in _NODE_COLUMN_NAMES)
 
     @staticmethod
-    def _edge_row(e):
-        return (e.id, e.source, e.target, e.relation, e.provenance.value, e.authored_by.value,
-                e.epistemic_state.value, e.span, e.source_file, e.confidence.value, e.confidence_score)
+    def _edge_row(e) -> tuple:
+        """One edge's persisted column VALUES as a positional tuple in _EDGE_COLUMNS order. Built via a
+        name->value dict and flattened through _EDGE_COLUMN_NAMES, so the order is DERIVED from the same
+        single source the DDL / INSERT placeholder / incremental-diff SELECT use — the positional
+        comparison in _write_incremental (cur SELECT row vs this tuple) can't desync on a column edit."""
+        v = {
+            "id": e.id, "source": e.source, "target": e.target, "relation": e.relation,
+            "provenance": e.provenance.value, "authored_by": e.authored_by.value,
+            "epistemic_state": e.epistemic_state.value, "span": e.span, "source_file": e.source_file,
+            "confidence": e.confidence.value, "confidence_score": e.confidence_score,
+        }
+        return tuple(v[name] for name in _EDGE_COLUMN_NAMES)
 
     def _write_full(self, nodes, ranks: Ranks, head, hashes, report, source_hash, stale):
         con = self._connect()
@@ -543,7 +596,7 @@ class Projector:
                 self._NODES_INSERT,
                 [self._node_values(self._node_row(n, ranks)) for n in nodes])
             erows = [self._edge_row(e) for n in nodes for e in n.edges]
-            con.executemany("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", erows)
+            con.executemany(self._EDGES_INSERT, erows)
             report.touched_nodes = [n.id for n in nodes]
             report.touched_edges = [e.id for n in nodes for e in n.edges]
             self._save_meta(con, head, hashes, ranks.gate_on, source_hash, stale, ranks.topo_sig)
@@ -564,13 +617,11 @@ class Projector:
                 con.execute(self._NODES_INSERT, self._node_values(self._node_row(n, ranks)))
                 report.touched_nodes.append(n.id)
                 # diff this node's edges against the DB; upsert only changed rows, delete vanished
-                cur = {r[0]: r for r in con.execute(
-                    "SELECT id,source,target,relation,provenance,authored_by,epistemic_state,span,"
-                    "source_file,confidence,confidence_score FROM edges WHERE source=?", (n.id,))}
+                cur = {r[0]: r for r in con.execute(self._EDGES_SELECT_BY_SOURCE, (n.id,))}
                 new = {e.id: self._edge_row(e) for e in n.edges}
                 for eid, row in new.items():
                     if cur.get(eid) != row:
-                        con.execute("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)", row)
+                        con.execute(self._EDGES_INSERT, row)
                         report.touched_edges.append(eid)
                 for eid in cur:
                     if eid not in new:

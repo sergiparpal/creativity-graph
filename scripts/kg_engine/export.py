@@ -173,7 +173,7 @@ def _community_lines(nodes: list, edges: list) -> list:
         prov = _axis_breakdown(members, "provenance")
         auth = _axis_breakdown(members, "authored_by")
         est = _axis_breakdown(edges_by_comm.get(c, []), "epistemic_state")
-        names = ", ".join(_escape_md(m.get("label") or m["id"])
+        names = ", ".join(f"`{_escape_md(m.get('label') or m['id'])}`"
                           for m in sorted(members, key=lambda m: m["id"])[:_COMMUNITY_PREVIEW])
         more = " …" if len(members) > _COMMUNITY_PREVIEW else ""
         lines.append(f"### Community {c} — {len(members)} node(s)")
@@ -194,7 +194,7 @@ def _falsification_lines(edges: list) -> list:
         for e in sorted(fails, key=lambda e: e.get("id") or "")[:_LIST_CAP]:
             lines.append(f"- `{_escape_md(e.get('source'))} --{_escape_md(e.get('relation'))}--> "
                          f"{_escape_md(e.get('target'))}` "
-                         f"[{e.get('epistemic_state')}]" + (f" — {_truncate(e.get('span'))}" if e.get("span") else ""))
+                         f"[{e.get('epistemic_state')}]" + (f" — `{_truncate(e.get('span'))}`" if e.get("span") else ""))
     else:
         lines.append("_(none — nothing refuted yet)_")
     return lines
@@ -207,7 +207,7 @@ def _stale_lines(stale: list) -> list:
     lines.append(f"## Stale verdicts (R3 — span no longer in source): {len(stale)}")
     if stale:
         for s in stale[:_LIST_CAP]:
-            lines.append(f"- `{_escape_md(s.get('edge_id'))}` — {_escape_md(s.get('reason'))}")
+            lines.append(f"- `{_escape_md(s.get('edge_id'))}` — `{_escape_md(s.get('reason'))}`")
     else:
         lines.append("_(none)_")
     return lines
@@ -248,10 +248,16 @@ def _fmt_counts(d: dict) -> str:
 
 
 def _escape_md(s) -> str:
-    """Neutralize markdown/HTML-significant characters in a value inlined into GRAPH_REPORT.md so an
-    untrusted label/relation/span cannot break a backtick code span or inject markup when the .md is
-    rendered as HTML (review-low). Uses visually-close lookalikes (no backtick, no </>) and collapses
-    newlines — safe both inside and outside a code span."""
+    """Neutralize the characters that let an untrusted label/relation/span/reason escape its rendering
+    context in GRAPH_REPORT.md: the backtick (which would break out of a code span), the HTML angle
+    brackets ``<``/``>`` (raw-HTML injection when the .md is rendered as HTML), and newlines. Uses
+    visually-close lookalikes so the text stays legible (review-low).
+
+    NOTE: this does NOT neutralize markdown link/emphasis metacharacters (``[ ] ( ) * _``), which are
+    extremely common in legitimate prose and must stay intact. Those are only *active* outside a code
+    span, so EVERY caller renders untrusted values INSIDE a backtick code span (where markdown is
+    inert); the escaped backtick above is what guarantees the value cannot break back out. Do not
+    inline an ``_escape_md`` result as bare markdown text."""
     return (str(s if s is not None else "")
             .replace("`", "ʼ").replace("<", "‹").replace(">", "›").replace("\n", " ").strip())
 

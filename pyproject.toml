@@ -7,10 +7,15 @@ requires-python = ">=3.10"
 # system build toolchain. The heavy/finicky optional layers live under [project.optional-dependencies]
 # so a plain `uv sync` (the SessionStart bootstrap) never hard-fails on a user machine.
 dependencies = [
-    "mcp>=1.2",            # FastMCP server + tool surface (the graph engine interface)
-    "pydantic>=2",         # the boundary contract (P_write validation)
-    "networkx>=3",         # node-link graph.json interchange
-    "pyyaml>=6",           # pack.yaml / glossary loader
+    # Upper bounds cap each below its next (unverified) major. Unlike the guarded igraph/leidenalg
+    # imports below (which DEGRADE silently on a breaking bump), a breaking mcp/pydantic/networkx major
+    # would fail LOUDLY at startup — but the no-uv pip-fallback install path (bootstrap.install_with_pip)
+    # resolves these fresh from PyPI against THESE constraints, not uv.lock, so a cap is what stops a
+    # fresh user venv from pulling an untested major. The primary uv path is pinned by uv.lock regardless.
+    "mcp>=1.2,<2",         # FastMCP server + tool surface (the graph engine interface)
+    "pydantic>=2,<3",      # the boundary contract (P_write validation)
+    "networkx>=3,<4",      # node-link graph.json interchange
+    "pyyaml>=6,<7",        # pack.yaml / glossary loader
     # Upper bounds pin BELOW the next (unverified) major so a fresh user venv can't silently pull a
     # breaking API change that the guarded _leiden import would degrade through rather than surface
     # (review-low). Verified working at igraph 1.0.0 / leidenalg 0.12.0; lift the cap after testing a
