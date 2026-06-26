@@ -268,6 +268,131 @@ mcp__plugin_creativity-graph_creativity-graph__kg_ping()
 
 ---
 
+## Tutorial — using creativity-graph (no jargon)
+
+A plain-English walkthrough for using the plugin **after it's installed and configured** (the two sections
+above). No coding — you'll type a few short commands and ask questions in normal words.
+
+### What this plugin does, in one breath
+
+You give it a document full of ideas — a theory, an essay, a set of notes. It reads that document and builds
+a **map of the ideas and how they connect** — and it **checks every connection against your original text**
+instead of taking it on faith. It will never tell you "this idea is good." It only tells you which claims
+actually hold up against what you wrote, and which ones don't.
+
+Think of it as a careful research assistant who refuses to repeat a claim back to you unless they can point
+to the exact sentence that supports it.
+
+### Two ways things happen
+
+1. **Commands you type yourself.** These start with a slash (`/`), like `/kg-build`. You type them straight
+   into Claude Code — these are the main buttons you press.
+2. **Helpers Claude runs for you.** These have names like `kg_ping` (no slash). You *don't* type these — you
+   just ask Claude in plain English ("check that the creativity-graph server is running") and it runs the
+   right helper behind the scenes. The slash commands use these helpers automatically.
+
+**Rule of thumb: anything with a `/`, you type. Anything without a `/`, you just ask for in normal words.**
+
+> **About the brackets below.** `<angle brackets>` mean a detail you **must** fill in; `[square brackets]`
+> mean an **optional** detail you can leave off for a sensible default. (Same notation as the rest of this
+> README.)
+
+### The steps
+
+**Step 1 — Point it at your document.** The map is built from one specific document, set as the `source_path`
+option on the configure screen (see *The install config screen* and the *userConfig* table just above).
+Just trying it out? The repo ships a demo document at `examples/source.md`.
+
+**Step 2 — Check it's awake.** Before building, make sure the plugin is connected and running. There's no
+command to type — just ask Claude something like:
+
+> "Check that the creativity-graph server is running and show me its settings."
+
+Claude runs the health check (`kg_ping`) and reports back the version and your settings. (You can also type
+`/mcp` to see every connected server and confirm `creativity-graph` is in the list.)
+
+**Step 3 — Build the map.**
+
+```
+/kg-build [source_path]
+```
+
+Leave `[source_path]` off to use the document from your settings (Step 1); add a path to build from a
+different file just this once. Claude reads your document section by section — several sections at once, so
+it's quick — and builds the map. Every connection it draws has to quote an exact phrase from your document;
+if it can't, that connection is thrown out. When it finishes, you have a first draft of the map. *(There's
+also an optional speed setting, `extract_wave_size`, in the config table above — you can ignore it to start.)*
+
+**Step 4 (optional) — Check the map is accurate.**
+
+```
+/kg-eval [graph.json]
+```
+
+Grades how accurate the map is *before* you rely on it (leave the bracket off to grade the current map). If
+the score is too low, the map isn't trustworthy yet, and you'd want to revisit your source document.
+
+**Step 5 — Fact-check the connections.**
+
+```
+/kg-ground [query-or-node-filter]
+```
+
+The heart of the plugin. It goes through every connection that hasn't been checked yet and decides whether
+it really holds up — keeping the good ones, rejecting the vague or unsupported ones, and even actively trying
+to *disprove* the strongest claims. Anything that fails is kept on record as a known weakness, **not** quietly
+deleted. Leave the bracket off to check everything not yet checked; add a topic or area to check just that part.
+
+**Step 6 — Ask questions.**
+
+```
+/kg-query <question>
+```
+
+The question is **required** — it's the thing you want answered. For example:
+
+```
+/kg-query What does the document say about compression?
+```
+
+Claude answers using only what's in the map, and for every part of its answer it shows you the supporting
+evidence and whether that evidence has been fact-checked. If something hasn't been verified, it says so
+instead of pretending it's solid.
+
+**Step 7 (optional) — Test whether it actually helps.**
+
+```
+/kg-experiment [prompts_path]
+```
+
+Runs a fair test of whether the map genuinely helps you come up with ideas, compared to not using it — so you
+find out whether it's worth the effort instead of assuming (leave the bracket off to use the built-in prompts).
+
+### A few things worth knowing
+
+- **Your map is a set of plain files you can edit by hand.** They live in a `canon` folder inside your
+  project, one file per idea. Nothing is hidden in a black box.
+- **You can't break it by deleting the working copy.** The plugin keeps a separate, regenerable copy for
+  speed; if it ever gets messy, you can rebuild it and lose nothing.
+- **The usual order is:** point at a document → build → (check) → fact-check → ask questions. The two optional
+  steps (`/kg-eval`, `/kg-experiment`) are about measuring quality, not everyday use.
+
+### Command cheat sheet
+
+| Command | What it does | The detail in brackets |
+| --- | --- | --- |
+| `/kg-build [source_path]` | Build the map of ideas | *Optional:* a document to build from (defaults to your settings) |
+| `/kg-ground [query-or-node-filter]` | Fact-check the connections | *Optional:* limit it to one topic or area (defaults to everything) |
+| `/kg-query <question>` | Ask a question, answered from the map | **Required:** your question |
+| `/kg-eval [graph.json]` | Grade how accurate the map is | *Optional:* which map file to grade (defaults to the current one) |
+| `/kg-experiment [prompts_path]` | Test whether the map really helps | *Optional:* a file of test prompts (defaults to the built-in set) |
+
+There are a few more advanced commands — generating new idea candidates, a second-document stress test, and a
+visual export — covered in *The workflow* below. And remember: the status check (`kg_ping`) and the other
+behind-the-scenes helpers have **no** slash; you just ask Claude for them in plain words.
+
+---
+
 ## Component layout
 
 ```
@@ -316,6 +441,9 @@ creativity-graph/
 ---
 
 ## The workflow
+
+> New here? The *Tutorial — using creativity-graph (no jargon)* section above is the plain-English version of
+> everything below. This section is the technical reference, with every command and the design rationale.
 
 ```
 /kg-build  →  /kg-ground  →  /kg-generate  →  /kg-ground  →  /kg-query
