@@ -253,13 +253,18 @@ generic runner — `scripts/validate_plugin.py` is the hard gate).
 
 ### 2. Bump the version
 
-Set the **same** version string in **all four** version-bearing files — `validate_plugin.py` (the CI
-hard gate) cross-checks every one against the plugin manifest, so missing any of them trips CI:
+Set the **same** version string in **all five** places below. `validate_plugin.py` (the CI hard gate)
+cross-checks the **first four** against the plugin manifest, so a mismatch in any of those trips CI
+directly. The **fifth** is a runtime "release gate" assertion that `validate_plugin.py` does **not** see —
+only the full `pytest` suite catches a stale literal there — so after a bump always run `uv run pytest`,
+not just the validator:
 
 - `.claude-plugin/plugin.json` → `version`
 - `.claude-plugin/marketplace.json` → the `creativity-graph` entry's `version`
 - `pyproject.toml` → `[project]` `version`
 - `scripts/kg_engine/__init__.py` → `__version__`
+- `tests/test_e2e_generative.py` → the `test_end_to_end_generative_loop` version stamp
+  (`assert engine.kg_ping()["version"] == __version__ == "<X.Y.Z>"`)
 
 Follow SemVer. Update `CHANGELOG.md`: move items out of `[Unreleased]` under the new version.
 

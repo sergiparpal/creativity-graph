@@ -495,3 +495,54 @@ def test_no_source_yields_empty_stale_list(vault):
     eng.canon.write_nodes([node], message="seed grounded")
     eng.projector.project()
     assert eng.projector.kg_context()["advisory"]["stale_verdicts"] == []  # no source -> no divergence
+
+
+# --------------------------------------------------------------------------- _head git-wedge guard
+# Regression for the watchdog exit-71 crash: in the detached MCP server, projector._head() shelled out
+# to `git rev-parse HEAD` with no timeout, no stdin redirect, and no non-git guard. On a non-git canon
+# (e.g. a cloud-synced Documents folder) or when git hangs on a prompt, subprocess.run() blocked
+# forever, the handler exceeded KG_HANDLER_TIMEOUT, and the supervisor force-exited the engine.
+
+
+def test_head_empty_on_non_git_canon_without_spawning_git(tmp_path, monkeypatch):
+    import kg_engine.projector as projector_mod
+    canon = Canon(tmp_path / "nogit")  # a fresh canon dir with NO .git — not the git-backed vault
+    proj = Projector(canon)
+
+    def _must_not_spawn(*a, **k):  # the .git guard must short-circuit before any git fork
+        raise AssertionError("git must not be spawned on a non-git canon")
+
+    monkeypatch.setattr(projector_mod.subprocess, "run", _must_not_spawn)
+    assert proj._head() == ""
+
+
+def test_head_empty_when_git_hangs(canon: Canon, monkeypatch):
+    # git-backed canon (the .git guard passes), but git itself wedges -> a bounded _head() must degrade
+    # to "" rather than let the TimeoutExpired propagate into the projection handler.
+    import kg_engine.projector as projector_mod
+    proj = Projector(canon)
+
+    def _hang(*a, **k):
+        raise projector_mod.subprocess.TimeoutExpired(cmd="git", timeout=5)
+
+    monkeypatch.setattr(projector_mod.subprocess, "run", _hang)
+    assert proj._head() == ""
+
+
+def test_project_succeeds_on_non_git_canon(tmp_path):
+    # End-to-end SMOKE test of the non-git projection path: a full project() over a canon with no .git
+    # lands an empty commit pin and a fresh derived layer. NB this does not by itself reproduce the
+    # exit-71 hang (a non-git `git rev-parse` returns fast in a normal shell — the wedge only manifests
+    # in the detached server) — the two _head tests above are the real regression guards; this just
+    # pins the observable contract on the real-world failure shape (canon on a non-repo filesystem).
+    canon = Canon(tmp_path / "nogit2")
+    nodes = [
+        Node(id="a", label="A", node_type="compression",
+             edges=[Edge(source="a", target="b", relation="grounds", span="s1")]),
+        Node(id="b", label="B", node_type="claim"),
+    ]
+    canon.write_nodes(nodes, message="seed", commit=False)  # commit=False: no git on a non-git vault
+    proj = Projector(canon)
+    report = proj.project()
+    assert report.built_from_commit == ""  # non-git canon has no HEAD
+    assert report.n_nodes == 2 and proj.is_stale() is False

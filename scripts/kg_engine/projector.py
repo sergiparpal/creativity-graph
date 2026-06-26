@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -223,8 +224,26 @@ class Projector:
 
     # ---- helpers
     def _head(self) -> str:
-        r = subprocess.run(["git", "-C", str(self.canon.root), "rev-parse", "HEAD"],
-                           capture_output=True, text=True)
+        # NEVER let a git invocation wedge projection. _head() runs inside _project_locked on every
+        # real reprojection; in the DETACHED MCP server process a `git` call with an inherited/absent
+        # stdin can block forever on a credential/identity prompt, and on a NON-GIT canon (e.g. a
+        # cloud-synced Documents folder) there is no HEAD to read anyway. A wedged _head() exceeds
+        # KG_HANDLER_TIMEOUT and the supervisor force-exits the engine (exit 71), dropping the MCP
+        # connection on the next stale reprojection. So: skip git entirely without a .git entry
+        # (.exists() — not .is_dir() — so a `.git` FILE worktree/submodule still counts), and bound +
+        # de-prompt the call for the git-repo case, degrading to "" on any timeout/spawn failure.
+        root = self.canon.root
+        if not (root / ".git").exists():
+            return ""  # non-git canon has no HEAD; never spawn git
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True, text=True,
+                timeout=5, stdin=subprocess.DEVNULL,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"},
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return ""  # a hung/absent git degrades to an empty commit pin; the projector tolerates it
         return r.stdout.strip() if r.returncode == 0 else ""
 
     @staticmethod

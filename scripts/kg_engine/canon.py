@@ -63,11 +63,28 @@ GROUND_AUDIT = ".kg-ground-audit.jsonl"
 # --------------------------------------------------------------------------- git helpers
 
 
+# Hardening shared by every git invocation (this is the lowest layer, like GROUND_AUDIT above): bound
+# the wait, DETACH stdin so git can never block on a credential/identity prompt, and disable terminal
+# prompts + the optional .git/index lock. A git call in the detached MCP server process must never be
+# able to wedge a tool handler — a wedged handler exceeds KG_HANDLER_TIMEOUT and the supervisor
+# force-exits the engine (exit 71). 5s is generous for the only commands we run (rev-parse/add/commit
+# on a local repo).
+_GIT_TIMEOUT_S = 5.0
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, check=check,
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, check=check,
+            timeout=_GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # A hung or unspawnable git degrades to a NON-ZERO result instead of hanging/raising. Every
+        # production caller passes check=False and reads .returncode, so this reads as "git
+        # unavailable": _git_ok -> False (skip the best-effort commit), never a wedged handler.
+        return subprocess.CompletedProcess(["git", "-C", str(repo), *args], 1, "", "")
 
 
 def _git_ok(repo: Path) -> bool:

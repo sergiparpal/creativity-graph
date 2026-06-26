@@ -14,6 +14,31 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-06-26
+
+A follow-up to the transport/cancellation resilience pass: close one more way the MCP server could
+"disconnect" — a `git` subprocess wedging a tool handler until the watchdog force-exits the engine
+(**exit 71**).
+
+### Fixed
+
+- **`projector._head()` can no longer wedge projection on a non-git canon or a hung `git`.** `_head()`
+  runs inside `_project_locked` on every real reprojection and shelled out to `git rev-parse HEAD` with
+  no timeout, no stdin redirect, and no non-git guard. In the **detached MCP server process** that git
+  call could block forever when the canon lives on a non-git filesystem (e.g. a cloud-synced `Documents`
+  folder) or when git tried to prompt with no attached console — the handler then exceeded
+  `KG_HANDLER_TIMEOUT` and the supervisor watchdog killed the engine with **exit 71**, closing the MCP
+  connection on the next *stale* reprojection (every `kg_export`/`kg_metrics`/`kg_generate`/… after any
+  canon change). `_head()` now returns `""` immediately when the canon has no `.git` (never forking
+  git), and hardens the git-repo case with `timeout=5`, `stdin=DEVNULL`, and
+  `GIT_TERMINAL_PROMPT=0`/`GIT_OPTIONAL_LOCKS=0`, degrading to `""` on any timeout/spawn failure.
+- **Same hardening applied to every other git invocation in the engine.** `canon._git` (used by the
+  best-effort canon-commit path of `kg_write`/`kg_rename` and by `_git_ok`) now bounds the wait, detaches
+  stdin, and disables terminal prompts/optional locks, degrading a hung/absent git to a non-zero result
+  (every caller passes `check=False` and reads `.returncode`, so a wedged git reads as "git unavailable"
+  → skip the commit, never a hung handler). `canonmerge._git_merge_file` (the merge-driver 3-way merge)
+  gains the same `timeout`/`stdin=DEVNULL` posture and now also recovers from `TimeoutExpired`.
+
 ## [0.5.0] — 2026-06-26
 
 A **transport / cancellation resilience** pass. Over a full 19-section build the MCP server would

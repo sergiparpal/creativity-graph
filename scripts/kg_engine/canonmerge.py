@@ -192,8 +192,14 @@ def _git_merge_file(base_text: str, ours_text: str, theirs_text: str) -> tuple[s
                 # silently corrupted note as a clean merge (defeats byte-identical-canon). surrogate-
                 # escape round-trips any odd byte rather than raising into main's broad except.
                 encoding="utf-8", errors="surrogateescape",
+                # Same git-hardening posture as canon._git: bound the wait and detach stdin so a
+                # wedged git (a merge driver runs inside `git merge`/checkout) can never hang the
+                # invoking git operation. merge-file is a pure local 3-way merge of these temp files —
+                # no repo/remote, so a prompt is unreachable — but de-prompt anyway for consistency.
+                timeout=5, stdin=subprocess.DEVNULL,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"},
             )
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return _manual_conflict(ours_text, theirs_text)
     # git merge-file: 0 == clean; a positive count == that many conflict hunks; 255 (-1) == internal error.
     if r.returncode == 0:
