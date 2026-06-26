@@ -161,11 +161,25 @@ edit, or a non-git vault — still reprojects.
 - `canonmerge`: `merge_nodes` / `merge_note_files` / `main` — the R5 semantic git merge driver for
   per-node canon Markdown (union edges by `edge_id`, demote a cross-branch verdict conflict to
   `unverified`); structurally incapable of forging a verdict.
-- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 17 tools: `kg_ping`,
+- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 18 tools: `kg_ping`,
   `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`
   (read-only structural agenda), `kg_export` (read-only human-facing render), `kg_write`, `kg_ground`,
-  `kg_rename`, `kg_metrics`, plus the four generative-layer tools `kg_propose`, `kg_generate`, `kg_operate`,
+  `kg_rename`, `kg_metrics`, `kg_status`, plus the four generative-layer tools `kg_propose`, `kg_generate`, `kg_operate`,
   `kg_absorption`.
+- `server` **transport/cancellation resilience (v0.5.0):** `kg_write` is idempotent — every response carries
+  a deterministic `receipt` (a hash over the sorted payload target ids) and an optional `idempotency_key`
+  replays the cached response verbatim (`idempotent_replay`) on a retry whose transport result was lost; a
+  rolled-back batch is never cached. **Writes never pass through the projection seam**
+  (`kg_write`/`kg_propose`/`kg_ground`/`kg_rename` touch only the canon), and a reprojection that raises
+  degrades the **read** path — logs, sets `projection_degraded`, materialises an empty-schema derived layer,
+  serves canon-derived/empty data with the flag — instead of crashing. `kg_status` is a projection-FREE
+  canon-only probe (counts, the `unverified` queue, source-section coverage) for resuming a partial build.
+  `configure_logging` writes a rotating `<KG_DATA>/server.log`; the tool envelope (`_tool_result`) converts
+  any `Exception` (incl. `BrokenPipeError`/`EOFError`/`ConnectionResetError`) into a structured `{ok:false}`
+  result while letting `CancelledError`/`KeyboardInterrupt`/`SystemExit` propagate; a handler watchdog
+  (`KG_HANDLER_TIMEOUT`, default 300 s) force-exits a wedged handler. The out-of-process recovery layer is the
+  Node **supervisor** `scripts/launch_server.mjs` (heals + relaunches a startup crash in place; exits cleanly
+  on a post-init crash so the client re-handshakes).
 
 All filesystem state goes under `${KG_DATA}` (derived, caches, locks may live with canon under
 `${KG_PROJECT_DIR}`); `${CLAUDE_PLUGIN_ROOT}` is read-only bundled code.

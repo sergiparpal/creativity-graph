@@ -14,9 +14,10 @@ call never crashes the session; success returns and domain `{ok:false}` results 
 
 A plugin-bundled MCP server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>` — here both the
 plugin and the server are named `creativity-graph`, so every tool is `mcp__plugin_creativity-graph_creativity-graph__<tool>`
-(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **seventeen** are the **only**
+(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **eighteen** are the **only**
 graph tools — the eleven verify/read tools (§1.1–§1.11) plus the four generative-layer tools (§1.12–§1.15)
-plus the read-only `kg_agenda` (§1.16) and `kg_export` (§1.17). There is no `kg_build` / `kg_query` /
+plus the read-only `kg_agenda` (§1.16), `kg_export` (§1.17), and the projection-free `kg_status` (§1.18).
+There is no `kg_build` / `kg_query` /
 `kg_project` MCP tool — those are slash commands (`/kg-build`, …) that *orchestrate* these tools.
 
 Mutation tools (`kg_write`, `kg_propose`, `kg_ground`, `kg_rename`) write the **canon** (human-editable Markdown,
@@ -27,7 +28,10 @@ generative reads (`kg_generate` §1.13, `kg_absorption` §1.15) read the **deriv
 `projector.is_stale()` — a content-driven check (a cheap per-note `(name, size, mtime)` signature pre-gate,
 then an authoritative per-node content-hash comparison), regardless of git HEAD, so an uncommitted edit
 still reprojects. The derived layer contains nothing the canon does not (§1.2) and never prunes failure
-memory (§1.7).
+memory (§1.7). A reprojection that raises does not crash the read: it is logged, `projection_degraded` is set,
+an empty-schema derived layer is materialised, and the tool serves canon-derived/empty data with that flag
+merged into its result (a list-returning read like `get_neighbors` can't carry the flag, so it returns `[]`).
+Writes never pass through this seam.
 
 ### 1.1 `mcp__plugin_creativity-graph_creativity-graph__kg_ping()`
 
@@ -64,7 +68,7 @@ local canon.
 For the no-PII demo source (`examples/source.md`), `kg_scrub` is a **no-op**: `redactions: 0`,
 `categories: []`, and `scrubbed` equals the source verbatim.
 
-### 1.3 `mcp__plugin_creativity-graph_creativity-graph__kg_write(payload: dict)`
+### 1.3 `mcp__plugin_creativity-graph_creativity-graph__kg_write(payload: dict, idempotency_key: str | None = None)`
 
 The boundary (§1.5). Validates an extraction payload, writes ACCEPTED/DEMOTED nodes & edges to the canon,
 quarantines or rejects the rest. `payload` is the write contract (see `references/contract.md` / the shared
@@ -81,6 +85,7 @@ REJECTED as `truncated-payload`.
      "disposition": "REJECTED", "reason": "span-not-in-source", "retryable": false}
   ],
   "written_nodes": ["generality-confound", "specificity", "compression"],
+  "receipt": "rcpt_3f2a…",
   "rolled_back": false,
   "error": null
 }
@@ -95,6 +100,13 @@ REJECTED as `truncated-payload`.
   span-not-in-source; **`true`** for TRANSPORT — truncation, schema-invalid).
 - `written_nodes[]` — node ids actually committed (includes boundary-auto-created placeholder source nodes).
 - `rolled_back` / `error` — `rolled_back` is `true` (and `error` carries the failure message) when the multi-file canon write could not commit and was rolled back.
+- `receipt` — a deterministic token: a short hash over the SORTED set of the payload's target ids (node ids +
+  derived edge ids). Same payload → same `receipt`, across restarts.
+- `idempotency_key` (optional arg) — re-sending an identical write (same payload ⇒ same `receipt`) with the
+  same key after a lost transport response is a TRUE no-op: the cached response is replayed VERBATIM with
+  `idempotent_replay: true` (no re-validation, no second write). A reused key with a DIFFERENT payload is NOT
+  replayed (a logged caller error; the new write is processed). A rolled-back batch is never cached, so a
+  transient failure is still retryable.
 
 A write may never set a non-`unverified` state or claim parser/human authorship: such payloads are
 **DEMOTED** — any verdict or `obsolete` is reset to `unverified` (`forged-verdict-stripped`); `human` →
@@ -423,6 +435,43 @@ dir. `kind ∈ {html, report, all}` (default `all`).
   (`projector.py` stays their sole writer). Cannot forge a verdict or bypass span-present. Also: CLI
   `python -m kg_engine.export html|report|all` and the `/kg-view` command.
 
+### 1.18 `mcp__plugin_creativity-graph_creativity-graph__kg_status()`
+
+A cheap, **projection-FREE** status + coverage probe. Reads ONLY the canon (and the source text for coverage);
+it **never** triggers or refreshes the derived layer (unlike `kg_metrics`, which serves off the index when
+fresh), so it is safe and instant even mid-build. Use it to confirm build progress and **resume a partial
+build** after a transport hiccup without grepping the filesystem. No args.
+
+```json
+{
+  "ok": true,
+  "version": "<__version__>",
+  "nodes": 113,
+  "edges": 180,
+  "edges_by_epistemic_state": {"unverified": 150, "grounded": 25, "failed": 5},
+  "nodes_by_epistemic_state": {"unverified": 113},
+  "unverified_edges": 150,
+  "coverage": {
+    "files": [{"file": "source.md", "covered": true, "sections": 19, "covered_sections": 12}],
+    "sections": [{"file": "source.md", "title": "The boundary", "covered": true}]
+  },
+  "derived_present": true,
+  "projection_degraded": null
+}
+```
+
+- `unverified_edges` — the still-`unverified` grounding-queue size (the `/kg-ground` backlog).
+- `coverage` — which source files / `##` sections already have at least one ANCHORED (span-present) edge:
+  `files[]` (`{file, covered, sections, covered_sections}`) and per-section `sections[]`
+  (`{file, title, covered}`). A section with no covered span hasn't been extracted yet — the **resume**
+  signal. If the source can't be read it degrades to
+  `{"files": [], "sections": [], "note": "source unavailable (…)"}`.
+- `derived_present` — a path-existence check on the derived db only (no db open).
+- `projection_degraded` — echoes the last reprojection failure (a read sets it, never this probe); `null` when
+  healthy.
+
+Unlike `kg_metrics` (§1.6) this NEVER opens the derived db. Granted to `/kg-build` for the resume use.
+
 ---
 
 ## 2 · Deterministic CLI surface
@@ -578,6 +627,7 @@ The `graph` condition "wins" only if it is `>=` control on diversity AND novelty
 | set a verdict (grounded/rejected/failed/obsolete) | `kg_ground(...)` — the **only** way |
 | fix a node id everywhere | `kg_rename(old, new)` |
 | cheap counts | `kg_metrics()` |
+| projection-free status / resume a partial build | `kg_status()` |
 | browse by type/relation/state, ranked by degree | `query_graph(...)` |
 | one node + its edges | `get_node(id)` |
 | a node's edges (list) | `get_neighbors(id, relation=?)` |

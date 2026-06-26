@@ -137,8 +137,11 @@ detached background process**, so it never blocks the session. It uses `uv` when
 to the stdlib `venv` + `pip` otherwise — only Python ≥3.10 and Node (always present in Claude Code) are
 required, on Windows, macOS, Linux, or WSL/Git-Bash. The MCP server (`.mcp.json` → `node
 scripts/launch_server.mjs`) self-heals the venv in the foreground if it is spawned before the build
-finishes, so it starts cleanly on a fresh machine. See *Installation system* in `CLAUDE.md` for the
-full chain.
+finishes, so it starts cleanly on a fresh machine. The launcher is a persistent **supervisor**: it logs
+every engine lifecycle event to `<KG_DATA>/server.log`, self-heals a crashed engine, isolates a
+cancelled request to that one call (the connection stays alive), and turns a dropped stdio transport
+into a clean automatic reconnect — no manual `/mcp reconnect`. See
+*Installation system* in `CLAUDE.md` for the full chain.
 
 ### Troubleshooting install
 
@@ -456,7 +459,7 @@ creativity-graph/
 │   │   ├── canonmerge.py              # R5 semantic git merge driver for per-node canon
 │   │   └── backend.py server.py        # headless extract CLI + FastMCP server
 │   ├── bootstrap.py               # cross-platform self-provisioning installer (uv | venv+pip)
-│   ├── launch_server.mjs          # Node MCP launcher (pointer + foreground catch-up)
+│   ├── launch_server.mjs          # Node MCP supervisor (pointer + catch-up; logs lifecycle, self-heals)
 │   └── f4_probe.py                # extraction-precision scorer CLI
 └── tests/                         # pytest suite
 ```
@@ -466,21 +469,22 @@ creativity-graph/
 ## The MCP tool surface
 
 Server name `creativity-graph` ⇒ tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`. The
-**thirteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
-`query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`, `kg_export`) plus the
+**fourteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
+`kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`, `kg_export`) plus the
 **four** generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
 mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) are the
-**seventeen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
+**eighteen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
 commands).
 
 | tool | purpose |
 |---|---|
 | `kg_ping()` | `{name, version, metrics_mode, sensitivity, pack_loaded}` — health + config. |
 | `kg_scrub(text=None)` | the §1.9 **egress** scrub → `{scrubbed, redactions, sensitivity, categories}`; redacts secrets (always) + PII (per sensitivity) with consistent placeholders (`⟦SECRET:1⟧` etc.) before text reaches a subagent. No-op (0 redactions) on the no-PII demo source. |
-| `kg_write(payload)` | the span-present write boundary → `{dispositions, details[], written_nodes[], rolled_back, error}`; egress scrubbing is wired in here too — placeholder spans are restored to the original source text for the canon. |
+| `kg_write(payload, idempotency_key=None)` | the span-present write boundary → `{dispositions, details[], written_nodes[], rolled_back, error, receipt}`; egress scrubbing is wired in here too — placeholder spans are restored to the original source text for the canon. Every response carries a deterministic `receipt` (a hash of the payload's target ids); an optional `idempotency_key` makes a retry of a write whose transport response was lost a true no-op that replays the same receipt (`idempotent_replay: true`) — never a duplicate. |
 | `kg_ground(target_id, verdict, kind, note)` | **the only way to set a verdict** (always attributed to the agent — `by` is not a parameter); `verdict ∈ {grounded, rejected, failed, obsolete}`, `kind ∈ {edge, node}`. |
 | `kg_rename(old_id, new_id)` | rename a node and re-key its edges. |
 | `kg_metrics()` | `{nodes, edges, edges_by_epistemic_state}`. |
+| `kg_status()` | cheap, **projection-FREE** status + coverage probe (reads only the canon, never opens the derived db) → `{ok, version, nodes, edges, edges_by_epistemic_state, nodes_by_epistemic_state, unverified_edges, coverage:{files[],sections[]}, derived_present, projection_degraded}`; reports the `unverified` grounding-queue size and which source files/`##` sections already have an anchored edge — for confirming progress and **resuming a partial build** after a transport hiccup. |
 | `query_graph(node_type, relation, epistemic_state, limit)` | filtered `{nodes[], edges[]}`. |
 | `get_node(node_id)` | a node dict with its incident edges. |
 | `get_neighbors(node_id, relation)` | `[edge dicts]`. |

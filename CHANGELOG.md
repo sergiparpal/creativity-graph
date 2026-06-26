@@ -14,6 +14,84 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-26
+
+A **transport / cancellation resilience** pass. Over a full 19-section build the MCP server would
+"disconnect" / hang — tool calls stuck in *Running…*, the server marked disconnected, needing a manual
+`/mcp reconnect` or app restart — even though every canon write actually committed to disk. The work
+succeeded server-side; the *result* failed to return and the process died with no trace. Root cause:
+broken cancellation/transport handling in the stdio server (a client cancelling a request mid-flight, now
+more frequent because `/kg-build` fires several concurrent requests per wave), compounded by **zero
+persisted diagnostics**. This release is defense-in-depth: make the plugin crash-proof, self-healing,
+idempotent, resumable, and projection-decoupled so a lost response or a dead transport is survivable.
+
+### Added
+
+- **`scripts/launch_server.mjs` is now a SUPERVISOR, not a one-shot launcher.** The Node process is a
+  persistent parent that spawns the Python engine as a child, logs every lifecycle event, and recovers
+  according to *when* the engine died — because with `stdio:"inherit"` Node cannot replay MCP's
+  per-connection `initialize` handshake, so the two cases are genuinely different:
+  - A **startup failure** (crash before the engine served `initialize`, e.g. an import error against a
+    half-built venv) leaves the client's `initialize` buffered, unread, on the inherited stdin — so a
+    one-time venv **heal + in-place relaunch** (capped exponential backoff 200 ms → 5 s; **crash-loop
+    guard** of ≤ 5 startup retries / 60 s then a clean logged exit) self-heals the cold-start race while
+    keeping the parent — and the client pipe — alive.
+  - A **post-init crash** (the engine had already answered `initialize`) **exits cleanly** instead of
+    relaunching: relaunching onto the held-open, already-handshaked pipe would strand an *uninitialized*
+    engine (the client never re-handshakes and gets no EOF — a connection that looks alive but is dead,
+    *worse* than a clean disconnect). Exiting closes the pipe so the client detects the drop and reconnects
+    with a fresh handshake. (Fully transparent post-init restart would need Node to *proxy* the stream and
+    replay the handshake — a larger change, deliberately deferred.)
+
+  The restart **policy is the pure, exported `restartDecision` / `backoffFor`**, unit-tested by driving the
+  real `createSupervisor` loop with a fake engine (startup heal+retry, backoff, crash-loop cap, clean
+  shutdown, post-init clean-exit, and prompt exit on a SIGTERM mid-backoff).
+- **Rotating server log at `<KG_DATA>/server.log`** (`server.py:configure_logging`, next to `provision.log`).
+  Every uncaught exception (main + worker threads, via `sys`/`threading` excepthooks), every tool-handler
+  error (full traceback), and every supervisor (re)launch / exit / backoff decision now land in a
+  size-bounded, rotated file (2 MB × 3). This was the single biggest debuggability gap — the whole crash
+  class was previously invisible.
+- **`kg_status` — a cheap, projection-FREE status + coverage probe (18th MCP tool).** Reads the canon only
+  (never triggers or refreshes the derived db), returning node/edge counts, edges by epistemic state, the
+  still-`unverified` grounding-queue size, and which source files / `##` sections already have an anchored
+  edge — so a partial build can be **confirmed and resumed** after any transport hiccup without grepping the
+  filesystem. Granted to `/kg-build` for exactly that resume use.
+- **A handler watchdog (`KG_HANDLER_TIMEOUT`, default 300 s; 0 disables).** FastMCP runs sync tools directly
+  on the event loop, so a wedged handler (a deadlocked write, a runaway projection) blocks everything with
+  no recovery. An observer thread dumps every thread's stack to the log and forces a clean process exit so
+  the supervisor relaunches a fresh process — never a half-dead *Running…* state. Crash-safe canon I/O +
+  idempotent receipts make the hard exit recoverable.
+
+### Changed
+
+- **`kg_write` is now idempotent with a deterministic receipt.** Every response carries a `receipt` (a hash
+  of the payload's target ids — same payload → same receipt, across restarts), and an optional
+  `idempotency_key` makes re-sending an identical write (after a lost transport response) a **true no-op
+  that replays the SAME receipt + dispositions** (`idempotent_replay: true`) instead of a confusing
+  all-deduped second pass. Validation is never weakened — only an exact repeat key short-circuits; without a
+  key the write is still idempotent by canonical id. A rolled-back batch is never cached, so a transient
+  failure can be retried for real.
+- **The read path degrades instead of crashing on a projection failure.** A reprojection that raises (a
+  sqlite hiccup, a native-dep blowup in community detection, a corrupt derived db) now logs, sets a
+  `projection_degraded` flag, materialises an empty-schema derived layer, and serves canon-derived/empty
+  data with the flag — rather than surfacing an exception. **Writes never come through the projection seam**
+  (`kg_write` / `kg_propose` / `kg_ground` / `kg_rename` touch only the canon), so projection can never
+  block or fail a write (now regression-tested).
+
+### Fixed
+
+- **A cancelled / broken-pipe request aborts ONLY that request; the server keeps serving.** The uniform tool
+  envelope (`_tool_result`) turns a `BrokenPipeError` / `EOFError` / `ConnectionResetError` (or any
+  `Exception`) into a structured `{ok:false, …}` result + a logged traceback instead of letting it bubble
+  into the serve loop, and the next call is served normally. It deliberately catches `Exception`, **not**
+  `BaseException`, so cooperative cancellation (`asyncio.CancelledError`) and shutdown
+  (`KeyboardInterrupt`/`SystemExit`) still propagate. The serve loop logs and exits with a distinct non-zero
+  code on an unexpected crash (so the supervisor relaunches) and exits 0 on a clean client disconnect.
+- **Graceful native-dep degradation kept as hygiene.** Community detection already falls back from
+  `leidenalg` to label propagation; a regression guard now imports `networkx`/`igraph`/`leidenalg` and runs
+  a full `Projector.project(incremental=False)` over a fixture canon, documenting that the native deps are
+  **not** the crash cause (the ruled-out hypothesis).
+
 ## [0.4.2] — 2026-06-26
 
 ### Added

@@ -137,7 +137,8 @@ prose edges `deterministic`.
    b. Identify the relations → **edges**. For each, choose the pack `relation`, set `source`/`target` to the
       node slugs, and **copy the verbatim span** that states it.
    c. Assemble ONE payload with `complete: true` and call `mcp__plugin_creativity-graph_creativity-graph__kg_write`.
-3. Read the return: `{dispositions, details[], written_nodes[], rolled_back, error}`. Report the
+3. Read the return: `{dispositions, details[], written_nodes[], rolled_back, receipt, error}` (`receipt` is
+   a deterministic hash of the payload's target ids — same payload → same receipt). Report the
    `dispositions` counts (ACCEPTED / DEMOTED / QUARANTINED / REJECTED) and any DEMOTED/QUARANTINED/REJECTED
    `details` (each has `kind`, `id`, `disposition`, `reason`, `retryable`).
 4. **Retry policy:**

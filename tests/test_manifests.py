@@ -211,6 +211,13 @@ def test_generative_layer_tools_are_registered():
     assert {"kg_propose", "kg_generate", "kg_operate", "kg_absorption"} <= valid
 
 
+def test_kg_status_registered():
+    """Transport-resilience pass: the projection-free status/coverage probe is registered as an
+    @mcp.tool() (an 18th tool) so a session can confirm progress / resume a partial build without
+    grepping the filesystem."""
+    assert "kg_status" in _registered_mcp_tools()
+
+
 def test_kg_agenda_registered():
     """R6: the read-only agenda tool is registered as a 16th @mcp.tool() (register-before-reference —
     kg-query.md / kg-ground.md grant it, and test_all_commands_and_agents_declare_only_existing_tools

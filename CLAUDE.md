@@ -140,13 +140,34 @@ grounding loop is the post-hoc filter, and promotion (`kg_ground` with support) 
 Evaluation **measures, never gates** (§4): below-threshold results iterate up to 3× then record the
 best and proceed — no human gate blocks the flow. Results are appended to `PROGRESS.md`.
 
-## MCP tool surface (17 tools)
+## MCP tool surface (18 tools)
 
 Namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`:
-- **Mutations (write canon):** `kg_write` (the boundary), `kg_propose` (the *hypothesized* write lane — forces hypothesized provenance, refuses text claims), `kg_ground` (the *sole* verdict gateway — stamps `verdict_by`/`verdict_at` + audit record; `support_span`/`support_note` promote a hypothesis and upgrade its provenance), `kg_rename`.
+- **Mutations (write canon):** `kg_write` (the boundary; carries a deterministic `receipt` and accepts an `idempotency_key` so a retry of a write whose transport response was lost replays the same receipt — never a duplicate), `kg_propose` (the *hypothesized* write lane — forces hypothesized provenance, refuses text claims), `kg_ground` (the *sole* verdict gateway — stamps `verdict_by`/`verdict_at` + audit record; `support_span`/`support_note` promote a hypothesis and upgrade its provenance), `kg_rename`. None of these touch the projection seam, so a projection failure can never block a write.
 - **Generative (read derived → propose; §2–§14):** `kg_generate` (six discovery mechanisms, read-only), `kg_operate` (the four §8 endo operations, write via the propose lane), `kg_absorption` (the §14 absorption window).
-- **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` (grounded `items[]` + a separate `hypotheses[]` + `advisory.bridge_metric`), `kg_agenda` (read-only structural "suggested questions" — R6; `answerable_now[]` vs `blocked_on_grounding[]`), `kg_export` (read-only human-facing render — R1; a self-contained `graph.html` + `GRAPH_REPORT.md`). Both read through the shared read-only `_agenda_reader()` seam; neither writes the derived layer.
-- **Utility:** `kg_ping`, `kg_metrics`, `kg_scrub` (egress PII/secret redaction with consistent placeholders; `kg_write` restores placeholders to original text for the canon).
+- **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` (grounded `items[]` + a separate `hypotheses[]` + `advisory.bridge_metric`), `kg_agenda` (read-only structural "suggested questions" — R6; `answerable_now[]` vs `blocked_on_grounding[]`), `kg_export` (read-only human-facing render — R1; a self-contained `graph.html` + `GRAPH_REPORT.md`). Both read through the shared read-only `_agenda_reader()` seam; neither writes the derived layer. A reprojection that raises degrades the read (a `projection_degraded` flag over canon-derived/empty data) rather than crashing the tool.
+- **Utility:** `kg_ping`, `kg_metrics`, `kg_status` (cheap, **projection-FREE** status + coverage probe — canon-only counts, the `unverified` queue size, and which source files/`##` sections already have an anchored edge; for confirming progress and **resuming a partial build** after a transport hiccup), `kg_scrub` (egress PII/secret redaction with consistent placeholders; `kg_write` restores placeholders to original text for the canon).
+
+### Transport / cancellation resilience (the robustness layer)
+
+The deterministic engine is wrapped in defense-in-depth so a cancelled request, a broken stdio pipe, or a
+crashed engine process is survivable without manual `/mcp reconnect`:
+- **`launch_server.mjs` is a supervisor** (not a one-shot launcher): a persistent Node parent that logs
+  every engine lifecycle event and recovers by *when* the engine died. With `stdio:"inherit"` Node can't
+  replay MCP's per-connection `initialize`, so a **startup** failure (crash before serving `initialize`;
+  its request is still buffered) is healed + relaunched in place (capped backoff + crash-loop cap), while a
+  **post-init** crash **exits cleanly** so the client reconnects with a fresh handshake (relaunching onto
+  the already-handshaked pipe would strand an uninitialized engine). Policy is the pure, exported
+  `restartDecision`/`backoffFor`; the loop is `createSupervisor`, both unit-tested by driving a fake engine.
+- **`server.py:configure_logging`** writes a rotating `<KG_DATA>/server.log` (every uncaught exception,
+  tool-handler error with traceback, and supervisor relaunch/exit/backoff) — the diagnostics that were
+  previously absent.
+- **The tool envelope (`_tool_result`)** turns any `Exception` (incl. `BrokenPipeError`/`EOFError`/
+  `ConnectionResetError`) into a structured result so only that request aborts; it never swallows
+  `CancelledError`/`KeyboardInterrupt`/`SystemExit` (cooperative cancellation/shutdown still propagate).
+- **A handler watchdog** (`KG_HANDLER_TIMEOUT`, default 300 s; 0 disables) force-exits a wedged handler so
+  the supervisor relaunches a fresh process instead of hanging in *Running…*. Crash-safe canon I/O +
+  idempotent `kg_write` receipts make the hard exit recoverable.
 
 ## Installation system (cross-platform engine provisioning)
 

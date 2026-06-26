@@ -7,10 +7,17 @@ so the flow never stalls (§2.4, §4).
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
+from collections import Counter, OrderedDict
 import math
 import os
+import sys
+import threading
+import time
+import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from . import __version__
@@ -45,6 +52,192 @@ VALID_VERDICTS = {s.value for s in GROUNDABLE_STATES}
 # The known verdict actors, derived from the AuthoredBy enum (mirroring how VALID_VERDICTS derives from
 # GROUNDABLE_STATES) so the clamp tracks the model instead of an inline literal that can drift.
 VALID_ACTORS = {a.value for a in AuthoredBy}
+
+# ---- transport/cancellation hardening (the robustness pass) ----------------------------------------
+# A rotating server log so the whole class of stdio-transport/cancellation crash is finally debuggable:
+# nothing was persisted before, so a server that "disconnected" left no trace. Lives under KG_DATA next
+# to provision.log; the Node supervisor (launch_server.mjs) appends its (re)launch/exit/backoff events to
+# the SAME file (Python owns rotation — the supervisor's lines are a few per restart, so they ride along).
+SERVER_LOG_NAME = "server.log"
+SERVER_LOG_MAX_BYTES = 2_000_000
+SERVER_LOG_BACKUP_COUNT = 3
+# Distinct non-zero exit codes so the supervisor's logs say WHY the engine died (both are "unexpected",
+# so both trigger a relaunch — see launch_server.mjs restartDecision).
+EXIT_CRASH = 70         # an exception escaped the serve loop
+EXIT_WATCHDOG = 71      # a handler wedged past KG_HANDLER_TIMEOUT and the watchdog forced a fresh process
+# A handler that runs longer than this is treated as wedged (a deadlocked write, a runaway projection) and
+# the watchdog forces a clean process exit so the supervisor relaunches — never a half-dead "Running…"
+# state. Generous by default: the only legitimately-slow path is a cross-process lease wait (capped at
+# canon.LOCK_ACQUIRE_TIMEOUT = 30s) plus a projection, both far under this. 0 disables the watchdog.
+DEFAULT_HANDLER_TIMEOUT = 300.0
+# Idempotency: bound the in-memory replay cache so a long-lived server can't grow it without limit.
+_WRITE_CACHE_MAX = 256
+
+
+def _clean_env(key: str) -> str | None:
+    """Read an env var, treating empty OR an unsubstituted ``${...}`` placeholder as unset (mirrors
+    ``bootstrap._clean`` / ``launch_server.clean``). Lifted to module scope so the logging path and
+    ``build_engine_from_env`` resolve project/data/source identically."""
+    v = (os.environ.get(key) or "").strip()
+    return None if not v or v.startswith("${") else v
+
+
+def resolve_data_dir() -> Path:
+    """The engine data dir (where the derived layer + server.log live), resolved exactly as a
+    KGEngine would: ``KG_DATA`` if set, else ``<project>/.kg-data``. Used to place the server log
+    BEFORE the engine is constructed, so even an engine-construction error is captured."""
+    proj = _clean_env("KG_PROJECT_DIR") or _clean_env("CLAUDE_PROJECT_DIR") or os.getcwd()
+    data = _clean_env("KG_DATA")
+    return Path(data) if data else (Path(proj) / ".kg-data")
+
+
+def server_log_path(data_dir=None) -> Path:
+    return (Path(data_dir) if data_dir else resolve_data_dir()) / SERVER_LOG_NAME
+
+
+_EXCEPTHOOKS_INSTALLED = False
+
+
+def _install_excepthooks() -> None:
+    """Route uncaught exceptions (main thread AND worker threads) through the logger so the rotating
+    file captures the full traceback instead of it vanishing to an unread stderr. Idempotent."""
+    global _EXCEPTHOOKS_INSTALLED
+    if _EXCEPTHOOKS_INSTALLED:
+        return
+    prev = sys.excepthook
+
+    def _hook(exc_type, exc, tb):
+        if not issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            logger.critical("uncaught exception", exc_info=(exc_type, exc, tb))
+        prev(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+    if hasattr(threading, "excepthook"):
+        def _thook(args):
+            logger.critical("uncaught exception in thread %s",
+                            getattr(args, "thread", None),
+                            exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+        threading.excepthook = _thook
+    _EXCEPTHOOKS_INSTALLED = True
+
+
+def configure_logging(data_dir=None, *, level=logging.INFO) -> Path | None:
+    """Attach a rotating file handler to the root logger (capturing ``kg_engine`` at INFO and the
+    ``mcp`` library at WARNING) writing to ``<data_dir>/server.log``, and install the uncaught-exception
+    hooks. Best-effort: a logging-setup failure must never stop the server from coming up, so any error
+    is swallowed and None returned. Idempotent — a prior kg-server handler is replaced, so repeated calls
+    (e.g. in tests) don't accumulate handlers or duplicate lines. Returns the log path on success."""
+    try:
+        path = server_log_path(data_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "_kg_server_log", False):
+                root.removeHandler(h)
+                try:
+                    h.close()
+                except Exception:  # noqa: BLE001 — closing a stale handler must never raise here
+                    pass
+        handler = RotatingFileHandler(path, maxBytes=SERVER_LOG_MAX_BYTES,
+                                      backupCount=SERVER_LOG_BACKUP_COUNT, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s [pid %(process)d]: %(message)s"))
+        handler.setLevel(level)
+        handler._kg_server_log = True  # type: ignore[attr-defined]  # marker for idempotent replace
+        root.addHandler(handler)
+        # Records propagate to the root handler; raise each logger's own level so the records are emitted
+        # (the root level only gates records logged directly on root, not propagated ones).
+        logging.getLogger("kg_engine").setLevel(level)
+        logging.getLogger("mcp").setLevel(logging.WARNING)
+        _install_excepthooks()
+        return path
+    except Exception:  # noqa: BLE001 — logging setup is best-effort; never block server startup on it
+        return None
+
+
+class _Watchdog:
+    """A daemon thread that force-exits the process if a single MCP handler runs longer than `timeout`.
+
+    FastMCP runs sync tools directly on the event loop (no thread offload), so a wedged handler — a
+    deadlocked write, a runaway projection — blocks the whole loop and the client just sees "Running…"
+    forever with no recovery. This observer thread (it never touches the handler, only watches a
+    monotonic start stamp the tool envelope updates) breaks that: on timeout it dumps every thread's
+    stack to the log and exits, so the Node supervisor relaunches a FRESH process. Crash-safe canon I/O
+    (atomic temp+replace, the reclaimable lease) makes a hard exit recoverable; idempotent write receipts
+    make a lost in-flight response harmless to retry.
+
+    `on_trip` is injected so tests can assert a trip WITHOUT killing the test process (default os._exit)."""
+
+    def __init__(self, timeout: float, *, on_trip=None, poll: float | None = None):
+        self.timeout = float(timeout)
+        self._poll = poll if poll is not None else max(1.0, self.timeout / 10.0)
+        self._on_trip = on_trip or (lambda: os._exit(EXIT_WATCHDOG))
+        self._lock = threading.Lock()
+        self._name: str | None = None
+        self._started: float = 0.0
+        self._depth = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def enter(self, name: str) -> None:
+        with self._lock:
+            self._depth += 1
+            if self._depth == 1:
+                self._name, self._started = name, time.monotonic()
+
+    def exit(self) -> None:
+        with self._lock:
+            self._depth = max(0, self._depth - 1)
+            if self._depth == 0:
+                self._name, self._started = None, 0.0
+
+    def overdue(self, now: float | None = None) -> "tuple[str, float] | None":
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._depth > 0 and self._name is not None:
+                elapsed = now - self._started
+                if elapsed > self.timeout:
+                    return self._name, elapsed
+        return None
+
+    def start(self) -> "_Watchdog":
+        if self.timeout <= 0 or self._thread is not None:
+            return self
+        self._thread = threading.Thread(target=self._run, name="kg-watchdog", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._poll):
+            hit = self.overdue()
+            if hit:
+                name, elapsed = hit
+                self._trip(name, elapsed)
+                return
+
+    def _trip(self, name: str, elapsed: float) -> None:
+        stacks = []
+        for tid, frame in sys._current_frames().items():
+            stacks.append(f"--- thread {tid} ---\n" + "".join(traceback.format_stack(frame)))
+        logger.critical("watchdog: handler %r exceeded %.0fs (ran %.0fs); forcing a fresh process so "
+                        "the supervisor relaunches.\n%s", name, self.timeout, elapsed, "\n".join(stacks))
+        # FLUSH (don't logging.shutdown()) before the trip: the default on_trip is os._exit, which bypasses
+        # the interpreter's atexit flush, so the critical record must be pushed to disk now. shutdown()
+        # would CLOSE every handler process-wide — harmful to a still-running process and to the test suite.
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:  # noqa: BLE001 — a flush hiccup must not stop the trip
+                pass
+        self._on_trip()
+
+
+# The active watchdog, set by main(). The tool envelope (_tool_result) feeds it without changing any
+# wrapper signature (so the manifest scrape and FastMCP schema are untouched); None disables feeding.
+_WATCHDOG: "_Watchdog | None" = None
 
 
 class _SourceResolver:
@@ -121,6 +314,15 @@ class KGEngine:
         self.sensitivity = sensitivity
         self.metrics_mode = metrics_mode
         self.max_edges_per_kb = max_edges_per_kb
+        # Reason string the last reprojection failed with (None when projection is healthy). Reads serve
+        # the existing/empty derived layer with this flag set rather than raising (defense: a projection
+        # hiccup degrades a read, it never crashes a tool — see _ensure_projected).
+        self._projection_degraded: str | None = None
+        # Idempotency: an in-memory LRU of {idempotency_key → kg_write response} so re-sending an
+        # identical write (after a lost transport response) is a TRUE no-op that returns the SAME receipt
+        # and counts, not a second pass. Bounded by _WRITE_CACHE_MAX; lost on restart, but the
+        # payload-derived `receipt` + id-dedup keep a post-restart retry safe regardless (§1.4).
+        self._write_cache: "OrderedDict[str, dict]" = OrderedDict()
 
     # ---- source set (for span verification) — delegate to the shared resolver
     def source_set(self) -> SourceSet:
@@ -192,13 +394,56 @@ class KGEngine:
         parsed/displayed); names the separator once."""
         return (existing + " | " if existing else "") + addition
 
-    def kg_write(self, payload: dict, *, message: str = "kg_write", existing_nodes=None) -> dict:
+    @staticmethod
+    def _payload_receipt(payload: dict) -> str:
+        """A deterministic receipt token for a write payload: a short hash over the SORTED set of
+        canonical ids the payload targets (node ids by slug; edge ids by the deterministic
+        `edge_id(source,relation,target)`). Same payload → same receipt, independent of dedup status or
+        process restarts — so a lost transport response is harmless: re-sending the identical payload
+        yields the identical `receipt`, and "did my write land?" becomes a cheap retry rather than an
+        out-of-band read of the canon dir."""
+        from .model import edge_id as _edge_id
+        ids = []
+        for n in (payload or {}).get("nodes") or []:
+            nid = (n or {}).get("id") or (n or {}).get("label") or ""
+            ids.append("node:" + slug(str(nid)))
+        for e in (payload or {}).get("edges") or []:
+            e = e or {}
+            ids.append("edge:" + _edge_id(str(e.get("source", "")), str(e.get("relation", "")),
+                                          str(e.get("target", ""))))
+        digest = hashlib.sha1("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
+        return f"rcpt_{digest[:16]}"
+
+    def kg_write(self, payload: dict, *, message: str = "kg_write", existing_nodes=None,
+                 idempotency_key: str | None = None) -> dict:
         """Validate an extraction payload at the boundary and write accepted/demoted items.
 
         `existing_nodes` is the canon baseline used for dedup + rate-limit seeding; it defaults to a
         fresh parse (every existing call site is unchanged). The headless backend threads an
         incrementally-maintained baseline so it doesn't re-parse the entire canon once per section
-        (backend-1/server-16)."""
+        (backend-1/server-16).
+
+        **Idempotency (a lost response is harmless).** The response always carries a deterministic
+        `receipt` derived from the payload (`_payload_receipt`). If `idempotency_key` is supplied and was
+        seen before in this process WITH THE SAME PAYLOAD (same receipt), the cached response is returned
+        VERBATIM with `idempotent_replay: True` — no re-validation, no second write — so a client that
+        retries after a dropped transport result gets the IDENTICAL receipt + dispositions instead of a
+        confusing all-deduped second pass. If the same key is reused with a DIFFERENT payload (a caller
+        contract violation), the new write is NOT silently dropped: it is processed normally and re-caches
+        the key (a warning is logged). Validation is never weakened: a mismatching/first-seen key validates
+        and writes normally. Idempotency is also intrinsic without a key — kg_write dedups by canonical id,
+        so a re-send creates no duplicates regardless (§1.4)."""
+        receipt = self._payload_receipt(payload)
+        if idempotency_key:
+            cached = self._write_cache.get(idempotency_key)
+            if cached is not None:
+                if cached.get("receipt") == receipt:
+                    self._write_cache.move_to_end(idempotency_key)
+                    return {**cached, "idempotent_replay": True}
+                # same key, DIFFERENT payload: a caller error. Don't replay a stale receipt and silently
+                # drop this write — process it normally (it re-caches the key below).
+                logger.warning("idempotency_key %r reused with a different payload; processing the new "
+                               "write instead of replaying the cached receipt", idempotency_key)
         # if egress scrubbing happened this session, restore placeholder spans to the original before
         # span verification, and store the original in the canon (§1.9).
         restore = self._restore_fn()
@@ -228,14 +473,24 @@ class KGEngine:
             for d in persisted:
                 summary[d] = 0
             written = []
-        return {
+        out = {
             "dispositions": summary,
             "details": [{"kind": r.kind, "id": getattr(r.item, "id", None), "disposition": r.disposition.value,
                          "reason": r.reason, "retryable": r.retryable} for r in results],
             "written_nodes": written,
             "rolled_back": rolled_back,
             "error": (info.error if rolled_back else None),
+            "receipt": receipt,
         }
+        # Cache the response under the idempotency key (bounded LRU) so an exact retry replays it verbatim.
+        # Do NOT cache a rolled-back batch: a rollback is a transient failure (e.g. an I/O error), and a
+        # retry should be allowed to actually write, not replay the failure.
+        if idempotency_key and not rolled_back:
+            self._write_cache[idempotency_key] = out
+            self._write_cache.move_to_end(idempotency_key)
+            while len(self._write_cache) > _WRITE_CACHE_MAX:
+                self._write_cache.popitem(last=False)
+        return out
 
     def kg_propose(self, payload: dict, *, message: str = "kg_propose") -> dict:
         """Write hypothesized candidates through the boundary (PLAN Stage 1: the propose lane).
@@ -588,6 +843,72 @@ class KGEngine:
             by_state[e.epistemic_state.value] = by_state.get(e.epistemic_state.value, 0) + 1
         return {"nodes": len(nodes), "edges": len(edges), "edges_by_epistemic_state": by_state}
 
+    @staticmethod
+    def _split_sections(text: str) -> "list[tuple[str, str]]":
+        """Split a source document into (heading, body) by level-2 `## ` headings — the SAME unit
+        `/kg-build` extracts per subagent. Text before the first `##` is the `(preamble)`. `### ` and
+        deeper stay inside their `##` section's body."""
+        sections: list[tuple[str, str]] = []
+        title, buf = None, []
+        for line in text.splitlines():
+            if line.startswith("## ") and not line.startswith("### "):
+                if title is not None or buf:
+                    sections.append((title or "(preamble)", "\n".join(buf)))
+                title, buf = line[3:].strip(), []
+            else:
+                buf.append(line)
+        if title is not None or buf:
+            sections.append((title or "(preamble)", "\n".join(buf)))
+        return sections
+
+    def _coverage(self, edges) -> dict:
+        """Which configured source files / `##` sections already have at least one ANCHORED (span-present)
+        edge — the resume signal: a section with no covered span hasn't been extracted yet. Reads the
+        source text (cheap, memoized) + the canon spans only; never the derived layer."""
+        try:
+            texts = self.source_set().texts  # {basename → raw_text} (a property)
+        except Exception as e:  # noqa: BLE001 — a source-read hiccup degrades coverage, never crashes kg_status
+            return {"files": [], "sections": [], "note": f"source unavailable ({type(e).__name__})"}
+        spans = [s for s in (normalize_text(e.span) for e in edges if e.span and e.span.strip()) if s]
+        files, sections = [], []
+        for fname, raw in texts.items():
+            secs = self._split_sections(raw)
+            covered_secs = 0
+            for title, body in secs:
+                nb = normalize_text(body)
+                covered = any(sp in nb for sp in spans)
+                covered_secs += covered
+                sections.append({"file": fname, "title": title, "covered": covered})
+            norm_file = normalize_text(raw)
+            files.append({"file": fname, "covered": any(sp in norm_file for sp in spans),
+                          "sections": len(secs), "covered_sections": covered_secs})
+        return {"files": files, "sections": sections}
+
+    def kg_status(self) -> dict:
+        """A cheap, projection-FREE status + coverage probe (resume a partial build after any transport
+        hiccup without grepping the filesystem). Reads ONLY the canon (and the source text for coverage) —
+        it never triggers or refreshes the derived layer, so it is safe and instant even mid-build while a
+        projection would be expensive. Reports node/edge counts, edges by epistemic state, the
+        still-`unverified` grounding-queue size, and which source files/`##` sections already have an
+        anchored edge. `derived_present` is a path-existence check only (no db open); `projection_degraded`
+        echoes any last reprojection failure (a read, not this probe, sets it)."""
+        nodes = self.canon.all_nodes()
+        edges = [e for n in nodes for e in n.edges]
+        by_state = dict(Counter(e.epistemic_state.value for e in edges))
+        nodes_by_state = dict(Counter(n.epistemic_state.value for n in nodes))
+        return {
+            "ok": True,
+            "version": __version__,
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "edges_by_epistemic_state": by_state,
+            "nodes_by_epistemic_state": nodes_by_state,
+            "unverified_edges": by_state.get(EpistemicState.UNVERIFIED.value, 0),
+            "coverage": self._coverage(edges),
+            "derived_present": self.projector.db_path.exists(),
+            "projection_degraded": self._projection_degraded,
+        }
+
     def _failure_ids(self, G=None) -> set:
         """Forward edge ids in failure memory (rejected/failed). The generators also check the reverse,
         so forward ids suffice for invariant 5 (PLAN §13: failure memory binds generation).
@@ -704,8 +1025,42 @@ class KGEngine:
 
     # ---- read surface (projects if stale, then reads precomputed ranks)
     def _ensure_projected(self) -> None:
-        if not self.projector.db_path.exists() or self.projector.is_stale():
-            self.projector.project()
+        """Project-if-stale on the read path — and NEVER raise. A projection failure (a sqlite hiccup, a
+        native-dep blowup in community detection, a corrupt derived db) must DEGRADE a read, not crash the
+        tool: log it, remember the reason in `_projection_degraded`, and make sure an empty-schema'd
+        derived layer exists so the read tools return canon-empty data with the degraded flag instead of
+        blowing up on a missing table. Writes never come through here — kg_write/kg_propose/kg_ground/
+        kg_rename touch only the canon — so projection can never block or fail a write (defense #6)."""
+        try:
+            if not self.projector.db_path.exists() or self.projector.is_stale():
+                self.projector.project()
+            self._projection_degraded = None
+        except Exception as e:  # noqa: BLE001 — a projection failure degrades the read, never crashes it
+            self._projection_degraded = f"{type(e).__name__}: {e}"
+            logger.warning("projection failed (%s); serving degraded derived layer", e, exc_info=True)
+            self._ensure_degraded_db()
+
+    def _ensure_degraded_db(self) -> None:
+        """Best-effort: guarantee a schema'd (possibly empty/stale) derived layer exists so a read after a
+        projection failure returns data instead of crashing on a missing table. Mirrors the projector's
+        cold-contended path (an idempotent CREATE TABLE IF NOT EXISTS + an empty graph.json)."""
+        try:
+            import networkx as nx
+            from .projector import _atomic_write, _node_link_data
+            if not self.projector.db_path.exists() or self.projector._schema_outdated():
+                self.projector._connect().close()
+            if not self.projector.graph_path.exists():
+                _atomic_write(self.projector.graph_path, json.dumps(_node_link_data(nx.MultiDiGraph())))
+        except Exception as e:  # noqa: BLE001 — purely defensive; a read that still can't project errors via _tool_result
+            logger.debug("could not materialise a degraded derived layer (%s)", e)
+
+    def _with_degraded(self, result):
+        """Annotate a dict read result with the projection-degraded reason, when set, so a caller can tell
+        "the derived layer is stale/unavailable" apart from a genuinely empty graph. Non-dict results
+        (lists, None) pass through untouched."""
+        if isinstance(result, dict) and self._projection_degraded:
+            result = {**result, "projection_degraded": self._projection_degraded}
+        return result
 
     @property
     def _proj(self) -> Projector:
@@ -715,22 +1070,30 @@ class KGEngine:
         return self.projector
 
     def get_node(self, node_id: str) -> dict | None:
-        return self._proj.get_node(node_id)
+        res = self._proj.get_node(node_id)
+        # On a degraded (empty/stale) derived layer a real canon node looks like a genuine miss; surface
+        # the flag on the miss too so a caller can tell "not found" from "couldn't project" (review-M2).
+        if res is None and self._projection_degraded:
+            return {"error": "not found", "projection_degraded": self._projection_degraded}
+        return self._with_degraded(res)
 
     def get_neighbors(self, node_id: str, relation: str | None = None) -> list:
+        # Returns a LIST, which can't carry the projection_degraded flag without changing the tool's
+        # shape; the degraded state is observable via the sibling reads (get_node/kg_context/query_graph/
+        # kg_status) that DO carry it. _ensure_projected (via _proj) still degrades-not-raises here.
         return self._proj.get_neighbors(node_id, relation=relation)
 
     def shortest_path(self, source: str, target: str):
         return self._proj.shortest_path(source, target)
 
     def query_graph(self, **kw) -> dict:
-        return self._proj.query_graph(**kw)
+        return self._with_degraded(self._proj.query_graph(**kw))
 
     def kg_context(self, query: str | None = None, budget: int = 2000) -> dict:
-        return self._proj.kg_context(query, budget=budget)
+        return self._with_degraded(self._proj.kg_context(query, budget=budget))
 
     def kg_agenda(self, *, limit: int = 5) -> dict:
-        return self._proj.kg_agenda(limit=limit)
+        return self._with_degraded(self._proj.kg_agenda(limit=limit))
 
     def kg_export(self, kind: str = "all") -> dict:
         """Render the human-facing artifacts (R1): a self-contained `graph.html` + `GRAPH_REPORT.md` under
@@ -754,9 +1117,9 @@ def build_engine_from_env(*, project=None, data=None, source=None, pack=None) ->
     # silently breaks the engine: `source_text()` reads a non-existent file and returns "", so every agent
     # edge fails span verification (`span-not-in-source`). Mirrors `bootstrap._clean` / `launch_server.clean`,
     # which strip the same values; without it the documented `examples/source.md` fallback never fires.
-    def _env(key):  # noqa: E306
-        v = (os.environ.get(key) or "").strip()
-        return None if not v or v.startswith("${") else v
+    # `_clean_env` is the module-level form of the old local `_env`, shared with the logging path
+    # (resolve_data_dir) so the server log lands in the SAME dir the engine resolves for the derived layer.
+    _env = _clean_env
     project = project or _env("KG_PROJECT_DIR") or _env("CLAUDE_PROJECT_DIR") or os.getcwd()
     data = data or _env("KG_DATA")
     opt = lambda k, d=None: (os.environ.get(f"CLAUDE_PLUGIN_OPTION_{k}") or "").strip() or d  # noqa: E731
@@ -782,20 +1145,35 @@ def build_engine_from_env(*, project=None, data=None, source=None, pack=None) ->
 
 def _tool_result(fn):
     """Uniform transport-error envelope for every MCP tool (finding: mixed-error-architecture). A RAISED
-    exception (e.g. a mid-read sqlite/networkx error escaping a pure-read tool) becomes a structured
-    {ok:False, error, error_kind} result + a logged warning, instead of crashing the tool call with an
-    MCP-level exception. SUCCESS returns pass through UNCHANGED — including the deliberate {ok:False}
-    DOMAIN dispositions (a locked vault, a refused verdict) and the reads' own shapes ({path:...},
-    {error:"not found"}, lists, None): transport ok/error and domain disposition are two ORTHOGONAL axes,
-    so the envelope never collapses a domain result into a transport error (the never-stall contract,
-    §2.4/§4). functools.wraps keeps the wrapped signature so FastMCP still builds the right tool schema."""
+    exception (e.g. a mid-read sqlite/networkx error escaping a pure-read tool, or a BrokenPipeError /
+    EOFError / ConnectionResetError on the stdio transport — all `Exception` subclasses) becomes a
+    structured {ok:False, error, error_kind} result + a logged traceback, instead of bubbling into the
+    transport serve loop and killing the process. The next request is served normally. SUCCESS returns
+    pass through UNCHANGED — including the deliberate {ok:False} DOMAIN dispositions (a locked vault, a
+    refused verdict) and the reads' own shapes ({path:...}, {error:"not found"}, lists, None): transport
+    ok/error and domain disposition are two ORTHOGONAL axes, so the envelope never collapses a domain
+    result into a transport error (the never-stall contract, §2.4/§4).
+
+    It deliberately catches `Exception`, NOT `BaseException`: an `asyncio.CancelledError`,
+    `KeyboardInterrupt`, or `SystemExit` MUST propagate so cooperative cancellation / shutdown still
+    works (swallowing a CancelledError would hang the framework's cancel of that one request). Per-request
+    cancellation already aborts only that request — the mcp serve loop isolates each handler in its own
+    task and returns tool errors as messages (raise_exceptions=False) — so a cancelled call never takes
+    the loop down. functools.wraps keeps the wrapped signature so FastMCP still builds the right tool
+    schema, and the manifest scrape still recognises the `def`."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        wd = _WATCHDOG
+        if wd is not None:
+            wd.enter(fn.__name__)
         try:
             return fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001 — uniform transport envelope; a tool must never crash the call
             logger.warning("MCP tool %s raised %s: %s", fn.__name__, type(e).__name__, e, exc_info=True)
             return {"ok": False, "error": str(e), "error_kind": type(e).__name__}
+        finally:
+            if wd is not None:
+                wd.exit()
     return wrapper
 
 
@@ -815,9 +1193,13 @@ def _register(mcp, engine: KGEngine) -> None:
 
     @mcp.tool()
     @_tool_result
-    def kg_write(payload: dict) -> dict:
-        """Validate an extraction payload at the boundary and write accepted/demoted nodes & edges."""
-        return engine.kg_write(payload)
+    def kg_write(payload: dict, idempotency_key: str | None = None) -> dict:
+        """Validate an extraction payload at the boundary and write accepted/demoted nodes & edges. The
+        response carries a deterministic `receipt` (a hash of the payload's target ids); pass an
+        `idempotency_key` to make a retry of a write whose transport response was lost a TRUE no-op that
+        replays the identical receipt + dispositions (`idempotent_replay: True`) instead of a second pass.
+        Without a key the write is still idempotent by canonical id — a re-send creates no duplicates."""
+        return engine.kg_write(payload, idempotency_key=idempotency_key)
 
     @mcp.tool()
     @_tool_result
@@ -853,6 +1235,16 @@ def _register(mcp, engine: KGEngine) -> None:
     def kg_metrics() -> dict:
         """Summary counts: nodes, edges, edges by epistemic state."""
         return engine.kg_metrics()
+
+    @mcp.tool()
+    @_tool_result
+    def kg_status() -> dict:
+        """Cheap, projection-FREE status + coverage probe — confirm build progress and RESUME a partial
+        build after any transport hiccup without grepping the filesystem. Reads ONLY the canon (+ source
+        text for coverage); never triggers/refreshes the derived layer. Returns node/edge counts, edges
+        by epistemic state, the still-`unverified` grounding-queue size, and which source files/`##`
+        sections already have an anchored edge. Unlike kg_metrics it never opens the derived db."""
+        return engine.kg_status()
 
     @mcp.tool()
     @_tool_result
@@ -906,7 +1298,11 @@ def _register(mcp, engine: KGEngine) -> None:
     @_tool_result
     def shortest_path(source: str, target: str) -> dict:
         """Shortest path between two nodes over the derived graph."""
-        return {"path": engine.shortest_path(source, target)}
+        out = {"path": engine.shortest_path(source, target)}
+        # surface the degraded signal so an empty path isn't mistaken for "no path" (review-M2)
+        if engine._projection_degraded:
+            out["projection_degraded"] = engine._projection_degraded
+        return out
 
     @mcp.tool()
     @_tool_result
@@ -936,12 +1332,49 @@ def _register(mcp, engine: KGEngine) -> None:
         return engine.kg_export(kind)
 
 
+def _start_watchdog() -> "_Watchdog | None":
+    """Construct + start the handler watchdog from KG_HANDLER_TIMEOUT (default DEFAULT_HANDLER_TIMEOUT;
+    0/negative/invalid disables it), and publish it for the tool envelope to feed. Returns it (or None)."""
+    global _WATCHDOG
+    try:
+        timeout = float(os.environ.get("KG_HANDLER_TIMEOUT", DEFAULT_HANDLER_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_HANDLER_TIMEOUT
+    if timeout <= 0:
+        return None
+    _WATCHDOG = _Watchdog(timeout).start()
+    return _WATCHDOG
+
+
 def main() -> None:
-    from mcp.server.fastmcp import FastMCP
-    mcp = FastMCP("creativity-graph")
-    engine = build_engine_from_env()
-    _register(mcp, engine)
-    mcp.run()
+    # Configure the rotating server log + uncaught-exception hooks FIRST, before anything that can fail,
+    # so even an engine-construction error lands in <KG_DATA>/server.log with a full traceback (the whole
+    # transport-crash class was previously undiagnosable because nothing was persisted).
+    configure_logging()
+    logger.info("kg_engine.server starting (version=%s pid=%s)", __version__, os.getpid())
+    _start_watchdog()
+    try:
+        from mcp.server.fastmcp import FastMCP
+        mcp = FastMCP("creativity-graph")
+        engine = build_engine_from_env()
+        _register(mcp, engine)
+        # mcp.run() returns NORMALLY on a clean client disconnect (stdin EOF closes the stdio transport
+        # and the serve loop exits) -> exit 0, and the supervisor does NOT relaunch (session ending). A
+        # per-request cancellation does NOT reach here: the mcp serve loop isolates each handler and keeps
+        # serving (see _tool_result). Only an UNEXPECTED exception escaping the loop is a crash.
+        mcp.run()
+    except KeyboardInterrupt:
+        logger.info("server interrupted (SIGINT); shutting down cleanly")
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001 — log EVERY way the serve loop can die before the process goes
+        logger.critical("server crashed out of the serve loop; exiting %s so the supervisor relaunches",
+                        EXIT_CRASH, exc_info=True)
+        # SystemExit triggers normal interpreter shutdown (atexit -> logging flush), so no explicit
+        # shutdown() here — that would close handlers before the `finally` line below is logged.
+        raise SystemExit(EXIT_CRASH)
+    finally:
+        logger.info("server exiting (pid=%s)", os.getpid())
 
 
 if __name__ == "__main__":

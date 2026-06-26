@@ -279,6 +279,171 @@ def test_mjs_parses(mjs):
 
 
 # --------------------------------------------------------------------------- #
+# (5) launch_server.mjs SUPERVISOR — relaunch/backoff/crash-loop policy (transport-resilience pass)
+# --------------------------------------------------------------------------- #
+# These import the SHIPPED launcher's exported helpers by file URL and drive the REAL supervision loop
+# (createSupervisor) with a fake spawner — so a simulated engine-child crash exercises the actual
+# relaunch / backoff / crash-loop-cap logic without spawning a real engine or killing the test process.
+# Importing the module must NOT spawn (the main-module guard); these tests prove that too.
+_LAUNCH_URL = json.dumps(_LAUNCH_MJS.as_uri())
+
+
+def _run_node_harness(body: str) -> dict:
+    """Run a node ESM harness that imports the launcher and prints a JSON line; return the parsed dict."""
+    script = f'import * as L from {_LAUNCH_URL};\n' + body
+    r = subprocess.run([NODE, "--input-type=module", "-e", script],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_supervisor_decision_table():
+    out = _run_node_harness(r"""
+const S = L.SUPERVISOR;
+const out = {};
+// capped exponential backoff
+out.backoff = [0,1,2,3,4,5,6].map((n) => L.backoffFor(n));
+// a clean exit (code 0, our signal, or shuttingDown) never relaunches
+out.code0   = L.restartDecision({code:0, signal:null, ranForMs:1e9, shuttingDown:false, triedHeal:false, recentRestartCount:0}).action;
+out.signal  = L.restartDecision({code:1, signal:"SIGTERM", ranForMs:10, shuttingDown:false, triedHeal:false, recentRestartCount:0}).action;
+out.shut    = L.restartDecision({code:70, signal:null, ranForMs:1e9, shuttingDown:true, triedHeal:false, recentRestartCount:0}).action;
+// a STARTUP-window non-zero exit heals once, then retries in place
+out.heal    = L.restartDecision({code:1, signal:null, ranForMs:200, shuttingDown:false, triedHeal:false, recentRestartCount:0}).action;
+out.retry   = L.restartDecision({code:1, signal:null, ranForMs:200, shuttingDown:false, triedHeal:true,  recentRestartCount:0});
+// repeated STARTUP failures trip the crash-loop cap
+out.cap     = L.restartDecision({code:70, signal:null, ranForMs:200, shuttingDown:false, triedHeal:true, recentRestartCount:S.MAX_RESTARTS});
+// a POST-INIT crash (ran past the startup window) EXITS cleanly with the child's code (no relaunch onto
+// the held-open, already-handshaked pipe) so the client reconnects with a fresh handshake
+out.postInit = L.restartDecision({code:70, signal:null, ranForMs:40000, shuttingDown:false, triedHeal:true, recentRestartCount:1});
+process.stdout.write(JSON.stringify(out));
+""")
+    assert out["backoff"] == [200, 400, 800, 1600, 3200, 5000, 5000]
+    assert out["code0"] == "exit" and out["signal"] == "exit" and out["shut"] == "exit"
+    assert out["heal"] == "heal"
+    assert out["retry"]["action"] == "relaunch" and out["retry"]["reason"] == "startup-retry"
+    assert out["cap"]["action"] == "exit" and out["cap"]["reason"] == "crash-loop-cap"
+    # the key correctness point of the post-init fix: exit cleanly, do NOT relaunch a post-init crash
+    assert out["postInit"]["action"] == "exit"
+    assert out["postInit"]["reason"] == "post-init-exit"
+    assert out["postInit"]["code"] == 70
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_supervisor_loop_relaunches_then_trips_crash_loop_cap():
+    """Drive the REAL createSupervisor loop: a rapidly STARTUP-crashing engine is healed once, retried with
+    backoff up to the cap, then the supervisor exits cleanly (code 1) instead of thrashing forever."""
+    out = _run_node_harness(r"""
+import { EventEmitter } from "node:events";
+let t = 1e6;
+const children = [], pending = [];
+let exitCode = null, healCalls = 0;
+const sup = L.createSupervisor({
+  spawnEngine: () => { const c = new EventEmitter(); children.push(c); return c; },
+  exit: (code) => { exitCode = code; },
+  heal: () => { healCalls++; },
+  now: () => t,
+  schedule: (fn, ms) => pending.push([fn, ms]),
+  log: () => {},
+});
+sup.start();
+let guard = 0;
+while (exitCode === null && guard++ < 50) {
+  const c = children[children.length - 1];
+  t += 100;                                  // each child dies during STARTUP (< EARLY_FAILURE_MS)
+  c.emit("exit", 70, null);
+  while (pending.length) { const [fn, ms] = pending.shift(); t += ms; fn(); }
+}
+process.stdout.write(JSON.stringify({ spawns: children.length, heal: healCalls, exitCode,
+                                      max: L.SUPERVISOR.MAX_RESTARTS }));
+""")
+    assert out["heal"] == 1, "exactly one early-failure heal"
+    assert out["exitCode"] == 1, "crash-loop must exit cleanly with code 1"
+    assert out["spawns"] <= out["max"] + 2, "spawns bounded by the crash-loop cap"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_supervisor_clean_shutdown_does_not_relaunch():
+    """A forwarded SIGTERM (session ending) marks shutdown, so the child's exit is clean and the
+    supervisor does NOT relaunch — the connection-keeping parent exits with it."""
+    out = _run_node_harness(r"""
+import { EventEmitter } from "node:events";
+const children = [], pending = [];
+let exitCode = null;
+const sup = L.createSupervisor({
+  spawnEngine: () => { const c = new EventEmitter(); c.kill = () => {}; children.push(c); return c; },
+  exit: (code) => { exitCode = code; },
+  now: () => 1e6, schedule: (fn) => pending.push(fn), log: () => {},
+});
+sup.start();
+sup.markShutdown("SIGTERM");
+children[0].emit("exit", 0, "SIGTERM");
+process.stdout.write(JSON.stringify({ spawns: children.length, pending: pending.length, exitCode }));
+""")
+    assert out["spawns"] == 1, "must not relaunch after a clean shutdown"
+    assert out["pending"] == 0
+    assert out["exitCode"] == 0
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_supervisor_post_init_crash_exits_cleanly_no_relaunch():
+    """A crash AFTER the engine came up and served `initialize` must EXIT cleanly (with the child's code),
+    NOT relaunch onto the held-open, already-handshaked pipe — so the client gets the disconnect and
+    reconnects with a fresh handshake instead of being stranded against an uninitialized engine."""
+    out = _run_node_harness(r"""
+import { EventEmitter } from "node:events";
+let t = 1e6;
+const children = [], pending = [];
+let exitCode = null;
+const sup = L.createSupervisor({
+  spawnEngine: () => { const c = new EventEmitter(); children.push(c); return c; },
+  exit: (code) => { exitCode = code; },
+  now: () => t, schedule: (fn) => pending.push(fn), log: () => {},
+});
+sup.start();
+t += 40000;                                   // ran healthily past the startup window, then crashes
+children[0].emit("exit", 70, null);
+process.stdout.write(JSON.stringify({ spawns: children.length, pending: pending.length, exitCode }));
+""")
+    assert out["spawns"] == 1, "a post-init crash must NOT relaunch"
+    assert out["pending"] == 0
+    assert out["exitCode"] == 70, "exits with the engine's crash code so the client reconnects"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_supervisor_shutdown_during_backoff_exits_promptly():
+    """A SIGTERM arriving while a startup-retry relaunch is pending in the backoff window must cancel that
+    timer and exit promptly — not idle until the timer fires."""
+    out = _run_node_harness(r"""
+import { EventEmitter } from "node:events";
+let t = 1e6;
+const children = [];
+let exitCode = null, scheduled = 0, cancelled = 0, fired = 0;
+let pendingFn = null;
+const sup = L.createSupervisor({
+  spawnEngine: () => { const c = new EventEmitter(); c.kill = () => {}; children.push(c); return c; },
+  exit: (code) => { exitCode = code; },
+  heal: () => {},
+  now: () => t,
+  schedule: (fn) => { scheduled++; pendingFn = fn; return 42; },   // a fake timer handle
+  cancel: (h) => { if (h === 42) cancelled++; },
+  log: () => {},
+});
+sup.start();
+t += 100; children[0].emit("exit", 70, null);   // 1st STARTUP crash -> one-time heal (sync relaunch)
+t += 100; children[1].emit("exit", 70, null);   // 2nd STARTUP crash -> schedules a backoff relaunch
+sup.markShutdown("SIGTERM");                     // SIGTERM mid-backoff
+if (pendingFn) pendingFn();                      // even if the stale timer somehow fires, it must no-op
+process.stdout.write(JSON.stringify({ scheduled, cancelled, exitCode, spawns: children.length }));
+""")
+    assert out["scheduled"] == 1
+    assert out["cancelled"] == 1, "the pending relaunch timer must be cancelled on shutdown"
+    assert out["exitCode"] == 0, "shutdown during backoff exits promptly"
+    # 2 spawns = initial + the one-time heal relaunch; the cancelled/guarded backoff relaunch must NOT add a 3rd
+    assert out["spawns"] == 2, "no further spawn after shutdown (cancelled/guarded relaunch)"
+
+
+# --------------------------------------------------------------------------- #
 # (5) precontext.py._clean is an EXACT mirror of bootstrap._clean — including the
 #     bare-sentinel `/.venv` / `/venv` results of substituting an empty ${...} into a
 #     ${VAR}/.venv template (M_tooling-5).

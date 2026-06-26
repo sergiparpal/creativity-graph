@@ -1,7 +1,7 @@
 ---
 description: Build the grounded knowledge graph from a source document — extract section-by-section into the canon (bounded parallel waves), then project.
 argument-hint: "[source_path] [wave_size]"
-allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_scrub, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph
+allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_scrub, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_status, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph
 ---
 
 # /kg-build — orchestrate the BUILD
@@ -148,6 +148,12 @@ the kg_write result (dispositions, details[], written_nodes[], rolled_back).
 > subagent would let an extractor mis-attribute a span across sections of the same file — undetectable by the
 > boundary, which verifies the span against the whole `source_file`, not the one section. Waves change *how many*
 > single-section extractors run at once; they never change *what one extractor sees*.
+
+**Resume / progress probe (projection-free).** Between waves — or to recover after a transport hiccup or a
+cancelled request — call `mcp__plugin_creativity-graph_creativity-graph__kg_status()`: it reads the **canon
+only** (it never projects) and returns the node/edge counts, the `unverified` queue size, and a `coverage` map
+of which `##` sections already carry an anchored span-present edge. Re-launch only the **uncovered** sections
+(covered re-writes are idempotent anyway), and call it once more at the end to confirm full coverage.
 
 Collect each launch's returned `kg_write` result: the `dispositions` counts
 (**ACCEPTED / DEMOTED / QUARANTINED / REJECTED**), `details[]`, `written_nodes[]`, and `rolled_back`.

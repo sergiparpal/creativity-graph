@@ -150,3 +150,45 @@ over a full max-size wave of brief writes) so a contended writer **serializes cl
 fast**, while the lazy projector's read path stays strictly non-blocking. New tests cover wave-size
 resolution (default/fallback/clamp/precedence + a Bash-mirror drift guard) and a full 10-writer concurrent
 wave (all commit, none corrupts, none dropped). Suite green at 549 tests.
+
+---
+
+## Transport / cancellation resilience (v0.5.0) — survive a cancelled request and a dead engine
+
+Over a full 19-section build the MCP server kept "disconnecting": tool calls stuck in *Running…*, the
+server marked disconnected (needing `/mcp reconnect` or an app restart) — yet **every canon write actually
+committed**. So the work succeeded server-side; the *result* failed to return and the process died with
+**no persisted trace**. The disconnects correlated 1:1 with pressing Esc (cancelling an in-flight call). The
+native deps and the projection were ruled out (a full `Projector.project(incremental=False)` over the real
+113-node canon completes cleanly; reads survive — now a regression guard). Root cause: broken
+cancellation/transport handling in the stdio server, made more frequent by the new concurrent build waves,
+plus zero diagnostics. Fix = defense-in-depth so a lost response or a dead transport is survivable:
+
+- **Supervisor launcher.** `launch_server.mjs` is now a persistent Node parent that logs every engine
+  lifecycle event and recovers by *when* the engine died — because with `stdio:"inherit"` Node can't replay
+  MCP's per-connection `initialize` handshake. A **startup** failure (crash before serving `initialize`,
+  whose request is still buffered unread) is healed + relaunched in place (capped backoff 200 ms→5 s;
+  crash-loop cap of 5 retries/60 s then a clean logged exit) — self-healing the cold-start race while
+  keeping the parent (and the client pipe) alive. A **post-init** crash instead **exits cleanly** so the
+  client reconnects with a fresh handshake, because relaunching onto the held-open, already-handshaked pipe
+  would strand an *uninitialized* engine (looks alive, is dead — worse than a clean disconnect). An
+  adversarial review caught that this distinction is load-bearing. The policy is the pure, exported
+  `restartDecision`/`backoffFor`; the loop is `createSupervisor` with injectable deps, so the **real** loop
+  is unit-tested with a fake engine (startup heal+retry, backoff, crash-loop cap, clean shutdown, post-init
+  clean-exit, prompt exit on SIGTERM mid-backoff).
+- **Persisted diagnostics.** `configure_logging` attaches a rotating `<KG_DATA>/server.log` (2 MB × 3)
+  capturing every uncaught exception (main + worker threads), every tool-handler traceback, and every
+  supervisor event — the single biggest debuggability gap, now closed.
+- **Per-request isolation.** The tool envelope turns any `Exception` (incl. `BrokenPipeError`/`EOFError`/
+  `ConnectionResetError`) into a structured result and keeps serving; it never swallows
+  `CancelledError`/`KeyboardInterrupt`/`SystemExit`. The serve loop exits non-zero (→ supervisor relaunch)
+  on an unexpected crash, 0 on a clean disconnect. A watchdog (`KG_HANDLER_TIMEOUT`, default 300 s)
+  force-exits a wedged handler so the supervisor relaunches a fresh process instead of hanging.
+- **Idempotent + decoupled.** `kg_write` returns a deterministic `receipt` and honours an `idempotency_key`
+  (an exact retry replays the same receipt + counts, never a duplicate). Writes never touch the projection
+  seam; a projection failure degrades a read (a `projection_degraded` flag over canon-derived data) instead
+  of raising. New `kg_status` is a projection-FREE canon-only probe (counts, `unverified` queue, source
+  section coverage) for confirming progress and resuming a partial build. An adversarial multi-agent review
+  of the whole diff (4 dimensions → per-finding verification) hardened the design — the supervisor's
+  startup-vs-post-init split, an idempotency-key payload-mismatch guard, the degraded flag on the structural
+  reads, and several non-vacuous test strengthenings all came out of it. Suite green at 600 tests.
