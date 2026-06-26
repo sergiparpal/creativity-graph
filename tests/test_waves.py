@@ -27,6 +27,20 @@ from kg_engine.waves import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _bash_available() -> bool:
+    """True only if a *working* bash is on PATH. `shutil.which('bash')` is not enough on Windows: the
+    runners ship the WSL launcher stub at C:\\Windows\\System32\\bash.exe, which is found by `which` but
+    exits non-zero (no distro installed) — so probe it, and only run the drift guard where bash actually
+    executes (Linux/macOS, or a properly-configured Git Bash)."""
+    if shutil.which("bash") is None:
+        return False
+    try:
+        r = subprocess.run(["bash", "-c", "echo ok"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "ok"
+
+
 def test_constants_are_the_documented_bounds():
     assert (DEFAULT_WAVE_SIZE, MIN_WAVE_SIZE, MAX_WAVE_SIZE) == (6, 1, 10)
     assert WAVE_ENV == "CLAUDE_PLUGIN_OPTION_EXTRACT_WAVE_SIZE"
@@ -130,7 +144,7 @@ def _run_bash(script: str, arg, env_val):
     return out.stdout.strip()
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash unavailable (e.g. Windows runner)")
+@pytest.mark.skipif(not _bash_available(), reason="no working bash (e.g. Windows WSL-stub runner)")
 @pytest.mark.parametrize("arg,env_val", [
     ("1", None), ("5", None), ("6", None), ("10", None), ("7", None),
     ("11", None), ("100", None), ("0", None), ("-1", None), ("-3", None),
