@@ -396,8 +396,17 @@ class Canon:
         deadline = time.monotonic() + self.lock_acquire_timeout
         backoff = LOCK_RETRY_INITIAL
         while True:
-            if self.lock.acquire():
-                return True
+            try:
+                if self.lock.acquire():
+                    return True
+            except OSError:
+                # A transient filesystem error while acquiring under contention — most often a Windows
+                # sharing violation (PermissionError) when another writer momentarily holds the lock file
+                # open for its own read/rename/O_EXCL-create. Treat it as "didn't get the lease this
+                # attempt" and retry within the budget instead of crashing the write; this is the same
+                # fail-closed posture as the lock reader (an error never reads as "free"). If it persists
+                # past the deadline the caller surfaces the locked-vault error rather than the raw OSError.
+                pass
             now = time.monotonic()
             if now >= deadline:
                 return False
