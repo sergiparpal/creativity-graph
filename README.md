@@ -377,7 +377,28 @@ find out whether it's worth the effort instead of assuming (leave the bracket of
 - **The usual order is:** point at a document → build → (check) → fact-check → ask questions. The two optional
   steps (`/kg-eval`, `/kg-experiment`) are about measuring quality, not everyday use.
 
+### Going further — turn the map into an idea generator (optional)
+
+So far you've **built** a map and **fact-checked** it. You can also flip it around: instead of only
+*verifying* what's already in your document, ask the map to **propose new ideas** from the way its concepts
+connect — and then fact-check those the exact same way. The design idea is **generate freely, judge
+strictly**: new candidates are never accepted just because they look clever; they only "stick" once grounding
+finds real support for them, and the ones that fail are remembered, not deleted. Three optional commands:
+
+- **`/kg-generate [mechanism] [k]`** — ask the map to suggest new idea candidates from its own structure (for
+  example, surprising links between distant topics, or a single idea that could absorb a whole cluster of
+  others). They land as clearly-marked *proposals* — then the very next `/kg-ground` is the filter that keeps
+  only the ones it can support.
+- **`/kg-perturb [second_source_or_pack]`** — build a *second* version of the map (a different angle on the
+  same material, or a second document) and cross-compare, to surface connections the first map would have
+  missed on its own.
+- **`/kg-view [html|report|all]`** — produce a self-contained, offline **`graph.html`** you can open in a
+  browser, plus a written **`GRAPH_REPORT.md`**, so you can *see* the map (rejected claims and all) instead
+  of only querying it. It's a read-only snapshot — it never changes the map.
+
 ### Command cheat sheet
+
+The first five are the everyday flow; the last three are the optional "going further" commands above.
 
 | Command | What it does | The detail in brackets |
 | --- | --- | --- |
@@ -386,10 +407,12 @@ find out whether it's worth the effort instead of assuming (leave the bracket of
 | `/kg-query <question>` | Ask a question, answered from the map | **Required:** your question |
 | `/kg-eval [graph.json]` | Grade how accurate the map is | *Optional:* which map file to grade (defaults to the current one) |
 | `/kg-experiment [prompts_path]` | Test whether the map really helps | *Optional:* a file of test prompts (defaults to the built-in set) |
+| `/kg-generate [mechanism] [k]` | Propose new idea candidates from the map | *Optional:* which mechanism, and how many (defaults to a sensible set) |
+| `/kg-perturb [second_source_or_pack]` | Stress-test coverage with a second map | *Optional:* a second document or setup (defaults to a re-angle of the same source) |
+| `/kg-view [html\|report\|all]` | Make a visual + written view of the map | *Optional:* which artifact to render (defaults to both) |
 
-There are a few more advanced commands — generating new idea candidates, a second-document stress test, and a
-visual export — covered in *The workflow* below. And remember: the status check (`kg_ping`) and the other
-behind-the-scenes helpers have **no** slash; you just ask Claude for them in plain words.
+Remember: the status check (`kg_ping`) and the other behind-the-scenes helpers have **no** slash; you just ask
+Claude for them in plain words.
 
 ---
 
@@ -437,96 +460,6 @@ creativity-graph/
 │   └── f4_probe.py                # extraction-precision scorer CLI
 └── tests/                         # pytest suite
 ```
-
----
-
-## The workflow
-
-> New here? The *Tutorial — using creativity-graph (no jargon)* section above is the plain-English version of
-> everything below. This section is the technical reference, with every command and the design rationale.
-
-```
-/kg-build  →  /kg-ground  →  /kg-generate  →  /kg-ground  →  /kg-query
-                   │         (generate            (the filter)
-                   │          offensively)
-        /kg-eval   │   /kg-experiment
-   (is it accurate?)   (does it actually help?)
-```
-
-**The inversion:** the first half *verifies* (every edge earns a verdict against a span); the second half
-*generates* (discovery mechanisms propose `hypothesized` candidates into a separate lane). Generation is
-**offensive** — never gatekept by a quality metric — and the **same** grounding loop is the **defensive
-filter**, applied afterward. The portico that stood at the door of imagination is moved to after it.
-
-### `/kg-build [source_path] [wave_size]` — extract → canon → project
-Drives the **kg-extractor** subagent (defaults to **Sonnet**, fast + cheap) over the (scrubbed)
-source — **one subagent per `##` section**, launched in **bounded parallel waves** of `wave_size`
-(default `6`, range 1–10; see `extract_wave_size` above). Keeping one section per subagent preserves
-span-isolation (each extractor can only cite text it was actually shown); the waves just run several of
-those at once, so a 19-section doc is a few waves instead of 19 serial agents. Each section yields a
-`kg_write` payload of typed nodes and typed edges, every non-deterministic edge carrying a verbatim
-span. The boundary accepts/demotes/quarantines/rejects each item — and a wave's brief writes funnel
-through the one single-threaded MCP server (so they serialize there), with the canon's single-writer lease
-guarding against cross-process contention, so nothing is dropped or corrupted no matter the wave size.
-The command then projects the canon into the derived layer and reports `kg_metrics`. Build-time gate:
-run `f4_probe.py score` and require precision ≥ 0.70 before trusting the graph.
-
-### `/kg-ground [query-or-node-filter]` — earn the verdicts (§1.6/§1.7/§1.8)
-Drains the queue of `unverified` edges. The **kg-grounder** re-reads each cited span and stamps
-`grounded` or `rejected` via `kg_ground` — rejecting relations that are true only because they
-are vague/unfalsifiable. The **kg-adversarial-grounder** red-teams hub nodes: it proposes the
-strongest typed `attacked_by` counter-edges and, where a claim is genuinely falsified, sets the
-attacked edge to `failed`. Those failures become never-pruned negative information, surfaced in
-`kg_context.falsification_counters`.
-
-### `/kg-generate [mechanism] [k]` — turn the graph into an idea generator (§2–§9)
-Runs the deterministic **discovery mechanisms** over the derived graph and writes their proposals into a
-separate **hypothesized lane** — never gatekept by a metric (the inversion). `kg_generate` emits ranked
-structural candidates from: **bridge** (§2/§4 — cross-community pairs, generality-controlled),
-**seed** (§3 — the positive residual `c − E[c|d]`, "abnormally connectable for its distance"),
-**compression** (§7 — dense clusters passing an MDL + specificity screen → a new node),
-**regroup** (§8 — bridges invisible under the prior partition), **transplant** (§5 — a hub's reorganising
-pattern imported into the most absorptive community), **ensemble** (§9 — cross two constructions). The
-**kg-generator** subagent phrases and names them; they land `hypothesized`/`unverified` via `kg_propose`
-(or the §8 endo operations `kg_operate`: collapse/explode/regroup/open). The very next `/kg-ground` is the
-filter — a candidate is promoted to `grounded` ONLY when a grounder supplies a span/citation (which
-*upgrades* its provenance), else it joins failure memory, which then binds the next generation.
-
-### `/kg-perturb [second_source_or_pack]` — import external structure (§9/§15)
-Grounding's *second* function. Builds a **second construction** (the same source under a different
-pack/resolution, or a second source), then cross-generates (`ensemble`) to surface bridges that exist
-across constructions — the structure the graph's own dynamics would resist. This is the only mechanism
-that *attacks coverage*; it relocates the blind spot rather than eliminating it.
-
-### `/kg-query <question>` — answer from the graph, not from priors
-Answers strictly **against the canon**, attaching provenance, epistemic state, and falsification
-counters to every supporting edge. Uses `kg_context`, `query_graph`, `get_node`,
-`get_neighbors`, and `shortest_path`. An ungrounded edge is reported as such, not laundered into
-a confident answer.
-
-### `/kg-view [html|report|all]` — eyeball the graph (read-only)
-Renders two **disposable, human-facing** artifacts under the derived dir via `kg_export`: a
-self-contained, fully-offline **`graph.html`** (vanilla-JS force layout encoding the three axes on
-**independent** visual channels — `epistemic_state`→edge line, `authored_by`→node border,
-`provenance`→fill opacity; **size = degree**; failed/rejected edges **drawn**, never filtered; a
-gate-aware bridge highlight) and **`GRAPH_REPORT.md`** (counts straight from `kg_metrics`, per-community
-axis breakdowns, the never-pruned falsification memory, R3 stale verdicts, R4 per-file edge counts). A
-*view*, never a write — it cannot forge a verdict or touch the canon.
-
-### `/kg-eval [graph.json]` — is it accurate? (Stages 4 & 7)
-Measures the two things that must be true before you trust the graph: **extraction precision**
-and **grounding reliability**. The **kg-annotator** labels extracted edges into a `f4_probe`
-CSV (`correct | fabricated | vague | wrong_type`, `span_found`); `f4_probe.py score` reports
-precision against the ≥ 0.70 gate. For reliability it produces an *independent* second label
-pass and `kg_engine.harness agreement` returns Krippendorff α against the ≥ 0.67 bar. The
-numbers are recorded, not hand-waved.
-
-### `/kg-experiment [prompts_path]` — is the graph actually useful? (Stage 8/9)
-A **blind** ideation experiment across four conditions — `control | graph | graph+generate | rag` — scored by
-`kg_engine.harness ideation`. The `graph+generate` arm (grounded context **plus** the hypothesized slate from
-`/kg-generate`) tests whether the generative layer lifts ideation beyond grounded context alone; the harness
-emits a second `generate_verdict` for it. This is where "idea value is a hypothesis under test" becomes a
-measurement rather than a slogan.
 
 ---
 
