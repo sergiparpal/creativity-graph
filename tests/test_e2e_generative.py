@@ -31,7 +31,7 @@ def _build(engine):
 
 def test_end_to_end_generative_loop(engine):
     # version stamp (release gate)
-    assert engine.kg_ping()["version"] == __version__ == "0.5.0"
+    assert engine.kg_ping()["version"] == __version__ == "0.4.2"
 
     # 1. BUILD
     _build(engine)

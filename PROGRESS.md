@@ -122,7 +122,7 @@ specificity-weighted-betweenness bridge metric (precomputed + gated), and the `/
 
 ---
 
-## Faster builds (v0.5.0) — Sonnet extractor + bounded parallel waves
+## Faster builds (v0.4.2) — Sonnet extractor + bounded parallel waves
 
 `/kg-build` was the slowest command: it launched one `kg-extractor` per `##` section **sequentially**, and
 the extractor **inherited the session model (Opus)**, so a 19-section document meant ~19 cold-started Opus
