@@ -27,9 +27,13 @@ These four are the entire space. Every edge gets exactly one. From `f4_probe.py`
 - **vague** — the edge is "true" **only because it is generic / unfalsifiable** — the *generality
   confound* (§1.6). The endpoints are so general that the relation can't be wrong, so it explains
   nothing. A vague edge would survive almost any source; that is exactly why it is worthless.
-- **wrong_type** — the **endpoints are genuinely related**, but the **relation label is wrong**. The
-  source connects A and B, but not with *this* edge_type. (e.g. source says A is `attacked_by` B, the
-  extractor wrote A `grounds` B.)
+- **wrong_type** — the **endpoints are genuinely related**, but the relation is wrong — *either* the
+  **label is wrong** (the source connects A and B, but not with *this* edge_type — e.g. source says A is
+  `attacked_by` B, the extractor wrote A `grounds` B) *or* the **direction is reversed** (right label,
+  wrong order — the source says `Y grounds X` but the extractor wrote `X grounds Y`). A reversed directed
+  edge (`grounds` / `attacked_by` / `defends_against` / …) is the canonical `wrong_type` and was the
+  dominant Stage-4 miss, so check HEAD/TAIL against the prose — not just the label. The endpoints can be
+  right and the span verbatim yet the edge still be `wrong_type` because it points the wrong way.
 
 And the orthogonal **span_found ∈ {y | n}** flag — the span-present check (§1.5, §2 of the source):
 

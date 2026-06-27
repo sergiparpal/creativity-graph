@@ -56,17 +56,28 @@ node_types:
 ### `edge_types` (10) — relation types drawn from the source prose
 ```yaml
 edge_types:
-  - grounds          # X provides verifiable support for Y
-  - attacked_by      # X is challenged by a stronger/more specific Y
-  - reconciles_with  # X resolves an intuition that Y captured imperfectly
-  - bridges          # X joins two otherwise separate communities
-  - collapses_into   # X reduces to / is subsumed by Y
-  - confounded_by    # X's apparent value is inflated by Y
-  - approximates     # X is an honest cheap proxy for Y
-  - defends_against  # X guards the graph against Y
-  - projects         # X is the regenerable projection of Y
-  - survives         # X persists across an operation Y
+  # Directed edges read  HEAD <relation> TAIL.  Reversing HEAD/TAIL was the dominant Stage-4 miss
+  # (precision 0.61, span-support 0.94: the span is right, the direction/type is wrong). These per-type
+  # comments are human-reference only — they never reach the model; agents/extractor.md is the live lever.
+  - grounds          # HEAD = evidence/foundation, TAIL = claim it supports. NOT part-of.
+  - attacked_by      # HEAD = victim (vaguer), TAIL = attacker (stronger/more specific).
+  - reconciles_with  # HEAD resolves a real tension TAIL left open. NOT mere complement/contrast.
+  - bridges          # HEAD joins two separate communities. NOT instance-of/evidence-of, NOT paired maxims.
+  - collapses_into   # HEAD reduces to / is subsumed by TAIL. NOT "is a clause/risk of", NOT "opposite extreme of".
+  - confounded_by    # HEAD's apparent value is inflated by TAIL.
+  - approximates     # HEAD = cheap proxy, TAIL = the truer target it stands in for. NOT instance-of, NOT "related but distinct".
+  - defends_against  # HEAD = remedy/defense, TAIL = threat/problem. The problem is the TAIL.
+  - projects         # HEAD = regenerable projection, TAIL = source it derives from. NOT "reveals / makes-detectable".
+  - survives         # HEAD = claim/info that persists, TAIL = the operation it survives (TAIL must be an `operation`).
 ```
+
+**Relation direction is load-bearing (§Stage 4).** Every directed edge reads `HEAD <relation> TAIL`; the
+right two endpoints in the **wrong order** score `wrong_type` and were the single largest Stage-4 miss
+(precision 0.61 at span-support 0.94 — the span verifies but the direction/type is wrong, so the boundary
+cannot catch it). The per-type comments above name the HEAD role; the authoritative, **model-facing**
+version is the HEAD/TAIL role table in `agents/extractor.md` (these YAML comments are human-reference only
+and are discarded by `yaml.safe_load`, so changing the names — never the comments — is what changes the
+boundary's allow-list).
 
 Each edge type is grounded in a verbatim relation in `source.md` (§1, span-present invariant). The
 relation words are wrapped in markdown emphasis in the source, and `normalize_text` does not strip the

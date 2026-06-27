@@ -192,3 +192,31 @@ plus zero diagnostics. Fix = defense-in-depth so a lost response or a dead trans
   of the whole diff (4 dimensions → per-finding verification) hardened the design — the supervisor's
   startup-vs-post-init split, an idempotency-key payload-mismatch guard, the degraded flag on the structural
   reads, and several non-vacuous test strengthenings all came out of it. Suite green at 600 tests.
+
+---
+
+## Stage-4 precision — relation-direction fix (v0.5.2)
+
+A real-corpus `/kg-eval` recorded **Stage-4 precision 0.61** (gate ≥ 0.70) at **span-support 0.94** — the
+extractor was finding the right verbatim span but stamping the **wrong relation direction or type**: HEAD/
+TAIL reversed on the directed "force" relations (`grounds` / `attacked_by` / `defends_against`), and
+region-spanning relations over-claimed (`bridges` 0/5, `projects` 0/3 — instance-of / "reveals" / paired
+concepts mislabeled). Because the `kg_write` boundary verifies the *span*, not the *direction*, the miss is
+unreachable by a structural guard and has to be taught in the prompt. The fix is **prompt/pack only** (no
+engine logic, every hard guarantee unchanged):
+
+- `agents/extractor.md` (the model-facing lever): a new "Relation DIRECTION is load-bearing" section — a
+  per-relation HEAD/TAIL role table for all ten edge types, a "don't reach for a region-spanning relation
+  when the prose says something narrower" guard, and a worked reversal on a verbatim §2 span.
+- `pack/pack.yaml` + `skills/.../references/pack-schema.md`: edge-type comments rewritten as HEAD/TAIL role
+  definitions (the ten *names* are unchanged, so the validated pack contract — and `pack.yaml` `version`
+  `0.1.0` — is untouched; comments never reach the model).
+- `agents/annotator.md`: the `wrong_type` verdict now explicitly covers a **reversed direction** (right
+  label, wrong order), so the precision labeling actually catches the dominant miss.
+
+Verified in-repo: pack validates, `validate_plugin.py` versions agree, full suite green (603 passed), the
+worked-reversal span verifies via `kg_engine.model.span_verifies`, and a 4-lens adversarial review
+confirmed all ten taught directions match the source prose. **Not yet re-measured:** the `f4_probe ≥ 0.70`
+gate must be re-run on the real build corpus — the bundled `examples/source.md` demo already scores **1.00**
+and is too small (one `bridges`, one `projects` edge) to exhibit this regression, so the table row above
+(Stage 4, precision 1.00) remains the demo-corpus measurement, not a refutation of the 0.61 finding.
