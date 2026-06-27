@@ -469,11 +469,11 @@ creativity-graph/
 ## The MCP tool surface
 
 Server name `creativity-graph` ⇒ tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`. The
-**fourteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_metrics`,
+**fifteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_merge`, `kg_metrics`,
 `kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`, `kg_export`) plus the
 **four** generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
 mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) are the
-**eighteen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
+**nineteen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
 commands).
 
 | tool | purpose |
@@ -482,7 +482,8 @@ commands).
 | `kg_scrub(text=None)` | the §1.9 **egress** scrub → `{scrubbed, redactions, sensitivity, categories}`; redacts secrets (always) + PII (per sensitivity) with consistent placeholders (`⟦SECRET:1⟧` etc.) before text reaches a subagent. No-op (0 redactions) on the no-PII demo source. |
 | `kg_write(payload, idempotency_key=None)` | the span-present write boundary → `{dispositions, details[], written_nodes[], rolled_back, error, receipt}`; egress scrubbing is wired in here too — placeholder spans are restored to the original source text for the canon. Every response carries a deterministic `receipt` (a hash of the payload's target ids); an optional `idempotency_key` makes a retry of a write whose transport response was lost a true no-op that replays the same receipt (`idempotent_replay: true`) — never a duplicate. |
 | `kg_ground(target_id, verdict, kind, note)` | **the only way to set a verdict** (always attributed to the agent — `by` is not a parameter); `verdict ∈ {grounded, rejected, failed, obsolete}`, `kind ∈ {edge, node}`. |
-| `kg_rename(old_id, new_id)` | rename a node and re-key its edges. |
+| `kg_rename(old_id, new_id)` | rename a node and re-key its edges (STRICT: refuses if `new_id` already exists). |
+| `kg_merge(from_id, into_id)` | deliberately **merge** `from_id` into an existing `into_id`, then retire `from_id`. Rewrites every endpoint and **dedups** colliding edges — `failed`/`rejected` negative info is sticky (never pruned), else `grounded`>`unverified`, the verbatim span + verdict note are kept, and no verdict/span is ever forged; drops the self-loops the rewrite makes; refuses a merge across two different declared `node_type`s. → `{ok, from, into, touched[], edges_rewritten, edges_deduped[], self_loops_dropped[], nodes, edges}`. |
 | `kg_metrics()` | `{nodes, edges, edges_by_epistemic_state}`. |
 | `kg_status()` | cheap, **projection-FREE** status + coverage probe (reads only the canon, never opens the derived db) → `{ok, version, nodes, edges, edges_by_epistemic_state, nodes_by_epistemic_state, unverified_edges, coverage:{files[],sections[]}, derived_present, projection_degraded}`; reports the `unverified` grounding-queue size and which source files/`##` sections already have an anchored edge — for confirming progress and **resuming a partial build** after a transport hiccup. |
 | `query_graph(node_type, relation, epistemic_state, limit)` | filtered `{nodes[], edges[]}`. |

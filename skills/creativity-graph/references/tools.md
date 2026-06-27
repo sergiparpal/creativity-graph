@@ -20,7 +20,7 @@ plus the read-only `kg_agenda` (§1.16), `kg_export` (§1.17), and the projectio
 There is no `kg_build` / `kg_query` /
 `kg_project` MCP tool — those are slash commands (`/kg-build`, …) that *orchestrate* these tools.
 
-Mutation tools (`kg_write`, `kg_propose`, `kg_ground`, `kg_rename`) write the **canon** (human-editable Markdown,
+Mutation tools (`kg_write`, `kg_propose`, `kg_ground`, `kg_rename`, `kg_merge`) write the **canon** (human-editable Markdown,
 the single source of truth) — `kg_propose` (§1.12) is the hypothesized write lane and `kg_operate` (§1.14) writes
 through it. Read tools (`get_node`, `get_neighbors`, `shortest_path`, `query_graph`, `kg_context`) and the
 generative reads (`kg_generate` §1.13, `kg_absorption` §1.15) read the **derived** layer; they call
@@ -156,6 +156,35 @@ single-canonical-edge rule. Both ids are slugged.
 ```
 
 Failure: `{"ok": false, "error": "node not found"}` or `"target id exists"`. `ok` is `false` (with `error: "rename rolled back: …"`) if the multi-file write had to roll back.
+
+`kg_rename` stays **strict** — `"target id exists"` is a refusal, never a silent merge. To collapse two
+nodes that genuinely name the same concept, use `kg_merge` (below).
+
+### 1.5b `mcp__plugin_creativity-graph_creativity-graph__kg_merge(from_id, into_id)`
+
+The **deliberate node-merge** `kg_rename` refuses. Folds `from_id` into the existing `into_id` (both must
+exist), rewrites every edge endpoint `from_id`→`into_id`, then RETIRES `from_id`. Where the rewrite makes
+two edges share one canonical id they are **deduped** (never duplicated, never an error):
+
+- **Negative information is sticky (§1.7):** if either edge is `failed` or `rejected`, the merged edge keeps
+  that state — it is never pruned. Otherwise the stronger of `grounded` > `unverified` wins.
+- The **verbatim span** and the stored **verdict note** are kept; provenance prefers `span-present`. No
+  verdict or span is ever forged, upgraded, or invented — the merged state is always one a real edge held.
+- **Self-loops** the rewrite creates (`source == target`) are dropped and reported.
+
+Keeps `into_id`'s `node_type`/`label`, and **refuses** (`"node_type conflict — refusing to merge"`) a merge
+across two *different declared* node types so a wrong merge can't corrupt typing. A surviving verdict whose
+edge id changed is re-keyed via the same id-migrating audit record as `kg_rename`, so it survives the
+reconciler's §1.8 forgery sweep.
+
+```json
+{"ok": true, "from": "dpp", "into": "dpp-selection",
+ "touched": ["dpp-selection", "collapse-toward-typical"],
+ "edges_rewritten": 3, "edges_deduped": [{"id": "e_dpp-selection__defends-against__collapse-toward-typical", "state": "grounded"}],
+ "self_loops_dropped": [], "nodes": 41, "edges": 87}
+```
+
+Failure: `{"ok": false, "error": "source node not found" | "target node not found" | "cannot merge a node into itself" | "node_type conflict — refusing to merge"}`; `ok` is `false` (`error: "merge rolled back: …"`) if the multi-file write rolled back — the graph is left untouched.
 
 ### 1.6 `mcp__plugin_creativity-graph_creativity-graph__kg_metrics()`
 
@@ -625,7 +654,8 @@ The `graph` condition "wins" only if it is `>=` control on diversity AND novelty
 | check the server is up / pack loaded | `kg_ping()` |
 | write extracted nodes/edges | `kg_write(payload)` (boundary, §1.5) |
 | set a verdict (grounded/rejected/failed/obsolete) | `kg_ground(...)` — the **only** way |
-| fix a node id everywhere | `kg_rename(old, new)` |
+| fix a node id everywhere | `kg_rename(old, new)` (strict — refuses if `new` exists) |
+| merge two nodes that name the same concept | `kg_merge(from, into)` (dedups edges, keeps negative info) |
 | cheap counts | `kg_metrics()` |
 | projection-free status / resume a partial build | `kg_status()` |
 | browse by type/relation/state, ranked by degree | `query_graph(...)` |

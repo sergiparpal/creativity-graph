@@ -220,3 +220,29 @@ confirmed all ten taught directions match the source prose. **Not yet re-measure
 gate must be re-run on the real build corpus — the bundled `examples/source.md` demo already scores **1.00**
 and is too small (one `bridges`, one `projects` edge) to exhibit this regression, so the table row above
 (Stage 4, precision 1.00) remains the demo-corpus measurement, not a refutation of the 0.61 finding.
+
+---
+
+## kg_merge — deliberate node-merge with edge dedup (v0.5.3)
+
+A `/kg-ground` adversarial pass flagged two nodes as the same concept (`dpp` / `dpp-selection`, both
+carrying a grounded `defends_against → collapse-toward-typical` edge) with **no honest way to collapse
+them**: `kg_rename` errors on a target-id collision (it is a pure rename), `kg_operate` only writes new
+hypothesized structure, and there was no merge/delete primitive — so the only cleanup path forged a verdict
+(stamping the duplicate's genuinely-grounded edge `rejected`, violating §1.4/§1.8). New tool **`kg_merge`**
+closes the gap.
+
+- **`kg_merge(from_id, into_id)`** (MCP tool + `KGEngine.kg_merge`): rewrites every endpoint `from`→`into`,
+  **dedups** colliding edge ids (negative info sticky — `failed`/`rejected` survive, else `grounded` >
+  `unverified`; verbatim span + verdict note kept; never forges/upgrades a verdict or span), drops the
+  self-loops the rewrite creates, retires `from`, and re-keys surviving verdicts via the same id-migrating
+  audit record as `kg_rename` so the reconciler's §1.8 sweep doesn't re-quarantine them. Refuses a merge
+  across two different *declared* node types. Canon-only — never the projection seam.
+- `kg_rename` stays **strict** (still errors on `target id exists`) — a name collision is never a silent
+  merge. `/kg-ground`'s Stage-6 merge checkpoint now executes the accepted merge via `kg_merge`.
+
+Verified in-repo: 9 new tests in `tests/test_merge.py` (collision dedup, sticky negative info, self-loop
+drop, node-type-conflict refusal, rename-still-strict, determinism/idempotency, verdict-survives-reconcile),
+a confirmation that the migrating audit record is **load-bearing** (dropping it re-quarantines the verdict),
+full suite green (**612 passed**), pack validates, and `validate_plugin.py` versions agree at **v0.5.3**.
+MCP tool surface is now **19 tools** (was 18); `kg_ground` remains the sole verdict channel.

@@ -14,6 +14,42 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-06-27
+
+A new write tool: **`kg_merge`** — the deliberate node-merge that `kg_rename` (deliberately) refuses. A
+grounding/reconcile pass that finds two nodes naming the same concept (e.g. `dpp` and `dpp-selection`, both
+carrying a grounded `defends_against → collapse-toward-typical` edge) previously had no honest way to
+collapse them: `kg_rename` errors on a target-id collision, `kg_operate` only writes new hypothesized
+structure, and there was no merge/delete primitive — so the only "cleanup" path forged a verdict. `kg_merge`
+closes that gap without weakening `kg_rename` or touching verdict semantics.
+
+### Added
+
+- **`kg_merge(from_id, into_id)` (MCP tool + `KGEngine.kg_merge`).** Folds `from_id` into the existing
+  `into_id` (both must exist) and retires `from_id`. It is a **distinct verb** from `kg_rename`, which stays
+  strict (still errors on `target id exists`) — a name collision is never silently a merge.
+  - **Edge-id collision ⇒ dedup, never duplicate/error.** When the `from_id`→`into_id` rewrite collapses
+    two edges onto one canonical `edge_id`, they are coalesced with negative-information-sticky precedence:
+    if either side is `failed`/`rejected` the merged edge keeps that state (§1.7 — never pruned), else
+    `grounded` beats `unverified`; the verbatim span + stored verdict note are kept and `span-present`
+    provenance is preferred. The merged state is always one a real edge already held — **no verdict or span
+    is ever forged, upgraded, or invented** (§1.4/§1.8). The dedup is order-insensitive (deterministic).
+  - **Self-loops** the rewrite creates (`source == target`) are dropped and reported.
+  - **Typing guard:** keeps `into_id`'s `node_type`/`label`; **refuses** a merge across two *different
+    declared* node types (`node_type conflict — refusing to merge`) so a wrong merge can't corrupt typing.
+  - **Verdict survival:** a surviving verdict whose `edge_id` changed is re-keyed via the same id-migrating
+    `GroundAuditLog` record as `kg_rename`, so the reconciler's §1.8 forgery sweep does not re-quarantine it.
+    Like the other writers, `kg_merge` touches only the canon — never the projection seam.
+  - Returns `{ok, from, into, touched[], edges_rewritten, edges_deduped[], self_loops_dropped[], nodes, edges}`.
+- **`/kg-ground` Stage-6 merge checkpoint now executes the merge** via `kg_merge` (added to the command's
+  `allowed-tools`) instead of deferring it to an out-of-band `kg_rename`/reconcile step.
+- **Tests:** `tests/test_merge.py` — collision dedup (grounded > unverified, span/note kept), sticky
+  `failed`/`rejected` negative information, self-loop drop, node-type-conflict refusal (no mutation),
+  `kg_rename` still strict on target-exists, determinism/idempotency, and verdict-survives-reconcile.
+
+The MCP tool surface is now **19 tools** (was 18). No existing tool's semantics changed; `kg_ground`
+remains the sole verdict channel.
+
 ## [0.5.2] — 2026-06-27
 
 A Stage-4 extraction-precision fix: tighten how the LLM extractor assigns relation **direction** and

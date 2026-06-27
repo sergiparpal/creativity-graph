@@ -95,7 +95,8 @@ demoted to `unverified` (every lane, including hypothesized). `authored_by=human
 `agent`. A claimed `authored_by=deterministic` is demoted to `agent` on the span-present/inferred lane (it
 would bypass the span check); on the **hypothesized** lane there is no span check to bypass, so a
 deterministic discovery-mechanism author is **preserved** there. Verdicts are applied ONLY through
-`kg_ground` (and the id-migrating `kg_rename`), which stamp `verdict_by`, `verdict_at`, and append a record
+`kg_ground` (and the id-migrating `kg_rename`/`kg_merge`, which carry an existing verdict to a re-keyed
+edge but can never mint one), which stamp `verdict_by`, `verdict_at`, and append a record
 to the crash-safe `GroundAuditLog` (`groundaudit`, §1.8) via `audited_write` (capturing the offset first so a
 failed canon write truncates the orphan record back). The reconciler *counts* those records (`_audit_counts`,
 not set-membership, so a replayed verdict has no unconsumed record left) and re-quarantines any out-of-band
@@ -161,16 +162,16 @@ edit, or a non-git vault — still reprojects.
 - `canonmerge`: `merge_nodes` / `merge_note_files` / `main` — the R5 semantic git merge driver for
   per-node canon Markdown (union edges by `edge_id`, demote a cross-branch verdict conflict to
   `unverified`); structurally incapable of forging a verdict.
-- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 18 tools: `kg_ping`,
+- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 19 tools: `kg_ping`,
   `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`
   (read-only structural agenda), `kg_export` (read-only human-facing render), `kg_write`, `kg_ground`,
-  `kg_rename`, `kg_metrics`, `kg_status`, plus the four generative-layer tools `kg_propose`, `kg_generate`, `kg_operate`,
-  `kg_absorption`.
+  `kg_rename`, `kg_merge` (deliberate node-merge with edge dedup), `kg_metrics`, `kg_status`, plus the four
+  generative-layer tools `kg_propose`, `kg_generate`, `kg_operate`, `kg_absorption`.
 - `server` **transport/cancellation resilience (v0.5.0):** `kg_write` is idempotent — every response carries
   a deterministic `receipt` (a hash over the sorted payload target ids) and an optional `idempotency_key`
   replays the cached response verbatim (`idempotent_replay`) on a retry whose transport result was lost; a
   rolled-back batch is never cached. **Writes never pass through the projection seam**
-  (`kg_write`/`kg_propose`/`kg_ground`/`kg_rename` touch only the canon), and a reprojection that raises
+  (`kg_write`/`kg_propose`/`kg_ground`/`kg_rename`/`kg_merge` touch only the canon), and a reprojection that raises
   degrades the **read** path — logs, sets `projection_degraded`, materialises an empty-schema derived layer,
   serves canon-derived/empty data with the flag — instead of crashing. `kg_status` is a projection-FREE
   canon-only probe (counts, the `unverified` queue, source-section coverage) for resuming a partial build.

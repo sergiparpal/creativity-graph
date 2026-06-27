@@ -1,7 +1,7 @@
 ---
 description: Drain the grounding queue — verdict unverified edges, attack hub candidates, then report verdict counts and falsification memory.
 argument-hint: "[query-or-node-filter]"
-allowed-tools: Task, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__kg_agenda
+allowed-tools: Task, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__kg_agenda, mcp__plugin_creativity-graph_creativity-graph__kg_merge
 ---
 
 # /kg-ground — grounding loop + adversarial grounder + memory of failures (§1.6/§1.7/§1.8, plan Stage 6)
@@ -145,8 +145,10 @@ Merge A and B? [y/N]
 ```
 
 Default is **N** (keep the nodes separate) after a brief wait — proceed without merging unless the human
-explicitly answers `y`. (Merging, if accepted, is a `kg_rename`/reconcile concern handled outside this
-read-and-dispatch command.)
+explicitly answers `y`. If accepted, perform the merge with **`kg_merge(from_id, into_id)`** — the
+deliberate node-merge tool: it rewrites + dedups the colliding edges (negative information stays sticky,
+`grounded` beats `unverified`, no verdict is forged) and re-keys any surviving verdict so the reconciler
+(§1.8) does not re-quarantine it. (`kg_rename` will NOT do this — it refuses a target-id collision.)
 
 ## Invariants this command upholds
 

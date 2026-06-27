@@ -27,10 +27,12 @@ from .groundaudit import GroundAuditLog
 from .model import (
     AuthoredBy,
     Disposition,
+    Edge,
     EpistemicState,
     GROUNDABLE_STATES,
     Node,
     Provenance,
+    UNDECLARED_TYPE,
     normalize_text,
     slug,
     utcnow,
@@ -52,6 +54,27 @@ VALID_VERDICTS = {s.value for s in GROUNDABLE_STATES}
 # The known verdict actors, derived from the AuthoredBy enum (mirroring how VALID_VERDICTS derives from
 # GROUNDABLE_STATES) so the clamp tracks the model instead of an inline literal that can drift.
 VALID_ACTORS = {a.value for a in AuthoredBy}
+
+# Precedence used when kg_merge dedups two edges that collide on one canonical id (§1.4/§1.7). The
+# winning epistemic_state is whichever ranks higher: failed/rejected are sticky NEGATIVE INFORMATION
+# (never pruned, §1.7) so they dominate any positive state; then grounded > unverified; `obsolete`
+# (a lifecycle state, not a verdict) ranks lowest. The merged state is therefore ALWAYS a state one of
+# the two real edges already held — the merge can never forge or upgrade a verdict.
+_MERGE_STATE_RANK = {
+    EpistemicState.FAILED: 4,
+    EpistemicState.REJECTED: 3,
+    EpistemicState.GROUNDED: 2,
+    EpistemicState.UNVERIFIED: 1,
+    EpistemicState.OBSOLETE: 0,
+}
+# Tie-break (and span-less provenance) order: a verbatim span (span-present) beats an asserted
+# inference, which beats a structural guess (hypothesized). Used to keep the cited span + its verdict
+# paired on a state tie, never to invent evidence.
+_MERGE_PROV_RANK = {
+    Provenance.SPAN_PRESENT: 2,
+    Provenance.INFERRED: 1,
+    Provenance.HYPOTHESIZED: 0,
+}
 
 # ---- transport/cancellation hardening (the robustness pass) ----------------------------------------
 # A rotating server log so the whole class of stdio-transport/cancellation crash is finally debuggable:
@@ -819,6 +842,173 @@ class KGEngine:
         finally:
             self.canon._release_lock()
 
+    @staticmethod
+    def _merge_edge_pair(a: Edge, b: Edge) -> Edge:
+        """Coalesce two edges that collide on ONE canonical id into a single edge — the dedup step of
+        kg_merge — deterministically and WITHOUT forging, upgrading, or inventing a verdict/span.
+
+        The merged epistemic_state is whichever of the two ranks higher (failed/rejected sticky as
+        never-pruned negative information §1.7, else grounded > unverified), so the state is ALWAYS one
+        a real edge already held. The verbatim span and verdict note are kept non-empty (never invented),
+        and the verdict attribution (`verdict_by`/`verdict_at`) travels WITH the winning state so a
+        grounded/failed edge is never left as a verdict floating over empty support (§1.8). The function
+        is order-insensitive: swapping (a, b) yields the same merged edge."""
+        ra, rb = _MERGE_STATE_RANK[a.epistemic_state], _MERGE_STATE_RANK[b.epistemic_state]
+        if ra != rb:
+            hi, lo = (a, b) if ra > rb else (b, a)
+        else:
+            # same state — keep the record carrying real evidence so its span + verdict stay paired.
+            hi, lo = ((a, b) if _MERGE_PROV_RANK[a.provenance] >= _MERGE_PROV_RANK[b.provenance]
+                      else (b, a))
+        state = hi.epistemic_state
+        # Keep a non-empty verbatim span, preferring the winning-state edge's (the span its verdict
+        # cited). A surviving real span IS span-present; otherwise keep the stronger spanless provenance.
+        span = hi.span or lo.span
+        if span:
+            provenance = Provenance.SPAN_PRESENT
+        else:
+            provenance = (a.provenance if _MERGE_PROV_RANK[a.provenance] >= _MERGE_PROV_RANK[b.provenance]
+                          else b.provenance)
+        verdict_by, verdict_at = ((hi.verdict_by, hi.verdict_at)
+                                  if state in GROUNDABLE_STATES else (None, None))
+        return Edge(source=hi.source, target=hi.target, relation=hi.relation,
+                    provenance=provenance, authored_by=hi.authored_by, epistemic_state=state,
+                    span=span, source_file=hi.source_file or lo.source_file,
+                    confidence=hi.confidence, confidence_score=hi.confidence_score,
+                    verdict_by=verdict_by, verdict_at=verdict_at, notes=(hi.notes or lo.notes))
+
+    def _rewrite_dedup_edges(self, edges: "list[Edge]", frm: str, into: str, report: dict):
+        """Rewrite every `frm`→`into` endpoint on a node's edge list, recompute each deterministic id,
+        DROP self-loops (a rewrite that collapsed source==target), and DEDUP edges that now share one
+        canonical id via `_merge_edge_pair`. Two edges can only collide on an id iff they share a source
+        (edge_id is a function of source), and a node file holds only its own source's edges — so a
+        collision is always within ONE file, which is why this dedup is per-node. Mutates `report`'s
+        counters and returns (deduped_edges, changed)."""
+        from .model import edge_id
+        survivors: dict[str, Edge] = {}
+        changed = False
+        for e in edges:
+            rewritten = (e.source == frm) or (e.target == frm)
+            if e.source == frm:
+                e.source = into
+            if e.target == frm:
+                e.target = into
+            e.id = edge_id(e.source, e.relation, e.target)
+            if rewritten:
+                report["edges_rewritten"] += 1
+                changed = True
+            if e.source == e.target:  # the rewrite collapsed an endpoint pair into a self-loop — drop it
+                report["self_loops_dropped"].append(e.id)
+                changed = True
+                continue
+            prev = survivors.get(e.id)
+            if prev is None:
+                survivors[e.id] = e
+            else:
+                survivors[e.id] = self._merge_edge_pair(prev, e)
+                report["edges_deduped"].append(
+                    {"id": e.id, "state": survivors[e.id].epistemic_state.value})
+                changed = True
+        return list(survivors.values()), changed
+
+    def kg_merge(self, from_id: str, into_id: str, *, message: str = "kg_merge") -> dict:
+        """Merge node `from_id` INTO `into_id`: rewrite every edge endpoint referencing `from_id` to
+        `into_id`, dedup edges that then collide on one canonical id (negative-info-sticky, never forging
+        a verdict), drop the self-loops the rewrite creates, and RETIRE `from_id`. A DELIBERATE merge —
+        deliberately a distinct verb from kg_rename, which stays strict (errors on a target collision) so
+        a name clash can never silently fold two concepts together. Operates on the CANON only (never the
+        projection seam); the reconciler re-attaches surviving verdicts to their new ids (§1.8)."""
+        frm, into = slug(from_id), slug(into_id)
+        if frm == into:
+            return {"ok": False, "error": "cannot merge a node into itself", "from": frm, "into": into}
+        # Acquire the single-writer lease FIRST, then read everything FRESH under the lease — same
+        # ordering as kg_rename/kg_ground (F17/L5): reading before locking would let a concurrent
+        # cross-process verdict on a sibling edge be clobbered by our verbatim (merge=False) write.
+        if not self.canon.try_acquire_lock():
+            return {"ok": False, "error": "canon vault is locked by another live session",
+                    "from": frm, "into": into}
+        try:
+            if not self.canon.exists(frm):
+                return {"ok": False, "error": "source node not found", "from": frm, "into": into}
+            if not self.canon.exists(into):
+                return {"ok": False, "error": "target node not found", "from": frm, "into": into}
+            try:
+                from_node = self.canon.read_node(frm)   # corrupt/invalid-UTF-8 note → structured error
+                into_node = self.canon.read_node(into)
+            except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
+                return {"ok": False, "error": f"node unreadable: {e}", "from": frm, "into": into}
+            # Typing safety: keep `into`'s node_type/label, but REFUSE a merge that would silently
+            # overwrite one DECLARED type with a different one — a wrong merge must not corrupt typing.
+            # An undeclared-type placeholder on either side is not a conflict (it carries no commitment).
+            if (from_node.node_type != into_node.node_type
+                    and from_node.node_type != UNDECLARED_TYPE
+                    and into_node.node_type != UNDECLARED_TYPE):
+                return {"ok": False, "error": "node_type conflict — refusing to merge",
+                        "from_type": from_node.node_type, "into_type": into_node.node_type,
+                        "from": frm, "into": into}
+
+            others = [n for n in self.canon.all_nodes() if n.id not in (frm, into)]
+            # Snapshot every (edge_id, state) present BEFORE the rewrite. We emit a migrating audit
+            # record ONLY for a surviving policed edge whose (id, state) is NEW — i.e. its verdict now
+            # sits where the audit history can't justify it (the rewrite changed its id, OR a dedup
+            # lifted the state at an existing id). An edge whose (id, state) is unchanged already has its
+            # baseline record, so we leave no spurious spendable record behind (mirrors kg_rename's
+            # precisely-sized migration set; §1.8).
+            pre_states = {(e.id, e.epistemic_state.value)
+                          for n in [from_node, into_node, *others] for e in n.edges}
+
+            report = {"edges_rewritten": 0, "edges_deduped": [], "self_loops_dropped": []}
+            # `into` absorbs its own edges PLUS every edge sourced at `from` (all of which rewrite onto
+            # `into`); rewrite + dedup the combined list as one file.
+            into_node.edges, _ = self._rewrite_dedup_edges(
+                list(into_node.edges) + list(from_node.edges), frm, into, report)
+            touched = [into_node]
+            for n in others:
+                n.edges, changed = self._rewrite_dedup_edges(n.edges, frm, into, report)
+                if changed:
+                    touched.append(n)
+
+            migrations = [(e.id, e.epistemic_state.value)
+                          for e in (into_node.edges + [e for n in others for e in n.edges])
+                          if e.epistemic_state in GROUNDABLE_STATES
+                          and (e.id, e.epistemic_state.value) not in pre_states]
+            records = [(eid, EpistemicState.UNVERIFIED.value, state, "agent")
+                       for eid, state in migrations]
+
+            def _attempt():
+                # merge=False: every endpoint is already rewritten + deduped, so re-merging would
+                # re-introduce the pre-rewrite edges (different id → not deduped) — same posture as
+                # kg_rename. The failure SIGNAL is info.rolled_back, not a caught exception.
+                info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
+                return (not info.rolled_back), info
+
+            info = self._audit_log.audited_write(records, _attempt)
+            if info.rolled_back:
+                # the batch rolled back — do NOT unlink `from` (its migrating records were already
+                # truncated by audited_write); the graph is left exactly as it was.
+                return {"ok": False, "error": f"merge rolled back: {info.error}",
+                        "from": frm, "into": into}
+            try:
+                self.canon.node_path(frm).unlink(missing_ok=True)  # retire the now-empty source node
+            except OSError as e:
+                return {"ok": False, "from": frm, "into": into, "touched": [n.id for n in touched],
+                        "error": f"merge wrote '{into}' but could not remove old '{frm}': {e}"}
+            from .canon import _git, _git_ok
+            if _git_ok(self.canon.root):
+                # stage only the rewritten notes + the removed source note (not a whole-tree `git add -A`).
+                paths = [str(self.canon.node_path(n.id)) for n in touched]
+                paths.append(str(self.canon.node_path(frm)))
+                _git(self.canon.root, "add", "--", *paths, check=False)
+                _git(self.canon.root, "commit", "-m", message, "--allow-empty", check=False)
+            return {"ok": True, "from": frm, "into": into, "touched": [n.id for n in touched],
+                    "edges_rewritten": report["edges_rewritten"],
+                    "edges_deduped": report["edges_deduped"],
+                    "self_loops_dropped": report["self_loops_dropped"],
+                    "nodes": len(others) + 1,
+                    "edges": sum(len(n.edges) for n in others) + len(into_node.edges)}
+        finally:
+            self.canon._release_lock()
+
     def kg_metrics(self) -> dict:
         # When the derived index is already fresh, serve counts from it with O(1) SQL instead of
         # re-parsing the whole canon (server-3). kg_metrics is not itself a projection trigger, so when
@@ -1227,8 +1417,21 @@ def _register(mcp, engine: KGEngine) -> None:
     @mcp.tool()
     @_tool_result
     def kg_rename(old_id: str, new_id: str) -> dict:
-        """Rename a node and rewrite every edge endpoint referencing it."""
+        """Rename a node and rewrite every edge endpoint referencing it. STRICT: refuses when `new_id`
+        already exists (a name collision is never silently a merge — use kg_merge for that)."""
         return engine.kg_rename(old_id, new_id)
+
+    @mcp.tool()
+    @_tool_result
+    def kg_merge(from_id: str, into_id: str) -> dict:
+        """Deliberately MERGE node `from_id` into the existing node `into_id` (both must exist), then
+        retire `from_id`. Rewrites every edge endpoint `from_id`→`into_id`; where that collides two edges
+        on one canonical id they are DEDUPED — failed/rejected negative information is sticky and never
+        pruned (§1.7), else grounded beats unverified, and the verbatim span + verdict note are kept;
+        no verdict/span is ever forged, upgraded, or invented. Self-loops the rewrite creates are dropped.
+        Keeps `into_id`'s node_type/label and REFUSES a merge across two different declared node_types.
+        Returns the edges rewritten/deduped/dropped and the final counts."""
+        return engine.kg_merge(from_id, into_id)
 
     @mcp.tool()
     @_tool_result
