@@ -14,6 +14,33 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-06-27
+
+A Stage-4 extraction-precision fix: tighten how the LLM extractor assigns relation **direction** and
+**type**. Prompt/pack only — no engine logic changed; every hard guarantee still lives in the `kg_write`
+boundary. The diagnosed dominant Stage-4 miss (precision 0.61 at span-support 0.94) was a *correct
+verbatim span* carried on a **reversed** directed relation (`grounds`/`attacked_by`/`defends_against`) or
+an **over-claimed** region-spanning one (`bridges` 0/5, `projects` 0/3 — instance-of / "reveals" /
+paired concepts mislabeled). The boundary verifies the span, not the direction, so the direction has to
+be taught in the prompt.
+
+### Changed
+
+- **`agents/extractor.md` — new "Relation DIRECTION is load-bearing" section.** A per-relation HEAD/TAIL
+  role table covering all ten edge types; a "do not reach for a region-spanning relation when the prose
+  says something narrower" guard (an instance offered as evidence → `grounds` while a bare taxonomic
+  *is-a* is dropped; paired concepts emit no edge unless a real tension is stated; "reveals" ≠
+  `projects`; complement/contrast ≠ `reconciles_with`); and a worked reversal anchored on a verbatim §2
+  span (`Span-present provenance *grounds* a claim`).
+- **`pack/pack.yaml` — edge-type comments rewritten as HEAD/TAIL role definitions.** The ten edge-type
+  *names* are unchanged, so the validated pack contract is identical and `pack.yaml` `version` stays
+  `0.1.0`; only the human-reference `#` comments changed (they document the same directional rule the
+  extractor enforces, and never reach the model).
+
+The precision gate (`f4_probe`, ≥ 0.70) must be re-measured against the real build corpus: the bundled
+`examples/source.md` demo already scores 1.00 and is too small (one `bridges`, one `projects` edge) to
+exhibit the regression this fix targets.
+
 ## [0.5.1] — 2026-06-26
 
 A follow-up to the transport/cancellation resilience pass: close one more way the MCP server could

@@ -14,16 +14,19 @@ node_types:
 
 # Relation types the theory actually uses (drawn from the source prose).
 edge_types:
-  - grounds          # X provides verifiable support for Y
-  - attacked_by      # X is challenged by a stronger/more specific Y
-  - reconciles_with  # X resolves an intuition that Y captured imperfectly
-  - bridges          # X joins two otherwise separate communities
-  - collapses_into   # X reduces to / is subsumed by Y
-  - confounded_by    # X's apparent value is inflated by Y
-  - approximates     # X is an honest cheap proxy for Y
-  - defends_against  # X guards the graph against Y
-  - projects         # X is the regenerable projection of Y
-  - survives         # X persists across an operation Y
+  # Directed edges read  HEAD <relation> TAIL.  Reversing HEAD/TAIL was the dominant Stage-4 miss
+  # (precision 0.61, span-support 0.94: the span is right, the direction/type is wrong). These per-type
+  # comments are human-reference only — they never reach the model; agents/extractor.md is the live lever.
+  - grounds          # HEAD = evidence/foundation, TAIL = claim it supports. NOT part-of.
+  - attacked_by      # HEAD = victim (vaguer), TAIL = attacker (stronger/more specific).
+  - reconciles_with  # HEAD resolves a real tension TAIL left open. NOT mere complement/contrast.
+  - bridges          # HEAD joins two separate communities. NOT instance-of/evidence-of, NOT paired maxims.
+  - collapses_into   # HEAD reduces to / is subsumed by TAIL. NOT "is a clause/risk of", NOT "opposite extreme of".
+  - confounded_by    # HEAD's apparent value is inflated by TAIL.
+  - approximates     # HEAD = cheap proxy, TAIL = the truer target it stands in for. NOT instance-of, NOT "related but distinct".
+  - defends_against  # HEAD = remedy/defense, TAIL = threat/problem. The problem is the TAIL.
+  - projects         # HEAD = regenerable projection, TAIL = source it derives from. NOT "reveals / makes-detectable".
+  - survives         # HEAD = claim/info that persists, TAIL = the operation it survives (TAIL must be an `operation`).
 
 glossary:
   compression: "A single idea that stands in for many observations; earns its keep only when it predicts."

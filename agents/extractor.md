@@ -61,6 +61,44 @@ and never reaches the graph. (The `undeclared-type` string is only the node_type
 parks an undeclared node under — it is never a `details.reason`.) (Read `pack/pack.yaml` and `pack/glossary.md`
 if you need the precise sense of a term.)
 
+## Relation DIRECTION is load-bearing — the dominant Stage-4 precision miss
+Every directed edge reads `HEAD <relation> TAIL`. The right two nodes in the **wrong order** is not
+`correct` — it counts against precision (`wrong_type`, f4_probe's catch-all for an edge that is neither
+right nor an outright fabrication) and was the single largest Stage-4 miss (precision 0.61 with
+span-support 0.94 — the span is usually right; the direction/type is wrong). The boundary cannot catch a
+reversed direction (only a wrong *span*), so the direction is on you. Before emitting a directed edge,
+name the HEAD by its role:
+
+| relation         | HEAD is…                     | TAIL is…                                |
+|------------------|------------------------------|-----------------------------------------|
+| grounds          | the evidence/foundation      | the claim it supports                   |
+| attacked_by      | the victim (vaguer/weaker)   | the attacker (stronger/more specific)   |
+| defends_against  | the remedy/defense           | the threat/problem                      |
+| confounded_by    | the inflated metric/value    | the confound that inflates it           |
+| collapses_into   | the thing that reduces       | what it reduces to                      |
+| approximates     | the cheap proxy              | the truer target it stands in for       |
+| projects         | the regenerable projection   | the source it derives from              |
+| survives         | the claim/info that persists | the operation node it survives          |
+
+(`reconciles_with` and `bridges` feel symmetric but are still typed HEAD→TAIL: for `reconciles_with`,
+HEAD is the resolution and TAIL is the intuition it rescues; for `bridges`, HEAD is the node that joins
+the two communities.)
+
+### Do NOT reach for a region-spanning relation when the prose says something narrower
+- an instance/example offered as **evidence** for a claim → `grounds` (the example is the HEAD), never
+  `bridges`/`approximates`. A bare taxonomic **is-a** with no evidential role has no pack relation — drop it.
+- two merely complementary / paired concepts → emit no edge (use `reconciles_with` **only** if the prose
+  states a real tension one resolves).
+- "reveals / makes detectable" → NOT `projects`.
+- complement / contrast → NOT `reconciles_with`.
+
+### Worked reversal (from examples/source.md §2)
+The source says `Span-present provenance *grounds* a claim`: the **foundation** is span-present provenance,
+the **claim** is what it supports — so emit `span-present grounds claim` (HEAD = the evidence, TAIL = the
+claim), never the reversed `claim grounds span-present`. Rule of thumb: when the prose says "A holds
+**because** of B", B is the foundation — emit `B grounds A`, never `A grounds B`. (The boundary verifies
+the **span**, not the **direction**, so getting HEAD/TAIL right is on you.)
+
 ## The kg_write payload contract (Pydantic — EXTRA FIELDS FORBIDDEN)
 One payload per section. Set `complete: true` on a terminal payload. A **missing** `complete` defaults to
 `true` (accepted); only an explicit `complete: false` is REJECTED as `truncated-payload`.
