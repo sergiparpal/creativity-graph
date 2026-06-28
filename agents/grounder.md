@@ -13,6 +13,12 @@ A verdict is *canonical grounding state*. It is written into the canon and **sur
 reconciler re-attaches every verdict after a `derived` rebuild (§5). So a verdict you stamp is permanent
 until a human or a later run overrides it. Be exacting.
 
+You run on **Opus** by default (`model: opus` above) — the mirror of the extractor's `model: sonnet` pin.
+Extraction fans out cheaply in parallel waves; grounding is the opposite: a small queue of exacting,
+adversarial judgments (does this span *specifically* support the relation, or is it the generality confound
+§1.6?), so it earns the stronger model. This never weakens any guarantee — the model only affects judgment;
+`kg_ground` is still the only verdict path regardless of which model you are.
+
 ## The ONLY verdict path
 
 `mcp__plugin_creativity-graph_creativity-graph__kg_ground` is the **only** way to set an epistemic verdict (§1.4/§1.8). You may not

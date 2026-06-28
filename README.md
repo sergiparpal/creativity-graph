@@ -440,7 +440,7 @@ creativity-graph/
 │   ├── adversarial-grounder.md    # kg-adversarial-grounder → attacked_by + kg_ground(failed)
 │   ├── generator.md               # kg-generator          → phrase/name candidates → kg_propose
 │   ├── annotator.md               # kg-annotator          → f4_probe labels / α label passes
-│   └── evaluator.md               # kg-evaluator          → blind ideation experiment (control|graph|graph+generate|rag)
+│   └── evaluator.md               # kg-evaluator          → blind ideation experiment (control|graph|graph+generate|rag · +optional lightrag)
 ├── skills/creativity-graph/       # SKILL.md operating guide + references/
 ├── pack/{pack.yaml,glossary.md}   # the declared vocabulary
 ├── hooks/                         # SessionStart provisioning + PreToolUse context (cross-platform)
@@ -569,7 +569,7 @@ python scripts/f4_probe.py score   labels.csv          # PRECISION (gate ≥ 0.7
 # Harness (ground-time / experiment gates) — all emit JSON
 python -m kg_engine.harness agreement   label_sets.json    # Krippendorff α (≥ 0.67 reliable)
 python -m kg_engine.harness specificity derived/graph.json examples/source.md   # bridge-metric gate verdict
-python -m kg_engine.harness ideation    outputs.json       # control|graph|graph+generate|rag scoring
+python -m kg_engine.harness ideation    outputs.json       # control|graph|graph+generate|rag scoring (+optional lightrag arm)
 ```
 
 `f4_probe` verdict vocabulary (the only labels an annotator may emit):

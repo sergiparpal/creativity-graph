@@ -31,7 +31,7 @@ below and `.mcp.json`; that's a runtime detail, not how you develop.)
 ```sh
 # Environment
 uv sync                                   # or: pip install -e ".[dev,backend]"
-# extras: dev (pytest) · backend (anthropic)
+# extras: dev (pytest) · backend (anthropic) · lightrag (optional GraphRAG experiment arm)
 
 # Tests (pytest config in pyproject: testpaths=["tests"], addopts="-q")
 uv run pytest                             # full suite
@@ -125,13 +125,13 @@ bundles these; its `references/{contract,tools,pack-schema}.md` are loaded on de
 | Command | Subagent(s) | What happens |
 |---|---|---|
 | `/kg-build` | `kg-extractor` | One extractor per `##` section (Sonnet by default), launched in bounded parallel **waves** (`extract_wave_size`, default 6) → `kg_scrub` (egress) → `kg_write` boundary; lands `unverified` edges with verbatim spans. One section per subagent preserves span-isolation; a wave's brief writes funnel through the single-threaded MCP server (FastMCP runs sync tools on the event loop) and serialize there, with the canon lease as the cross-process safety guarantee |
-| `/kg-ground` | `kg-grounder`, `kg-adversarial-grounder` | Drain the unverified queue (`grounded`/`rejected`); red-team hubs, write counter-edges, mark `failed` — all via `kg_ground` |
+| `/kg-ground` | `kg-grounder`, `kg-adversarial-grounder` | Drain the unverified queue (`grounded`/`rejected`); red-team hubs, write counter-edges, mark `failed` — all via `kg_ground`. Both roles pin `model: opus` (the expensive adversarial-reasoning work), the mirror of the extractor's `model: sonnet` pin; the model only affects judgment — verdicts still flow only through `kg_ground` |
 | `/kg-generate` | `kg-generator` | Run the discovery mechanisms (`kg_generate`: bridge/seed/compression/regroup/transplant/ensemble), phrase/name them, write `hypothesized`/`unverified` via `kg_propose`/`kg_operate` — generation is offensive, never metric-gated |
 | `/kg-perturb` | `kg-generator` | Build a second construction and cross-generate (`kg_generate` ensemble §9/§15) — the only mechanism that attacks coverage |
 | `/kg-query` | — | `kg_context` (budgeted, grounding-aware; grounded `items[]` vs separate `hypotheses[]`) + structural reads; answers cite all three axes and report falsification counters |
 | `/kg-view` | — | `kg_export` (read-only): render a self-contained offline `graph.html` (three axes on independent channels) + `GRAPH_REPORT.md` under the derived dir — a disposable human-facing view, never a write |
 | `/kg-eval` | `kg-annotator` | Stage 4 extraction precision (`f4_probe`) + Stage 7 inter-coder α and the specificity gate (`harness`) |
-| `/kg-experiment` | `kg-evaluator` | Blind A/B/C/D ideation (control vs graph vs graph+generate vs rag), scored by `harness ideation` |
+| `/kg-experiment` | `kg-evaluator` | Blind ideation (control vs graph vs graph+generate vs rag — plus an optional, off-by-default `lightrag` real-GraphRAG arm over the same corpus), scored by `harness ideation` (arm-tolerant: scores every present arm, omits a missing one without error) |
 
 The generative layer (`/kg-generate`, `/kg-perturb`) is the inversion: **generate offensively, judge
 defensively.** Candidates enter a separate `hypothesized` lane never gatekept by a metric; the existing
