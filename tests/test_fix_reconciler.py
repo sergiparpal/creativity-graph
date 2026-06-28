@@ -55,6 +55,77 @@ def test_null_sub_key_state_does_not_crash_scan(canon):
         assert isinstance(healed.get("consumed"), dict)
 
 
+def _seed_grounded_edge(engine) -> str:
+    """Write one span-verifying edge and ground it (audited). Returns its edge id."""
+    engine.kg_write({"edges": [
+        {"source": "degree", "target": "importance", "relation": "approximates",
+         "span": "Degree approximates importance", "authored_by": "agent"}]})
+    eid = edge_id("degree", "approximates", "importance")
+    engine.kg_ground(eid, "grounded", by="agent")
+    return eid
+
+
+def test_replay_survives_reconcile_state_deletion(engine):
+    """§1.8 durability: deleting the disposable .kg-reconcile-state.json cache must NOT let a
+    previously-grounded-then-demoted edge be re-forged. The spend ledger is recovered from the durable
+    checkpoint in the append-only audit log, so the already-spent record can't justify the replay."""
+    eid = _seed_grounded_edge(engine)
+    recon = Reconciler(engine.canon)
+    recon.scan(full_sweep=True)  # validates + drains the record + writes a durable checkpoint
+
+    # legitimately demote grounded -> unverified out-of-band (e.g. a canonmerge cross-branch conflict),
+    # then sweep so the checkpoint records the demoted baseline.
+    node = engine.canon.read_node("degree")
+    for e in node.edges:
+        if e.id == eid:
+            e.epistemic_state = EpistemicState.UNVERIFIED
+            e.verdict_by = e.verdict_at = None
+    engine.canon.write_one(node)
+    recon.scan(full_sweep=True)
+
+    # delete ONLY the disposable cache (the audit log + its checkpoint survive)
+    recon.state_path.unlink()
+    assert not recon.state_path.exists()
+
+    # forge the verdict back to grounded out-of-band (no kg_ground, no new audit record)
+    node = engine.canon.read_node("degree")
+    for e in node.edges:
+        if e.id == eid:
+            e.epistemic_state = EpistemicState.GROUNDED
+    engine.canon.write_one(node)
+
+    report = recon.scan(full_sweep=True)
+    assert eid in report.requarantined  # the stale record was recovered as already-spent -> forgery caught
+    after = next(e for e in engine.canon.all_edges() if e.id == eid)
+    assert after.epistemic_state == EpistemicState.UNVERIFIED
+
+
+def test_legit_verdict_survives_reconcile_state_deletion(engine):
+    """The durability recovery must be safe in the legitimate direction too: a genuinely-grounded edge
+    (never demoted) keeps its verdict after the reconcile-state cache is lost — the checkpoint restores
+    the `epistemic` baseline so `last == current` short-circuits instead of re-quarantining it."""
+    eid = _seed_grounded_edge(engine)
+    recon = Reconciler(engine.canon)
+    recon.scan(full_sweep=True)  # writes the checkpoint (consumed + grounded baseline)
+
+    recon.state_path.unlink()  # lose the disposable cache
+
+    report = recon.scan(full_sweep=True)
+    assert eid not in report.requarantined
+    after = next(e for e in engine.canon.all_edges() if e.id == eid)
+    assert after.epistemic_state == EpistemicState.GROUNDED
+
+
+def test_node_id_with_double_pipe_does_not_overdrain_sibling(canon):
+    """reconciler-||collision: a hand-edited node id containing literal '||' must not let a sibling key's
+    ledger be over-drained by the prefix match (the drain now isolates by rsplit on the last '||')."""
+    recon = Reconciler(canon)
+    consumed: dict = {}
+    audit = {"node:a||grounded": 1, "node:a||b||grounded": 1}
+    recon._drain_key_ledger("node:a", consumed, audit)
+    assert consumed == {"node:a||grounded": 1}  # the 'node:a||b' record is left untouched
+
+
 def test_non_canonical_filename_correction_lands_canonically(canon):
     """F3: the un-forgery correction for a non-slug-canonical note must be written to the CANONICAL slug
     path and the stale original deleted — one file, one edge, reset to UNVERIFIED — not a duplicate."""

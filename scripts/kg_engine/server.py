@@ -6,6 +6,8 @@ so the flow never stalls (§2.4, §4).
 """
 from __future__ import annotations
 
+import contextlib
+import copy
 import functools
 import hashlib
 import json
@@ -13,6 +15,7 @@ import logging
 from collections import Counter, OrderedDict
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -54,6 +57,37 @@ VALID_VERDICTS = {s.value for s in GROUNDABLE_STATES}
 # The known verdict actors, derived from the AuthoredBy enum (mirroring how VALID_VERDICTS derives from
 # GROUNDABLE_STATES) so the clamp tracks the model instead of an inline literal that can drift.
 VALID_ACTORS = {a.value for a in AuthoredBy}
+
+# Absolute filesystem paths (Windows drive/UNC, or a POSIX path of >=2 segments) — redacted from any
+# error string before it crosses the §1.9 egress boundary back to the session, so a raw exception can't
+# leak a vault path. A bare "/" or a single-segment "/x" or a mid-word "and/or" is deliberately NOT
+# matched (over-redaction of prose), only path-shaped runs.
+_ABS_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'`]*"        # C:\... / C:/... drive path, or \\server\share UNC
+    r"|/(?:[^\s\"'`/]+/)+[^\s\"'`/]*")            # POSIX absolute path (>=2 segments)
+
+
+def _scrub_error_text(msg, *, sensitivity: str = "medium") -> str:
+    """Scrub an error string before it crosses the §1.9 egress boundary back to the session: redact
+    absolute filesystem paths AND run the same secret/PII egress scrub `kg_scrub` applies, so a raw
+    exception can't leak a vault path or quote un-scrubbed canon content. Uses a THROWAWAY `Scrubber`
+    (the session's accumulated egress placeholder namespace is never polluted by error text) and degrades
+    to the best partial result if scrubbing itself raises — the error-reporting path must NEVER itself
+    raise. This is the single chokepoint both the tool envelope and the handler `{e}` interpolations route
+    through."""
+    try:
+        text = str(msg)
+    except Exception:  # noqa: BLE001 — an un-str-able error must not crash the error path
+        return "<unprintable error>"
+    try:
+        text = _ABS_PATH_RE.sub("<path>", text)
+    except Exception:  # noqa: BLE001 — path redaction is best-effort
+        pass
+    try:
+        text = Scrubber(sensitivity).scrub(text)[0]
+    except Exception:  # noqa: BLE001 — the secret/PII scrub is best-effort; keep the path-redacted text
+        pass
+    return text
 
 # Precedence used when kg_merge dedups two edges that collide on one canonical id (§1.4/§1.7). The
 # winning epistemic_state is whichever ranks higher: failed/rejected are sticky NEGATIVE INFORMATION
@@ -116,6 +150,55 @@ def resolve_data_dir() -> Path:
 
 def server_log_path(data_dir=None) -> Path:
     return (Path(data_dir) if data_dir else resolve_data_dir()) / SERVER_LOG_NAME
+
+
+# A readiness MARKER the Node supervisor (launch_server.mjs) reads to tell a POST-INIT crash from a
+# STARTUP crash without relying solely on a wall-clock proxy: it is written as the stdio serve loop comes
+# up (the lifespan __aenter__, AFTER imports + engine construction succeed) and its mtime, newer than the
+# child's spawn time, proves THIS engine began serving. Lives under the SAME KG_DATA dir both sides resolve
+# (resolve_data_dir <-> serverLogDir in the launcher).
+READY_MARKER_NAME = ".engine-ready"
+
+
+def ready_marker_path(data_dir=None) -> Path:
+    return (Path(data_dir) if data_dir else resolve_data_dir()) / READY_MARKER_NAME
+
+
+def write_ready_marker(data_dir=None) -> None:
+    """Stamp the readiness marker (best-effort; a failure must never block serving)."""
+    try:
+        p = ready_marker_path(data_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"pid={os.getpid()} t={time.time():.3f}\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001 — the marker is advisory; never fail startup on it
+        pass
+
+
+def clear_ready_marker(data_dir=None) -> None:
+    """Remove the readiness marker on a clean shutdown (best-effort). The supervisor also clears it on
+    each (re)spawn, so a leftover from a hard crash can never be mistaken for the next child's marker."""
+    try:
+        ready_marker_path(data_dir).unlink()
+    except OSError:
+        pass
+
+
+@contextlib.asynccontextmanager
+async def readiness_lifespan(_server=None):
+    """FastMCP lifespan: write the readiness marker as the stdio serve loop starts, clear it on exit.
+
+    __aenter__ runs after the transport is established and right BEFORE the session begins reading the
+    buffered ``initialize`` request — and crucially AFTER module import + ``build_engine_from_env``, so a
+    broken-venv import/construction error (a genuine STARTUP failure) never reaches here and stays
+    correctly classified by the supervisor's wall-clock fallback. RESIDUAL GAP: the few milliseconds
+    between this point and ``initialize`` actually being answered are attributed to "serving", so a crash
+    in that sliver is treated as post-init — acceptable since no engine code runs there (MCP handles the
+    handshake) and the alternative (a true on-initialize hook) does not exist in this FastMCP."""
+    write_ready_marker()
+    try:
+        yield {}
+    finally:
+        clear_ready_marker()
 
 
 _EXCEPTHOOKS_INSTALLED = False
@@ -411,6 +494,13 @@ class KGEngine:
         but ONLY when a scrub happened this session (else None — verify the span as written)."""
         return (lambda s: Scrubber.restore(s, self._scrub_map)) if self._scrub_map else None
 
+    def _scrub_error(self, msg) -> str:
+        """Scrub a handler's error string (a `{e}` exception interpolation — a corrupt-node parse error
+        quoting un-scrubbed canon content, an OSError carrying a vault path) to the SAME §1.9 egress
+        standard `kg_scrub` applies, before it is returned to the session. Uses the engine's configured
+        sensitivity; never raises (see `_scrub_error_text`)."""
+        return _scrub_error_text(msg, sensitivity=self.sensitivity)
+
     @staticmethod
     def _append_note(existing: str, addition: str) -> str:
         """Append `addition` to a notes field with the load-bearing ` | ` separator (the field is later
@@ -462,7 +552,9 @@ class KGEngine:
             if cached is not None:
                 if cached.get("receipt") == receipt:
                     self._write_cache.move_to_end(idempotency_key)
-                    return {**cached, "idempotent_replay": True}
+                    # Deep-copy so the replayed receipt's nested `dispositions`/`details`/`written_nodes`
+                    # do NOT alias the cached objects — a caller mutating a replay can't corrupt the cache.
+                    return {**copy.deepcopy(cached), "idempotent_replay": True}
                 # same key, DIFFERENT payload: a caller error. Don't replay a stale receipt and silently
                 # drop this write — process it normally (it re-caches the key below).
                 logger.warning("idempotency_key %r reused with a different payload; processing the new "
@@ -509,7 +601,9 @@ class KGEngine:
         # Do NOT cache a rolled-back batch: a rollback is a transient failure (e.g. an I/O error), and a
         # retry should be allowed to actually write, not replay the failure.
         if idempotency_key and not rolled_back:
-            self._write_cache[idempotency_key] = out
+            # Snapshot a deep copy so the returned `out` (which the caller may mutate) and the cached
+            # receipt never share nested structures.
+            self._write_cache[idempotency_key] = copy.deepcopy(out)
             self._write_cache.move_to_end(idempotency_key)
             while len(self._write_cache) > _WRITE_CACHE_MAX:
                 self._write_cache.popitem(last=False)
@@ -572,12 +666,15 @@ class KGEngine:
 
         `note` is appended to the EDGE's `notes` and is **edge-only**: a Node has no notes field, so a
         `note` passed with `kind='node'` is ignored (the verdict's audit record still captures `by`)."""
-        verdict = verdict.lower()
+        # Strip/normalize inputs like kg_rename/kg_merge do, so a stray-whitespace verdict (" grounded ")
+        # isn't mis-classified as invalid and a stray-whitespace `kind` is canonicalized before dispatch.
+        verdict = verdict.strip().lower()
         if verdict not in VALID_VERDICTS:
             return {"ok": False, "error": f"invalid verdict {verdict!r}"}
         # `kind` selects the dispatch branch; reject anything outside {node,edge} up front (mirroring the
         # verdict clamp) so a typo'd `kind` (e.g. 'Node', 'edges', '') can't fall through the else into the
         # edge path and surface a misleading 'edge not found' for what was meant as a node verdict.
+        kind = kind.strip()
         if kind not in ("node", "edge"):
             return {"ok": False, "error": f"invalid kind {kind!r}; expected node|edge"}
         # `by` is provenance, not a free-text field: clamp to the known actors so a stray value can't
@@ -594,12 +691,16 @@ class KGEngine:
             return {"ok": False, "error": "canon vault is locked by another live session"}
         try:
             if kind == "node":
+                # Canonicalize the node id like kg_rename/kg_merge (`slug`) so a non-canonical id doesn't
+                # yield a false "node not found". Edge ids already arrive canonical from reads, so the edge
+                # branch below deliberately does NOT slug `target_id`.
+                target_id = slug(target_id)
                 if not self.canon.exists(target_id):
                     return {"ok": False, "error": "node not found"}
                 try:
                     node = self.canon.read_node(target_id)  # corrupt/invalid-UTF-8 note → structured error (F13/L1)
                 except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
-                    return {"ok": False, "error": f"node unreadable: {e}"}
+                    return {"ok": False, "error": self._scrub_error(f"node unreadable: {e}")}
                 # the hypothesized→grounded promotion gate applies to NODES too: kg_operate writes
                 # hypothesized compression nodes/primitives via the propose lane, so a generated node must
                 # earn grounding with support, not become grounded knowledge for free (mirrors the edge
@@ -642,7 +743,7 @@ class KGEngine:
                     self.canon.write_one(node)
                     return True, None
                 except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
-                    err_holder["error"] = f"write failed: {e}"
+                    err_holder["error"] = self._scrub_error(f"write failed: {e}")
                     return False, None
 
             self._audit_log.audited_write([(key, frm, verdict, by)], _attempt)
@@ -783,7 +884,8 @@ class KGEngine:
             try:
                 node = self.canon.read_node(old)  # corrupt/invalid-UTF-8 note → structured error (F13/L1)
             except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
-                return {"ok": False, "error": f"node unreadable: {e}", "old": old, "new": new}
+                return {"ok": False, "error": self._scrub_error(f"node unreadable: {e}"),
+                        "old": old, "new": new}
             # A rename recomputes edge ids (and the node id), but the kg_ground audit record + reconciler
             # baseline are keyed by those ids. Collect every policed-state (verdict OR obsolete) item whose
             # id CHANGES so we can write a migrating audit record for the NEW id — otherwise the reconciler
@@ -828,8 +930,8 @@ class KGEngine:
             try:
                 self.canon.node_path(old).unlink(missing_ok=True)
             except OSError as e:  # the new note already landed; surface a structured error, not a raw raise
-                return {"ok": False, "error": f"rename wrote '{new}' but could not remove old '{old}': {e}",
-                        "old": old, "new": new, "touched": [n.id for n in touched]}
+                return {"ok": False, "old": old, "new": new, "touched": [n.id for n in touched],
+                        "error": self._scrub_error(f"rename wrote '{new}' but could not remove old '{old}': {e}")}
             from .canon import _git, _git_ok
             if _git_ok(self.canon.root):
                 # stage only what this rename touched — the rewritten notes + the removed old note —
@@ -936,7 +1038,8 @@ class KGEngine:
                 from_node = self.canon.read_node(frm)   # corrupt/invalid-UTF-8 note → structured error
                 into_node = self.canon.read_node(into)
             except Exception as e:  # noqa: BLE001 — surface as a structured error, not an MCP exception
-                return {"ok": False, "error": f"node unreadable: {e}", "from": frm, "into": into}
+                return {"ok": False, "error": self._scrub_error(f"node unreadable: {e}"),
+                        "from": frm, "into": into}
             # Typing safety: keep `into`'s node_type/label, but REFUSE a merge that would silently
             # overwrite one DECLARED type with a different one — a wrong merge must not corrupt typing.
             # An undeclared-type placeholder on either side is not a conflict (it carries no commitment).
@@ -992,7 +1095,7 @@ class KGEngine:
                 self.canon.node_path(frm).unlink(missing_ok=True)  # retire the now-empty source node
             except OSError as e:
                 return {"ok": False, "from": frm, "into": into, "touched": [n.id for n in touched],
-                        "error": f"merge wrote '{into}' but could not remove old '{frm}': {e}"}
+                        "error": self._scrub_error(f"merge wrote '{into}' but could not remove old '{frm}': {e}")}
             from .canon import _git, _git_ok
             if _git_ok(self.canon.root):
                 # stage only the rewritten notes + the removed source note (not a whole-tree `git add -A`).
@@ -1041,7 +1144,9 @@ class KGEngine:
         sections: list[tuple[str, str]] = []
         title, buf = None, []
         for line in text.splitlines():
-            if line.startswith("## ") and not line.startswith("### "):
+            # `### `/deeper never satisfy startswith("## ") (the 3rd char is '#', not ' '), so they fall to
+            # the else and stay in the section body — no extra guard needed.
+            if line.startswith("## "):
                 if title is not None or buf:
                     sections.append((title or "(preamble)", "\n".join(buf)))
                 title, buf = line[3:].strip(), []
@@ -1059,19 +1164,35 @@ class KGEngine:
             texts = self.source_set().texts  # {basename → raw_text} (a property)
         except Exception as e:  # noqa: BLE001 — a source-read hiccup degrades coverage, never crashes kg_status
             return {"files": [], "sections": [], "note": f"source unavailable ({type(e).__name__})"}
-        spans = [s for s in (normalize_text(e.span) for e in edges if e.span and e.span.strip()) if s]
+        # DEDUP the normalized spans (many edges re-cite the same span) so the scan below is bounded by
+        # DISTINCT spans, then INVERT the matching: walk each span once, marking the file + every section
+        # it anchors and SKIPPING anything already covered, so a covered section/file is never re-scanned
+        # and the loop short-circuits once a file is fully covered. Identical result to the old per-section
+        # `any(sp in body for sp in spans)` (covered iff some span is a substring), without the
+        # files×sections×spans worst case.
+        spans = {s for s in (normalize_text(e.span) for e in edges if e.span and e.span.strip()) if s}
         files, sections = [], []
         for fname, raw in texts.items():
             secs = self._split_sections(raw)
-            covered_secs = 0
-            for title, body in secs:
-                nb = normalize_text(body)
-                covered = any(sp in nb for sp in spans)
-                covered_secs += covered
-                sections.append({"file": fname, "title": title, "covered": covered})
+            norm_bodies = [normalize_text(body) for _title, body in secs]
+            covered_flags = [False] * len(secs)
             norm_file = normalize_text(raw)
-            files.append({"file": fname, "covered": any(sp in norm_file for sp in spans),
-                          "sections": len(secs), "covered_sections": covered_secs})
+            file_covered = False
+            remaining = len(secs)  # sections still uncovered
+            for sp in spans:
+                if file_covered and remaining == 0:
+                    break  # nothing left to discover in this file
+                if not file_covered and sp in norm_file:
+                    file_covered = True
+                if remaining:
+                    for i, nb in enumerate(norm_bodies):
+                        if not covered_flags[i] and sp in nb:
+                            covered_flags[i] = True
+                            remaining -= 1
+            for (title, _body), covered in zip(secs, covered_flags):
+                sections.append({"file": fname, "title": title, "covered": covered})
+            files.append({"file": fname, "covered": file_covered,
+                          "sections": len(secs), "covered_sections": sum(covered_flags)})
         return {"files": files, "sections": sections}
 
     def kg_status(self) -> dict:
@@ -1124,7 +1245,7 @@ class KGEngine:
         G = self.projector.load_graph()
         corpus = self.projector._corpus()
         failures = self._failure_ids(G)
-        gate_on = int(next((G.nodes[n].get("gate_on", 0) for n in G.nodes()), 0))
+        gate_on = int(next((G.nodes[n].get("gate_on", 0) for n in G.nodes()), 0) or 0)  # `or 0`: tolerate gate_on=None
         G2, note = None, ""
         if second_graph:
             try:
@@ -1359,8 +1480,11 @@ def _tool_result(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001 — uniform transport envelope; a tool must never crash the call
+            # Log the RAW exception locally (server.log is a local diagnostic, not egress), but SCRUB the
+            # returned `error` so a raised exception can't leak an absolute path or un-scrubbed canon
+            # content back across the §1.9 egress to the session. `error_kind` (the type name) is verbatim.
             logger.warning("MCP tool %s raised %s: %s", fn.__name__, type(e).__name__, e, exc_info=True)
-            return {"ok": False, "error": str(e), "error_kind": type(e).__name__}
+            return {"ok": False, "error": _scrub_error_text(str(e)), "error_kind": type(e).__name__}
         finally:
             if wd is not None:
                 wd.exit()
@@ -1558,7 +1682,9 @@ def main() -> None:
     _start_watchdog()
     try:
         from mcp.server.fastmcp import FastMCP
-        mcp = FastMCP("creativity-graph")
+        # The lifespan writes <KG_DATA>/.engine-ready as the serve loop comes up so the Node supervisor can
+        # tell a post-init crash (exit clean -> client reconnects) from a startup crash (relaunch in place).
+        mcp = FastMCP("creativity-graph", lifespan=readiness_lifespan)
         engine = build_engine_from_env()
         _register(mcp, engine)
         # mcp.run() returns NORMALLY on a clean client disconnect (stdin EOF closes the stdio transport

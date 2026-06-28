@@ -703,8 +703,11 @@ class Canon:
                 # outside the rollback scope, must stay fail-open.
                 if snapshot:
                     _git(repo, "add", "--", *[str(p) for p in snapshot], check=False)
-                # allow empty so a no-op batch still succeeds
-                _git(repo, "commit", "-m", message, "--allow-empty", check=False)
+                # No --allow-empty: an idempotent/no-op batch (deduped edges, an identical re-write)
+                # would otherwise force an EMPTY commit that pollutes vault history. A no-op commit
+                # exits non-zero, which check=False already ignores harmlessly — the writes have
+                # durably landed regardless of whether the commit records anything.
+                _git(repo, "commit", "-m", message, check=False)
             return RollbackInfo(False)
         finally:
             self._release_lock()
@@ -754,7 +757,13 @@ class Canon:
         cur.edges = list(by_id.values())
         if node.body:
             cur.body = node.body
-        cur.label = node.label or cur.label
+        # A bare edge-only write carries a placeholder Node(id=src) whose label DEFAULTS to the id
+        # (Node.__post_init__ sets label=id when blank, so `node.label` is never falsy — the old
+        # `node.label or cur.label` was a no-op that clobbered a rich human label with the bare id).
+        # Only adopt an incoming label that is genuinely richer than the id (mirror the node_type
+        # 'undeclared-type' guard just below).
+        if node.label and node.label != node.id:
+            cur.label = node.label
         if node.node_type and node.node_type != "undeclared-type":
             cur.node_type = node.node_type
         return cur
@@ -768,17 +777,27 @@ class Canon:
         edits — silently reverting them to their last committed state. Scoping to `snapshot` keeps the
         rollback confined to this batch and never disturbs anything else in the working tree.
         """
+        restore_errors: list[str] = []
         if snapshot:
             for p, original in snapshot.items():
-                if original is None:
-                    p.unlink(missing_ok=True)  # file was newly created by this batch -> remove it
-                    # fsync the parent so the dirent REMOVAL is as durable as the create it reverses
-                    # (atomic_write_bytes dir-fsyncs after os.replace). Without this, a crash right after
-                    # rollback can resurrect the just-deleted note's dirent, leaving a phantom node the
-                    # projector treats as real — the restore branch below is already durable.
-                    _fsync_dir(p.parent)
-                else:
-                    # atomic + fsynced restore, consistent with the rest of the module — a crash mid
-                    # rollback must not leave a half-written note (review-low: rollback non-atomic).
-                    _atomic_write_bytes(p, original)
+                # Guard each per-file restore so a SECOND I/O fault (after the write fault that
+                # triggered this rollback) never propagates out of write_nodes: the boundary must
+                # always receive a RollbackInfo, never a raw exception. Accumulate any restore failure
+                # into the returned error so it is surfaced rather than swallowed.
+                try:
+                    if original is None:
+                        p.unlink(missing_ok=True)  # file was newly created by this batch -> remove it
+                        # fsync the parent so the dirent REMOVAL is as durable as the create it reverses
+                        # (atomic_write_bytes dir-fsyncs after os.replace). Without this, a crash right
+                        # after rollback can resurrect the just-deleted note's dirent, leaving a phantom
+                        # node the projector treats as real — the restore branch below is already durable.
+                        _fsync_dir(p.parent)
+                    else:
+                        # atomic + fsynced restore, consistent with the rest of the module — a crash mid
+                        # rollback must not leave a half-written note (review-low: rollback non-atomic).
+                        _atomic_write_bytes(p, original)
+                except Exception as ex:  # noqa: BLE001 — rollback must never raise out of write_nodes
+                    restore_errors.append(f"{p.name}: {ex}")
+        if restore_errors:
+            error = f"{error}; rollback restore failures: {'; '.join(restore_errors)}"
         return RollbackInfo(True, error)

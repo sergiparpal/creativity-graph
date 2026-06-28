@@ -291,7 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         _eprint(f"[kg canon merge] conflict: {c}")
     try:
         _write_atomic(Path(ours_path), text)
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
+        # Also catch UnicodeError: _git_merge_file decodes git's stdout with errors="surrogateescape"
+        # (host-locale-independent), so a stray non-UTF-8 byte survives as a lone surrogate that the
+        # STRICT-utf-8 encode in _write_atomic raises UnicodeEncodeError (a UnicodeError) on. Catch it
+        # here so it fails OPEN — leave 'ours' untouched, exit 1 for a human — exactly like an OSError,
+        # instead of an uncaught traceback after the temp file is cleaned up.
         _eprint(f"[kg canon merge] could not write merged result; leaving 'ours': {e}")
         return 1
     return 0 if ok else 1

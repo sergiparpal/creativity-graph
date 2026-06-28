@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .canon import Canon, GROUND_AUDIT
+from .groundaudit import GroundAuditLog
 from .model import EpistemicState, GROUNDABLE_STATES, VERDICT_STATES, node_from_markdown, slug
 
 __all__ = ["Reconciler", "ReconcileReport", "OrphanReport", "GROUND_AUDIT"]
@@ -47,6 +48,10 @@ class Reconciler:
         self.canon = canon
         self.state_path = Path(state_path) if state_path else (canon.root / ".kg-reconcile-state.json")
         self.audit_path = canon.root / GROUND_AUDIT
+        # The audit log is the durable trust root; this seam appends/reads the §1.8 spend-ledger
+        # checkpoint that lets a sweep RECOVER `consumed`/`epistemic` after the disposable reconcile-state
+        # cache is lost (the incremental count fold below reads the bytes directly for its offset cache).
+        self._ground_audit = GroundAuditLog(self.audit_path)
         # In-process incremental-fold cache for the append-only audit log (reconciler-18). The audit log
         # is read+parsed in full on every sweep and grows unbounded; folding only the NEW bytes since the
         # last sweep avoids re-parsing the whole log when scan() runs more than once in this process. This
@@ -98,11 +103,13 @@ class Reconciler:
 
     @staticmethod
     def _fold_audit_lines(blob: bytes, counts: dict[str, int]) -> None:
-        """Fold a byte blob of complete audit lines into `counts` in place (one increment per record).
-        `blob` MUST end on a record boundary (caller trims any partial trailing line). A locale-clean
-        utf-8 decode is required; an undefined-byte read raises UnicodeError, which the caller degrades
-        to "no audit" and fails open rather than crashing the whole reconcile (§1.8)."""
-        for line in blob.decode("utf-8").splitlines():
+        """Fold a byte blob of complete audit lines into `counts` in place (one increment per VERDICT
+        record). `blob` MUST end on a record boundary (caller trims any partial trailing line). Decoded
+        with `errors="replace"` so a single undefined byte only corrupts (and thus drops, via the json
+        parse) its OWN line rather than blinding the reconciler to the whole log — matching the per-line
+        tolerance for a corrupt JSON line. Checkpoint records (the `_ckpt` marker, §1.8 spend-ledger
+        snapshots) carry no verdict pair and are skipped so they never count as a transition."""
+        for line in blob.decode("utf-8", "replace").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -110,6 +117,8 @@ class Reconciler:
                 rec = json.loads(line)
             except ValueError:
                 continue  # one corrupt audit line must not blind the reconciler to the rest
+            if not isinstance(rec, dict) or "_ckpt" in rec:
+                continue  # checkpoint snapshot, not a verdict transition
             pair = f"{rec.get('key', '')}||{rec.get('to', '')}"
             counts[pair] = counts.get(pair, 0) + 1
 
@@ -277,6 +286,23 @@ class Reconciler:
         files_state = self._coerce_subdict(state, "files")
         epistemic = self._coerce_subdict(state, "epistemic")
         consumed = self._coerce_subdict(state, "consumed")
+        # Durability recovery (§1.8): `consumed` (the spend ledger) and `epistemic` (the re-quarantine
+        # baseline) live in the git-ignored, fail-open `.kg-reconcile-state.json` cache. If that cache is
+        # lost/deleted while the append-only audit log survives, `consumed` resets to {} and every
+        # historical record looks unspent again — letting a previously-grounded-then-demoted edge be
+        # re-forged and accepted (the count check at _forged finds an "unconsumed" stale record). So when
+        # the cache carries no spend ledger, recover both from the last checkpoint persisted in the audit
+        # log (the durable trust root). Merge safe-HIGH for consumed (max per pair — over-strict, never a
+        # missed forgery) and adopt the checkpoint's epistemic baseline only where the cache lacks one. A
+        # genuine first-ever run has no checkpoint -> stays empty, behaviour unchanged.
+        if not consumed:
+            recovered = self._ground_audit.last_checkpoint()
+            if recovered:
+                for pair, c in recovered["consumed"].items():
+                    if isinstance(c, int) and c > consumed.get(pair, 0):
+                        consumed[pair] = c
+                for k, v in recovered["epistemic"].items():
+                    epistemic.setdefault(k, v)
         audit = self._audit_counts()
         report = ReconcileReport(full_sweep=full_sweep)
         # On a FULL SWEEP we visit and hash every note in the loop below, so we can build the live
@@ -397,6 +423,9 @@ class Reconciler:
         else:
             # cheap pre-gate skipped unchanged notes (their cached keys may be stale under an (mtime,size)
             # collision), so recompute authoritatively — byte-identical to the pre-reconciler-6 prune.
+            # (Trusting cached keys here could leave a stale baseline key and reopen a delete→recreate→
+            # forge bypass — see test_f29_cheap_path_uses_authoritative_all_nodes — so it stays
+            # deliberately authoritative.)
             live_nodes = self.canon.all_nodes()
             prune_files = {p.name for p in self.canon.note_paths()}
             prune_keys = {f"node:{n.id}" for n in live_nodes} | {e.id for n in live_nodes for e in n.edges}
@@ -406,6 +435,20 @@ class Reconciler:
             del epistemic[k]
 
         self._save_state({"files": files_state, "epistemic": epistemic, "consumed": consumed})
+
+        # Durably checkpoint the spend ledger into the append-only audit log (the trust root) so a later
+        # loss of the disposable reconcile-state cache can RECOVER it (above) instead of replaying every
+        # historical record (§1.8). A full sweep is a consistent snapshot of every live key, so checkpoint
+        # there; scan() runs full_sweep per session, keeping growth to ~one record per session. Gated on
+        # the lease (the audit log is lease-guarded like every writer) and best-effort: a busy lease or a
+        # failed append just defers to the next sweep, and a stale checkpoint is only ever safe-high.
+        if full_sweep and self.canon.try_acquire_lock():
+            try:
+                self._ground_audit.append_checkpoint(consumed, epistemic)
+            except Exception:  # noqa: BLE001 — checkpointing must never break the sweep
+                pass
+            finally:
+                self.canon._release_lock()
 
         # Housekeeping (full sweep only): reap bounded-retention transient dotfiles (old `.bak` self-heal
         # backups beyond the retention cap, crash-leftover `.tmp-*`, sidelined lock records) that would
@@ -424,11 +467,13 @@ class Reconciler:
         """Mark EVERY audit record for `key` as consumed (consumed[pair] = audit[pair] for each of the
         key's pairs). Called once `key`'s current canon state is validated as legitimate: that state is
         authoritative, so all historical records that led here are spent and none may justify a FUTURE
-        out-of-band transition. Pair keys are `f"{key}||{state}"`, and ids/slugs never contain '|', so the
-        `||` prefix isolates exactly this key's pairs."""
-        prefix = f"{key}||"
+        out-of-band transition. Pair keys are `f"{key}||{state}"`; isolate this key's pairs by splitting
+        the trailing `||{state}` off the LAST `||` (the state value never contains `||`) rather than a
+        prefix match — a hand-edited node id that itself contains `||` (raw frontmatter ids are not
+        re-slugged on read, model.node_from_markdown) would otherwise let `node:a` over-drain `node:a||b`'s
+        ledger and wrongly re-quarantine a sibling's legit verdict (reconciler-||collision)."""
         for pair, count in audit.items():
-            if pair.startswith(prefix) and count > consumed.get(pair, 0):
+            if pair.rsplit("||", 1)[0] == key and count > consumed.get(pair, 0):
                 consumed[pair] = count
 
     def _forged(self, key: str, current: EpistemicState, epistemic: dict, consumed: dict,
@@ -473,7 +518,7 @@ class Reconciler:
         fresh = self._audit_counts()
         if fresh.get(pair, 0) > audit.get(pair, 0):
             for p, c in fresh.items():
-                if p.startswith(f"{key}||") and c > audit.get(p, 0):
+                if p.rsplit("||", 1)[0] == key and c > audit.get(p, 0):
                     audit[p] = c  # adopt mid-sweep records for this key into the working snapshot
             if audit.get(pair, 0) > consumed.get(pair, 0):
                 self._drain_key_ledger(key, consumed, audit)

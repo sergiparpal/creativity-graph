@@ -83,13 +83,15 @@ def availability() -> tuple[bool, str]:
     return True, "available"
 
 
-def _build_or_load(working_dir: Path, source_path: Path):
-    """Construct a LightRAG instance over `working_dir`, indexing `source_path` once (cached on reuse).
+async def _answer_async(prompts: list[str], source_path: Path, working_dir: Path) -> list[str]:
+    """Init storages, build/load the index, and answer EVERY prompt inside ONE event loop.
 
-    All LightRAG imports are local so the package is required only on this opt-in path. Returns an
-    initialized `(rag, query_one)` where `query_one(prompt)` answers a single prompt synchronously."""
-    import asyncio
+    LightRAG binds its locks/futures to the loop that ran `initialize_storages()`; the old shape ran init
+    in one `asyncio.run` loop (which then closed) and each query in a fresh loop, so every `aquery` awaited
+    cross-loop against now-stale storage and failed. Keeping init + all queries on a single loop fixes that;
+    `finalize_storages()` in a `finally` releases the storages so the working_dir is left clean for reuse.
 
+    All LightRAG imports are local so the package is required only on this opt-in path."""
     from lightrag import LightRAG, QueryParam
     from lightrag.kg.shared_storage import initialize_pipeline_status
     from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
@@ -98,36 +100,39 @@ def _build_or_load(working_dir: Path, source_path: Path):
     text = source_path.read_text(encoding="utf-8")
     mode = query_mode()
 
-    async def _aopen():
-        rag = LightRAG(working_dir=str(working_dir),
-                       llm_model_func=gpt_4o_mini_complete,
-                       embedding_func=openai_embed)
-        await rag.initialize_storages()
-        await initialize_pipeline_status()
+    rag = LightRAG(working_dir=str(working_dir),
+                   llm_model_func=gpt_4o_mini_complete,
+                   embedding_func=openai_embed)
+    await rag.initialize_storages()
+    await initialize_pipeline_status()
+    try:
         # build the index only the first time — a populated working_dir is reused as a cache
         if not (working_dir / _INDEX_MARKER).exists():
             await rag.ainsert(text)
-        return rag
-
-    rag = asyncio.run(_aopen())
-
-    def query_one(prompt: str) -> str:
-        return str(asyncio.run(rag.aquery(prompt, param=QueryParam(mode=mode)))).strip()
-
-    return rag, query_one
+        answers: list[str] = []
+        for prompt in prompts:
+            ans = await rag.aquery(prompt, param=QueryParam(mode=mode))
+            answers.append(str(ans).strip())
+        return answers
+    finally:
+        await rag.finalize_storages()
 
 
 def answer_prompts(prompts: list[str], source_path: Path, working_dir: Path | None = None) -> list[str]:
     """Answer each prompt from a LightRAG index built over `source_path` (== examples/source.md).
 
-    Builds/loads the index once, then queries it per prompt. Raises if the arm is unavailable — the
-    caller is expected to gate on `availability()` first."""
+    Builds/loads the index once, then queries it per prompt — all on a SINGLE event loop. Raises if the
+    arm is unavailable (the caller is expected to gate on `availability()` first) or if `source_path` is
+    missing (the CLI maps that to the clean exit-3 'unavailable' path)."""
+    import asyncio
+
     ok, reason = availability()
     if not ok:
         raise RuntimeError(f"lightrag arm unavailable: {reason}")
+    if not source_path.exists():
+        raise FileNotFoundError(f"source not found: {source_path}")
     working_dir = working_dir or default_store_dir()
-    _rag, query_one = _build_or_load(working_dir, source_path)
-    return [query_one(p) for p in prompts]
+    return asyncio.run(_answer_async(prompts, source_path, working_dir))
 
 
 def _load_prompts(path: Path) -> list[str]:
@@ -172,7 +177,11 @@ def _main(argv: list[str]) -> int:
         return 3  # distinct from argparse(2)/generic-error(1): "arm cleanly unavailable, omit it"
     prompts = _load_prompts(Path(args.prompts))
     store = Path(args.store) if args.store else default_store_dir()
-    answers = answer_prompts(prompts, Path(args.source), store)
+    try:
+        answers = answer_prompts(prompts, Path(args.source), store)
+    except FileNotFoundError as e:
+        print(json.dumps({"available": False, "reason": str(e)}), file=sys.stderr)
+        return 3  # bad source surfaces as the clean 'arm unavailable, omit it' path, not a traceback
     blob = json.dumps({"answers": answers}, indent=2)
     if args.out:
         Path(args.out).write_text(blob + "\n", encoding="utf-8")

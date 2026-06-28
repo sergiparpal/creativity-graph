@@ -110,6 +110,15 @@ def utcnow() -> str:
 
 _WS = re.compile(r"\s+")
 
+# Windows reserved device names (case-insensitive). A file whose base name (the part before the first
+# dot) equals one of these is a device alias and UNWRITABLE on Windows, so a node id like `con` slugging
+# to `con.md` would fail to write there. slug() escapes a result equal to one of these by appending '-'.
+_WINDOWS_RESERVED = (
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
 
 def normalize_text(s: str) -> str:
     """Whitespace-collapsed, case-folded form used for span verification.
@@ -178,7 +187,14 @@ def slug(s: str) -> str:
     # empty-endpoint edges onto one id/file). The write boundary rejects empty/punctuation-only edge
     # endpoints (no word character) before edge_id is built so this fallback can't silently alias
     # distinct edges; callers that slug elsewhere should be aware of the collapse.
-    return re.sub(r"[\s_-]+", "-", s).strip("-") or "node"
+    out = re.sub(r"[\s_-]+", "-", s).strip("-") or "node"
+    # Escape a Windows reserved device name (CON/NUL/AUX/PRN/COMn/LPTn): append '-' so `con` -> `con-`
+    # and the canon file `con-.md` is writable. A normal slug never ENDS in '-' (the strip("-") above),
+    # so the escaped form lives in a disjoint output space and can never collide with another input's
+    # slug (deterministic + collision-free). Done in slug() so node ids and edge ids both benefit.
+    if out.lower() in _WINDOWS_RESERVED:
+        out += "-"
+    return out
 
 
 def edge_id(source: str, relation: str, target: str) -> str:
@@ -303,19 +319,26 @@ def node_from_markdown(text: str, *, fallback_id: str | None = None) -> Node:
     if not isinstance(fm, dict):
         raise ValueError("note frontmatter is not a mapping")
     body = m.group(2).strip("\n")
+    # Resolve the node id ONCE (fm id > fallback_id > slug(label)) and reuse it for BOTH the edge-source
+    # default and fields["id"] below. A present-but-NULL `id:` makes fm.get("id", fallback_id) return
+    # None (the key exists, so the default is not applied); Edge.from_dict(e, source=None) on an edge
+    # lacking its own `source:` would then raise TypeError, which Canon.all_nodes swallows — dropping
+    # the WHOLE node, including its §1.7 failed/rejected counter-edges, from every read. One resolution
+    # keeps the two ends consistent so a null-id note still parses.
+    resolved_id = fm.get("id") or fallback_id or slug(fm.get("label", "node"))
     # Skip a malformed edge entry (e.g. a hand-edited `- just a string` scalar instead of a mapping)
     # rather than letting it raise and take the whole node — including its failed/rejected counter-
     # edges (§1.7) — out of every read.
-    edges = [Edge.from_dict(e, source=fm.get("id", fallback_id))
+    edges = [Edge.from_dict(e, source=resolved_id)
              for e in (fm.get("edges") or []) if isinstance(e, dict)]
     # Mirror Edge.from_dict: filter to known Node fields and drop None values so each absent/None key
     # falls through to the dataclass field default + __post_init__ coercion — the single source of every
     # static default (incl. "prose", and the enum defaults via coerce_axes). Then inject the two values
-    # that are NOT plain field defaults: the resolved `id` (fm id > fallback_id > slug(label) precedence)
-    # and the pre-parsed `edges` (with the malformed-entry skipping above), plus the parsed body.
+    # that are NOT plain field defaults: the resolved `id` (resolved once above) and the pre-parsed
+    # `edges` (with the malformed-entry skipping above), plus the parsed body.
     known = {f for f in Node.__dataclass_fields__}
     fields = {k: v for k, v in fm.items() if k in known and v is not None}
-    fields["id"] = fm.get("id") or fallback_id or slug(fm.get("label", "node"))
+    fields["id"] = resolved_id
     fields["body"] = body
     fields["edges"] = edges
     return Node(**fields)

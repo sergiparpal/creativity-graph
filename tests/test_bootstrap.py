@@ -234,6 +234,52 @@ def test_do_install_keeps_preexisting_foreign_dir_on_failure(tmp_path, monkeypat
     assert not (venv_dir / "pyvenv.cfg").exists()
 
 
+def test_do_install_refuses_preexisting_foreign_venv_with_pyvenv_cfg(tmp_path, monkeypatch):
+    # bootstrap-1: a USER's own real venv (it HAS a pyvenv.cfg, like every venv) pointed at by
+    # --venv / KG_ENGINE_VENV must NOT be treated as ours. A bare pyvenv.cfg no longer qualifies as
+    # an engine marker, so do_install refuses to scaffold into it and NEVER rmtrees it on failure —
+    # the regression that previously let install_with_uv run against (and rmtree) a user's venv.
+    pp = tmp_path / "pyproject.toml"
+    pp.write_text("[project]\n", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "PYPROJECT", pp)
+
+    venv_dir = tmp_path / "user-venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    site = venv_dir / "lib" / "python3.12" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "userpkg.py").write_text("# the user's installed package\n", encoding="utf-8")
+
+    # install_with_* must never even be reached — the refusal fires before any scaffolding.
+    def _boom(*a, **k):  # pragma: no cover - asserts it is never invoked
+        raise AssertionError("must not scaffold into a foreign venv")
+
+    monkeypatch.setattr(bootstrap, "install_with_uv", _boom)
+    monkeypatch.setattr(bootstrap, "install_with_pip", _boom)
+
+    with pytest.raises(SystemExit):
+        bootstrap.do_install(venv_dir)
+    # The user's venv survives intact — neither deleted nor polluted with our markers.
+    assert (venv_dir / "pyvenv.cfg").exists()
+    assert (site / "userpkg.py").read_text(encoding="utf-8") == "# the user's installed package\n"
+    assert not (venv_dir / bootstrap.PTR_NAME).exists()
+    assert not (venv_dir / bootstrap.STAMP_NAME).exists()
+
+
+def test_has_engine_marker_ignores_bare_pyvenv_cfg(tmp_path):
+    # The ownership predicate keys on engine markers ONLY (bootstrap-1): a bare pyvenv.cfg is not enough.
+    venv_dir = tmp_path / "venv"
+    venv_dir.mkdir()
+    assert bootstrap._has_engine_marker(venv_dir) is False
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    assert bootstrap._has_engine_marker(venv_dir) is False     # pyvenv.cfg alone -> NOT ours
+    (venv_dir / bootstrap.PTR_NAME).write_text("x\n", encoding="utf-8")
+    assert bootstrap._has_engine_marker(venv_dir) is True      # engine pointer -> ours
+    (venv_dir / bootstrap.PTR_NAME).unlink()
+    (venv_dir / bootstrap.STAMP_NAME).write_text("x\n", encoding="utf-8")
+    assert bootstrap._has_engine_marker(venv_dir) is True      # install.stamp -> ours
+
+
 # --------------------------------------------------------------------------- #
 # leidenalg soft probe (SAC-blocked native DLL → graceful degradation)
 # --------------------------------------------------------------------------- #

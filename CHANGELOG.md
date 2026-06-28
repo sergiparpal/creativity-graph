@@ -12,7 +12,7 @@ NetworkX/SQLite **derived** layer. The deterministic Python engine (`scripts/kg_
 hard guarantees; the Claude Code session and its subagents do the language work and hand structured
 JSON back across the MCP boundary.
 
-## [Unreleased]
+## [0.5.4] — 2026-06-28
 
 ### Added
 
@@ -56,6 +56,75 @@ JSON back across the MCP boundary.
   ms), `FileNotFoundError` still propagates immediately (genuinely reclaimed), and a *persistent* error
   still degrades gracefully (the TTL is the backstop). Fixes the flaky Windows CI failure of
   `test_full_wave_of_concurrent_writers_all_commit_none_corrupted`; new coverage in `tests/test_fix_canon.py`.
+- **A whole node (and its §1.7 failure memory) no longer vanishes from every read on a hand-edited
+  null `id:`.** `node_from_markdown` resolved the node id twice with different fallbacks: the edge-source
+  default used `fm.get("id", fallback_id)` (which returns `None` when the `id:` key is *present but null*,
+  a plausible hand-edit `id:` / `id: null`), while the node id itself used `... or fallback_id or ...`. A
+  source-less edge under such a note then hit `Edge.__init__` with `source=None` and raised, and
+  `Canon.all_nodes` swallows a per-note parse error — so the entire node, including any never-pruned
+  `failed`/`rejected` counter-edges, silently disappeared from every read (§1.2/§1.7). The id is now
+  resolved once and reused for both. New coverage in `tests/test_fix_reconciler.py`.
+- **Edge-only writes no longer clobber a node's human label with its bare id.** `Canon._merge_into_existing`
+  had `cur.label = node.label or cur.label`, which never fired its guard — `Node.__post_init__` defaults an
+  empty label to the id, so `node.label` is never falsy. Any edge-only merge (a grounder counter-edge, a
+  later extraction wave referencing an earlier node) whose auto-created placeholder is labelled with the id
+  therefore overwrote the existing label (e.g. `Free Energy Principle` → `fep`). Now guarded the same way as
+  `node_type` (`if node.label and node.label != node.id`).
+- **Self-loop edges no longer inflate `degree` or falsely flag `structural_bridge`.** `und.neighbors(n)`
+  includes `n` itself for a self-loop, so the persisted distinct-neighbour `degree` (which drives
+  `query_graph` ranking, the `kg_agenda` hub detector, and the bridge advisory) counted a node's own
+  self-loop as a connection. Both the degree and bridge-community computations now exclude the node from
+  its own neighbour set (`projector.py`).
+- **`bootstrap.py` no longer installs into — or deletes on failure — a user's pre-existing venv.**
+  `_looks_like_our_venv` treated *any* virtualenv as "ours" (every venv has `pyvenv.cfg`), so pointing
+  `KG_ENGINE_VENV`/`--venv` at an existing venv would scaffold deps into it and `shutil.rmtree` it on a
+  failed install. Ownership for the purpose of deletion is now keyed only on the engine's own markers
+  (`engine-python.txt` / `install.stamp`) or "created this run", never bare `pyvenv.cfg`; a populated
+  foreign venv is refused up front. New coverage in `tests/test_bootstrap.py`.
+- **The MCP supervisor distinguishes a fast post-init engine crash from a startup crash.** A tool call
+  that crashed the engine within the 5 s early-failure window was misclassified as a startup failure and
+  relaunched in place onto the already-handshaked stdio pipe, stranding the client on a dead-but-alive
+  connection. The engine now writes a readiness marker (`.engine-ready`, via a FastMCP lifespan) as its
+  serve loop comes up; `launch_server.mjs` consults it as the authoritative post-init-vs-startup signal
+  (wall-clock remains the fallback when the marker is absent), so a post-init crash now exits cleanly and
+  the client reconnects with a fresh handshake. New coverage in `tests/test_launchers.py`.
+- **The optional `lightrag` experiment arm runs init and all queries on a single event loop.** It
+  previously ran `initialize_storages()` in one `asyncio.run` loop (which then closed) and each query in a
+  fresh loop, so every `aquery` awaited cross-loop against loop-bound storage and would fail whenever the
+  arm was enabled; it also never released the storages and surfaced a missing source as a raw traceback.
+  Init + queries now share one loop with `finalize_storages()` in a `finally`, and a bad `--source` maps to
+  the clean "arm unavailable" exit code.
+- **Review-driven robustness & hygiene hardening pass** (no behaviour change on the happy path): tool
+  error strings are now scrubbed to the §1.9 egress standard before crossing back to the session (a raw
+  exception could quote a vault path or un-scrubbed canon content); idempotent `kg_write` replays
+  deep-copy their cached receipt; `kg_status` coverage scanning is bounded (no files×sections×spans
+  worst case); `kg_ground` strips/canonicalizes its `verdict`/`kind`/node-id inputs like the other
+  mutators; the canon git commit drops `--allow-empty` (no more empty no-op commits); `canonmerge`'s
+  surrogate-escape decode now fails *open* instead of crashing on an encode mismatch; `slug()` escapes
+  Windows reserved device names (`con`, `nul`, `com1`, …); `_rollback` never raises mid-rollback;
+  `graphio`'s reader fallback is symmetric with the writer's `links` key; the projector closes its SQLite
+  connection on a schema-heal failure, re-checks columns inside the transaction, degrades on a source-read
+  error, and `shortest_path` uses an O(V+E) predecessor-map BFS; several JSON reads pin `encoding="utf-8"`;
+  `generate`'s bridge-strength is precomputed once per node; `scrub` validates `extra_terms` categories
+  against the placeholder grammar; the audit log compensates an orphan record when the write *raises* (not
+  only when it returns failure); the interpreter-probe `spawnSync` calls carry timeouts; a Windows
+  `SIGTERM` shutdown exits the supervisor with code 0; and the canon merge driver bounds its subprocess
+  and reports a spawn error.
+
+### Security
+
+- **The §1.8 grounding-verdict replay defense is now durable across loss of the reconcile-state cache.**
+  The spend ledger (`consumed`) and re-quarantine baseline (`epistemic`) lived only in the git-ignored,
+  fail-open `.kg-reconcile-state.json` cache. Deleting it reset `consumed` to empty while the append-only
+  audit log survived, so every historical `kg_ground` record looked unspent again — letting a
+  previously-grounded-then-demoted edge be re-forged out of band and accepted as a "legitimate transition"
+  (an attacker within §1.8's own threat model could delete an obviously-disposable cache file rather than
+  the trust-rooted log). The reconciler now writes a durable spend-ledger **checkpoint** into the
+  append-only audit log (the trust root) at the end of each full sweep and **recovers** `consumed`/
+  `epistemic` from it when the cache is missing, so an already-spent record can no longer justify a replay.
+  Recovery merges safe-high (over-strict re-quarantine, never a missed forgery), genuine grounded verdicts
+  survive cache loss, and a first-ever run with no checkpoint is unchanged. New coverage in
+  `tests/test_fix_reconciler.py` (replay caught, legit verdict preserved) and `tests/test_groundaudit.py`.
 
 ## [0.5.3] — 2026-06-27
 

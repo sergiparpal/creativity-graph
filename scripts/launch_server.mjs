@@ -34,7 +34,7 @@
 //
 // Venv/interpreter resolution lives in ./_engine_resolve.mjs (shared with the other launchers).
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { venvDir, systemPython, enginePython, withPythonpath, clean, STAMP_NAME } from "./_engine_resolve.mjs";
@@ -46,8 +46,51 @@ const BOOTSTRAP = join(SCRIPTS, "bootstrap.py");
 const dir = venvDir(ROOT);
 
 // A server that exits non-zero within this window of starting is treated as an early failure (an
-// import error against a half-built / just-updated venv) and triggers the one self-heal retry.
+// import error against a half-built / just-updated venv) and triggers the one self-heal retry. This is
+// only the FALLBACK proxy for "died before serving init" — the authoritative signal is the engine's
+// readiness marker (below), consulted first.
 const EARLY_FAILURE_MS = 5000;
+
+// Interpreter-probe / bootstrap-check spawnSync timeout (review-low). On Windows the `py`/`python` App
+// Execution Alias stub can stall indefinitely; a timed-out probe is treated as "not found"/"not fresh".
+const PROBE_TIMEOUT_MS = 15000;
+
+// The engine writes this marker (under the SAME KG_DATA dir — see serverLogDir / server.py
+// resolve_data_dir) as its stdio serve loop comes up. Its presence with an mtime newer than the current
+// child's spawn time is the authoritative "this engine served `initialize`" signal the supervisor uses to
+// classify a crash as post-init (exit clean) vs startup (relaunch in place). Kept in sync with
+// server.READY_MARKER_NAME.
+const READY_MARKER_NAME = ".engine-ready";
+// Slack absorbing filesystem mtime granularity when comparing the marker's mtime against the child's
+// wall-clock spawn time. The marker is also cleared on each (re)spawn, so a stale marker from a previous
+// process (mtime well before this child's spawn) is never mistaken for the current child's.
+const MARKER_CLOCK_SLACK_MS = 2000;
+
+export function readyMarkerPath(env = process.env) {
+  return join(serverLogDir(env), READY_MARKER_NAME);
+}
+
+// Best-effort: did THIS child (spawned at wall-clock `startedAtMs`) write the readiness marker? A marker
+// whose mtime is at/after the spawn time means the engine began serving; an absent or older marker means
+// "not served" and the caller falls back to the wall-clock window.
+export function markerServedInit(startedAtMs, env = process.env) {
+  try {
+    const st = statSync(readyMarkerPath(env));
+    return st.mtimeMs + MARKER_CLOCK_SLACK_MS >= startedAtMs;
+  } catch {
+    return false; // no marker yet -> not served (use the wall-clock fallback)
+  }
+}
+
+// Clear the readiness marker before (re)spawning so it can only be (re)written by the child we are about
+// to launch — a leftover from a hard-crashed previous engine can never be read as the new child's.
+export function clearReadyMarker(env = process.env) {
+  try {
+    rmSync(readyMarkerPath(env), { force: true });
+  } catch {
+    /* best-effort */
+  }
+}
 
 // ----------------------------------------------------------------------------------------------------
 // Supervision policy (pure + exported so tests exercise the decision table without spawning an engine).
@@ -82,21 +125,32 @@ export function backoffFor(consecutiveFailures, S = SUPERVISOR) {
 //     starts uninitialized, the client (seeing Node still alive) never re-handshakes AND gets no EOF, so
 //     the connection looks alive but is dead — strictly WORSE than a clean disconnect. So we EXIT: Node
 //     goes away, the pipe closes, the client detects the drop and reconnects with a fresh handshake.
-// `EARLY_FAILURE_MS` is the (imperfect but safe) proxy for "died before serving init" — the engine's
+// `servedInit` is the AUTHORITATIVE signal: the engine writes a readiness marker as its serve loop comes
+// up (server.readiness_lifespan), so a crash with the marker present is post-init regardless of how long
+// it ran — this is what fixes a fast post-init crash (a tool call that kills the engine in <5s) being
+// mis-relaunched in place and stranding the client. `EARLY_FAILURE_MS` remains the FALLBACK proxy used
+// only when the marker is absent (an older engine, or the marker write failed): the engine's
 // import+startup is sub-second, so a crash within the window is overwhelmingly a startup failure. (Fully
 // transparent post-init restart would require Node to PROXY the stream and replay the handshake — a
 // larger change, deliberately deferred; see the header.)
 export function restartDecision(
-  { code, signal, ranForMs, shuttingDown, triedHeal, recentRestartCount },
+  { code, signal, ranForMs, shuttingDown, triedHeal, recentRestartCount, servedInit = false },
   S = SUPERVISOR
 ) {
-  // A clean exit: we forwarded a term signal (session ending), the child was signalled, or it returned
-  // a zero/empty code. Honor it — do NOT relaunch (no thrashing on a deliberate shutdown).
-  if (shuttingDown || signal || !code) {
+  // A deliberate shutdown (we forwarded a term signal, the session is ending): ALWAYS a code-0 clean exit.
+  // On Windows libuv maps kill(SIGTERM) to a numeric exit code (signum) with signal=null, so an ordinary
+  // shutdown would otherwise surface that non-zero code (review-low) — force 0 when shuttingDown.
+  if (shuttingDown) {
+    return { action: "exit", code: 0, reason: "clean-exit" };
+  }
+  // A clean exit otherwise: the child was signalled, or it returned a zero/empty code. Honor it — do NOT
+  // relaunch (no thrashing on a deliberate shutdown).
+  if (signal || !code) {
     return { action: "exit", code: signal ? 0 : code ?? 0, reason: "clean-exit" };
   }
-  // Died during STARTUP (before serving the buffered `initialize`): self-heal in place.
-  if (ranForMs < S.EARLY_FAILURE_MS) {
+  // Died during STARTUP — i.e. WITHOUT having written its readiness marker AND within the wall-clock
+  // window (before serving the buffered `initialize`): self-heal in place.
+  if (!servedInit && ranForMs < S.EARLY_FAILURE_MS) {
     // A near-instant non-zero exit looks like an import error against a half-built / just-updated venv
     // (the --check fast-path can pass on a stamp-fresh-but-broken venv): force ONE rebuild before retrying.
     if (!triedHeal) return { action: "heal", reason: "early-failure-heal" };
@@ -104,8 +158,9 @@ export function restartDecision(
     if (recentRestartCount >= S.MAX_RESTARTS) return { action: "exit", code: 1, reason: "crash-loop-cap" };
     return { action: "relaunch", reason: "startup-retry" };
   }
-  // Crashed AFTER serving `initialize` — relaunching onto the held-open pipe would strand an uninitialized
-  // engine, so exit cleanly and let the client reconnect with a fresh handshake (see the note above).
+  // Crashed AFTER serving `initialize` (marker present, or ran past the startup window) — relaunching onto
+  // the held-open pipe would strand an uninitialized engine, so exit cleanly and let the client reconnect
+  // with a fresh handshake (see the note above).
   return { action: "exit", code, reason: "post-init-exit" };
 }
 
@@ -168,8 +223,10 @@ function stampFresh(sys) {
   if (!sys) return false;
   const r = spawnSync(sys, [BOOTSTRAP, "--check", "--venv", dir], {
     stdio: ["ignore", "ignore", "ignore"],
+    timeout: PROBE_TIMEOUT_MS,
   });
-  return r.status === 0;
+  // A timed-out (r.error) or non-zero --check is "not fresh" -> run the foreground catch-up (review-low).
+  return !r.error && r.status === 0;
 }
 
 // The supervision loop, with every side-effecting dependency injectable so a test can drive the REAL
@@ -188,6 +245,12 @@ export function createSupervisor({
   cancel = (handle) => clearTimeout(handle),
   log = serverLog,
   onChildSpawned = () => {},
+  // Did the child that just exited write its readiness marker (i.e. begin serving)? Injectable so tests
+  // drive the post-init vs startup classification without a real engine; production reads the marker file.
+  servedInit = (startedAtMs) => markerServedInit(startedAtMs),
+  // Clear the readiness marker before each (re)spawn so only the new child can (re)write it. Injectable
+  // so the loop tests stay hermetic (no real filesystem marker).
+  clearMarker = () => clearReadyMarker(),
   policy = SUPERVISOR,
 } = {}) {
   let child = null;
@@ -215,6 +278,7 @@ export function createSupervisor({
   }
 
   function spawnOnce() {
+    clearMarker(); // drop any stale readiness marker so it can only be (re)written by THIS child
     startedAt = now();
     child = spawnEngine();
     child.on("error", (e) => {
@@ -233,12 +297,15 @@ export function createSupervisor({
     child = null;
     const t = now();
     const ranForMs = t - startedAt;
+    const served = servedInit(startedAt); // did this child write its readiness marker (begin serving)?
     restartTimes = restartTimes.filter((ts) => t - ts < policy.RESTART_WINDOW_MS);
     const decision = restartDecision(
-      { code, signal, ranForMs, shuttingDown, triedHeal, recentRestartCount: restartTimes.length },
+      { code, signal, ranForMs, shuttingDown, triedHeal, recentRestartCount: restartTimes.length, servedInit: served },
       policy
     );
-    log(`engine exited code=${code} signal=${signal} ranForMs=${ranForMs} -> ${decision.reason}`);
+    log(
+      `engine exited code=${code} signal=${signal} ranForMs=${ranForMs} servedInit=${served} -> ${decision.reason}`
+    );
 
     if (decision.action === "exit") {
       if (decision.reason === "crash-loop-cap") {

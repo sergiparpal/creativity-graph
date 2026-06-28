@@ -456,7 +456,7 @@ def merge_results_into_nodes(results: list[ValidationResult]) -> dict[str, Node]
     nodes: dict[str, Node] = {}
     for r in results:
         if r.kind == "node" and r.written:
-            nodes.setdefault(r.item.id, r.item)
+            nodes[r.item.id] = r.item  # last write wins — parity with the edge dedup below
     # single-canonical-edge rule: dedup by edge id within a source node (last write wins). Key the
     # attachment on the SLUG of edge.source — the same canonical key node ids, edge_id, node files, and
     # dedup all use — NOT the raw source string. Keying on the raw label (e.g. 'Free Energy Principle')

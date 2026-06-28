@@ -77,6 +77,62 @@ class GroundAuditLog:
         except OSError:
             return False
 
+    def append_checkpoint(self, consumed: dict, epistemic: dict) -> bool:
+        """Append a durable spend-ledger CHECKPOINT to the (append-only) audit log: a snapshot of the
+        reconciler's ``consumed`` tally and ``epistemic`` baseline at the end of a sweep.
+
+        The audit log is the trust ROOT (fsync'd, committed alongside the canon) — unlike the
+        ``.kg-reconcile-state.json`` cache, which is git-ignored and fails open to ``{}`` on loss. Without
+        a durable checkpoint, deleting that disposable cache resets ``consumed`` to empty while every
+        historical record survives, so a previously-grounded-then-demoted edge can be re-forged and slip
+        past the count check (§1.8). A checkpoint lets the reconciler RECOVER the spend ledger from the
+        trust root instead of replaying the whole log.
+
+        Best-effort (returns False on OSError): a missing checkpoint only costs the recovery, never breaks
+        a sweep, and the next sweep re-checkpoints. A stale checkpoint is only ever safe-HIGH (over-strict
+        re-quarantine), never a missed forgery. The record carries an ``_ckpt`` marker the reader's pair
+        fold skips, so it never counts as a verdict transition. ``ensure_ascii=True`` keeps the log
+        pure-ASCII like ``append`` (non-ASCII ids survive as \\u escapes)."""
+        rec = {"_ckpt": 1, "consumed": consumed, "epistemic": epistemic, "at": utcnow()}
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            _fsync_dir(self.path.parent)
+            return True
+        except OSError:
+            return False
+
+    def last_checkpoint(self) -> "dict | None":
+        """The most recent checkpoint's ``{'consumed': {...}, 'epistemic': {...}}``, or None if the log
+        has none (or is absent/unreadable). Scans the whole log — recovery-only, called when the reconcile
+        cache is missing — tolerating corrupt lines and a single undecodable byte (``errors='replace'``).
+        The LAST checkpoint wins (latest sweep)."""
+        try:
+            blob = self.path.read_bytes()
+        except (FileNotFoundError, OSError):
+            return None
+        found = None
+        for line in blob.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and "_ckpt" in rec:
+                found = rec
+        if found is None:
+            return None
+        consumed = found.get("consumed")
+        epistemic = found.get("epistemic")
+        return {
+            "consumed": consumed if isinstance(consumed, dict) else {},
+            "epistemic": epistemic if isinstance(epistemic, dict) else {},
+        }
+
     def audited_write(self, records, attempt):
         """The crash-safe audit+write dance shared by the verdict-writing handlers (§1.8): capture the
         offset BEFORE appending so an orphan record can be dropped, append each ``(key, frm, to, by)``
@@ -109,7 +165,16 @@ class GroundAuditLog:
                 raise OrphanAuditError(
                     f"audit append failed and orphan record(s) could not be truncated back to {offset}")
             raise
-        ok, payload = attempt()
+        try:
+            ok, payload = attempt()
+        except Exception:  # noqa: BLE001 — a RAISED write (not the (ok, payload) signal) must also compensate
+            # attempt() threw instead of returning a failure signal: truncate the just-appended records
+            # the same way as the failure path so a thrown write never leaves orphan records that would
+            # inflate the reconciler's consumed tally and let a later replay defeat forge detection (§1.8).
+            if not self.truncate(offset):
+                raise OrphanAuditError(
+                    f"write raised and orphan audit record(s) could not be truncated back to {offset}")
+            raise
         if not ok and not self.truncate(offset):
             # the write signalled failure but the compensating truncate could not drop the record(s):
             # surface a hard error so the caller does not report a clean rollback (§1.8).

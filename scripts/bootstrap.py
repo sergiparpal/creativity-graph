@@ -222,7 +222,17 @@ def venv_current(venv_dir: Path) -> bool:
 
     Recomputes the stamp against the VENV interpreter's identity on every call (review-M7),
     so a fresh check after another builder lands the venv compares equal.
+
+    Cheap pre-check FIRST (review-low/perf): if the interpreter pointer / stamp markers are not
+    even present yet there is nothing to compare, so return False WITHOUT computing the expensive
+    ``_current_stamp`` — which spawns the venv interpreter (``_interp_identity``). A foreground
+    ``_wait_for_lock`` poll re-checks readiness every ``POLL_SECS`` while another builder works,
+    and the markers only appear once that build finishes, so this keeps the wait loop from
+    re-spawning the interpreter on every 2s tick.
     """
+    py = venv_python(venv_dir)
+    if not (py.exists() and (venv_dir / PTR_NAME).exists() and (venv_dir / STAMP_NAME).exists()):
+        return False
     return is_ready(venv_dir, _current_stamp(venv_dir))
 
 
@@ -567,15 +577,18 @@ def probe_leidenalg(py: Path) -> None:
         )
 
 
-def _looks_like_our_venv(venv_dir: Path) -> bool:
-    """True when the dir is a venv this provisioner owns/built (so deleting it on failure
-    is safe). We refuse to rmtree an arbitrary pre-existing user dir that --venv /
-    KG_ENGINE_VENV merely points at: a populated, non-venv path must never be clobbered."""
-    return (
-        (venv_dir / "pyvenv.cfg").exists()
-        or (venv_dir / PTR_NAME).exists()
-        or (venv_dir / STAMP_NAME).exists()
-    )
+def _has_engine_marker(venv_dir: Path) -> bool:
+    """True only when the dir carries an ENGINE-specific marker that bootstrap itself writes
+    (``engine-python.txt`` / ``install.stamp``) — proof that THIS provisioner built it, so
+    deleting it on failure is safe.
+
+    A bare ``pyvenv.cfg`` deliberately does NOT qualify (bootstrap-1): EVERY venv has one,
+    including a user's own venv that ``--venv`` / ``KG_ENGINE_VENV`` merely points at. Keying
+    ownership on ``pyvenv.cfg`` would let a failed install ``rmtree`` a user's real venv. So we
+    key strictly on the files bootstrap writes; a populated dir without one is treated as
+    foreign user data and is never scaffolded into nor deleted.
+    """
+    return (venv_dir / PTR_NAME).exists() or (venv_dir / STAMP_NAME).exists()
 
 
 def do_install(venv_dir: Path) -> Path:
@@ -585,25 +598,28 @@ def do_install(venv_dir: Path) -> Path:
     if uv:
         print(f"[bootstrap] Found uv at {uv} — using it for a faster install", flush=True)
     venv_dir.parent.mkdir(parents=True, exist_ok=True)
-    # Did this dir already exist (and look like an unrelated user path) before we touched
-    # it? If so, never rmtree it on failure (bootstrap-4: --venv may point at user data).
-    preexisting_foreign = venv_dir.exists() and not _looks_like_our_venv(venv_dir)
-    # Whether the dir was absent or EMPTY before we touched it — i.e. WE are populating it. On failure
-    # such a dir is safe to rmtree even if the install died before pyvenv.cfg/markers exist (a partial
-    # pre-config scaffold), without the _looks_like_our_venv check. Without this, a partial scaffold is
-    # neither cleaned (no markers) nor buildable next run (the preexisting_foreign guard below then sees a
-    # populated non-venv dir and SystemExits), wedging the venv path until a human deletes it (bootstrap).
+    # Whether the dir was absent or EMPTY before we touched it — i.e. WE are populating it THIS run. On
+    # failure such a dir is safe to rmtree even if the install died before any marker exists (a partial
+    # pre-config scaffold). Without this, a scaffold we created and then failed on would be neither cleaned
+    # (no marker yet) nor buildable next run (the foreign guard would see a populated markerless dir),
+    # wedging the venv path until a human deletes it (bootstrap).
     try:
         ours_to_clean = not venv_dir.exists() or not any(venv_dir.iterdir())
     except OSError:
         ours_to_clean = False
-    # Refuse to SCAFFOLD a venv into a populated dir we don't own, BEFORE writing anything — so we
-    # neither delete (handled below) nor pollute user data with pyvenv.cfg/bin/lib. An empty foreign
-    # dir is fine to build into.
-    if preexisting_foreign and any(venv_dir.iterdir()):
+    # A PRE-EXISTING, populated dir that carries NO engine marker is FOREIGN — a user's own venv (a bare
+    # pyvenv.cfg does NOT make it ours; see _has_engine_marker) or unrelated data that --venv /
+    # KG_ENGINE_VENV merely points at (bootstrap-1/4). Refuse to SCAFFOLD into it BEFORE writing anything,
+    # so we neither pollute user data with bin/lib nor (below) ever rmtree it. DELIBERATE trade-off: a
+    # half-built venv left by a HARD-KILLED previous run (pyvenv.cfg but no marker, its own cleanup never
+    # ran) is also treated as foreign and so wedges this path until a human removes it — chosen over any
+    # risk of deleting real user data. The COMMON half-built case (this run created it, then failed) is
+    # ours_to_clean and is cleaned below.
+    preexisting_foreign = (not ours_to_clean) and not _has_engine_marker(venv_dir)
+    if preexisting_foreign:
         raise SystemExit(
             f"[bootstrap] refusing to provision into {venv_dir}: it already exists and is not an "
-            f"engine venv (no pyvenv.cfg / {PTR_NAME} / {STAMP_NAME}). Point --venv / KG_ENGINE_VENV "
+            f"engine venv (no {PTR_NAME} / {STAMP_NAME}). Point --venv / KG_ENGINE_VENV "
             f"at a dedicated path.")
 
     # Keep the lock alive across a slow source-build so a concurrent provisioner does not
@@ -630,12 +646,15 @@ def do_install(venv_dir: Path) -> Path:
         probe_leidenalg(py)
     except BaseException:
         # A failed/interrupted install leaves a venv with an interpreter but a partial
-        # dependency graph that the next run would silently "reuse". Remove it so the
-        # next provision rebuilds clean — but ONLY when it is a venv we own; a --venv /
-        # KG_ENGINE_VENV pointed at a pre-existing populated user dir is left untouched.
-        # The lock lives BESIDE the venv (_lock_dir), so this never deletes the lock this
-        # process still holds.
-        if not preexisting_foreign and (ours_to_clean or _looks_like_our_venv(venv_dir)):
+        # dependency graph that the next run would silently "reuse". Remove it so the next
+        # provision rebuilds clean — but ONLY when it is genuinely ours: either WE created
+        # the dir THIS run (ours_to_clean) or it carries an engine marker from a prior build
+        # (engine-python.txt / install.stamp). A pre-existing populated dir WITHOUT an engine
+        # marker is foreign and was already refused above, so we never reach here for one — but
+        # the marker re-check keeps the rmtree from ever touching such a dir even if that guard
+        # changed. A bare pyvenv.cfg never qualifies (bootstrap-1). The lock lives BESIDE the
+        # venv (_lock_dir), so this never deletes the lock this process still holds.
+        if ours_to_clean or _has_engine_marker(venv_dir):
             shutil.rmtree(venv_dir, ignore_errors=True)
         raise
     finally:

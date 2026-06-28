@@ -57,8 +57,11 @@ export function systemPython(requireImports = ["sys"]) {
   const probe =
     `import ${requireImports.join(", ")}; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)`;
   for (const c of cands) {
-    const r = spawnSync(c, ["-c", probe], { stdio: "ignore" });
-    if (r.status === 0) return c;
+    // Cap the probe (review-low): on Windows the `py`/`python` App Execution Alias stub can stall
+    // indefinitely. A timed-out probe sets r.error with r.status=null, so it is skipped like a missing
+    // interpreter and we fall through to the next candidate / null.
+    const r = spawnSync(c, ["-c", probe], { stdio: "ignore", timeout: 15000 });
+    if (!r.error && r.status === 0) return c;
   }
   return null;
 }

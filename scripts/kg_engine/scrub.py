@@ -175,6 +175,14 @@ class Scrubber:
         # never collide with a literal a later restore would over-expand (scrub-2/M4). It also drives the
         # identity entries emitted into each call's returned mapping (see scrub()).
         self._reserved_placeholders: set[str] = set()
+        # Each extra_terms category is emitted VERBATIM as the ⟦CAT:N⟧ placeholder category, which
+        # restore() only recovers when it matches _PLACEHOLDER_RE's [A-Z]+ grammar. A lowercase/mixed/
+        # non-ASCII category would emit a placeholder restore can never match -> the original text is
+        # never recovered (canon corruption). Fail LOUDLY at construction instead of silently corrupting.
+        for cat in self.extra_terms:
+            if not (cat.isascii() and cat.isalpha() and cat.isupper()):
+                raise ValueError(
+                    f"extra_terms category {cat!r} must be uppercase ASCII letters (the ⟦CAT:N⟧ grammar)")
         # Precompile caller-supplied literal terms ONCE per instance instead of re.compile-per-term
         # per scrub() call (perf-#21). Each term becomes re.compile(re.escape(term)) — byte-identical
         # match semantics to the old `re.sub(re.escape(term), ...)` — and the longest-first ordering

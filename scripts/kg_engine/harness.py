@@ -361,7 +361,7 @@ def _load_json_or_demo(path, demo, *, notice: str):
     data on a real-but-broken input would be a misleading number, worse than a clean error."""
     if path and Path(path).exists():
         try:
-            return json.loads(Path(path).read_text()), False
+            return json.loads(Path(path).read_text(encoding="utf-8")), False
         except (json.JSONDecodeError, OSError) as e:
             raise _LoadError(f"failed to parse {path}: {e}") from e
     print(f"[harness] {notice}", file=sys.stderr)

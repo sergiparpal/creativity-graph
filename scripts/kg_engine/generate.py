@@ -193,16 +193,17 @@ def bridge(G, *, pack, corpus, failures, k=10, adj=None) -> list:
     if adj is None:
         adj = _undirected_adjacency(G)
     nodes = list(G.nodes())
+    strength = {n: _bridge_strength(G, n, gate_on) for n in nodes}  # endpoint-only; precomputed once (perf)
     cands: list = []
     for i, u in enumerate(nodes):
-        su = _bridge_strength(G, u, gate_on)
+        su = strength[u]
         if su <= 0:
             continue
         cu = _attr(G, u, "community", NO_COMMUNITY)
         for v in nodes[i + 1:]:
             if v in adj[u] or _attr(G, v, "community", NO_COMMUNITY) == cu:
                 continue  # already connected, or same community (not a cross-community bridge)
-            sv = _bridge_strength(G, v, gate_on)
+            sv = strength[v]
             if sv <= 0:
                 continue
             if _is_failure(failures, u, BRIDGES_RELATION, v):
@@ -325,6 +326,7 @@ def regroup(G, *, pack, corpus, failures, k=10, und=None, adj=None, new_comm=_UN
         adj = _undirected_adjacency(G)
     gate_on = _gate_on(G)
     nodes = list(G.nodes())
+    strength = {n: _bridge_strength(G, n, gate_on) for n in nodes}  # endpoint-only; precomputed once (perf)
     cands: list = []
     for i, u in enumerate(nodes):
         ou, nu = _attr(G, u, "community", NO_COMMUNITY), new_comm.get(u)
@@ -338,8 +340,8 @@ def regroup(G, *, pack, corpus, failures, k=10, und=None, adj=None, new_comm=_UN
                 continue
             if _is_failure(failures, u, BRIDGES_RELATION, v):
                 continue
-            su = _bridge_strength(G, u, gate_on)
-            sv = _bridge_strength(G, v, gate_on)
+            su = strength[u]
+            sv = strength[v]
             spec = _pair_specificity(G, u, v)
             cands.append(_edge_cand(
                 "regroup", u, v, BRIDGES_RELATION, score=(su + sv) + 1e-3, specificity=spec, section="§8",

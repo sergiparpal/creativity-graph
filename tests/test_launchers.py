@@ -316,6 +316,12 @@ out.cap     = L.restartDecision({code:70, signal:null, ranForMs:200, shuttingDow
 // a POST-INIT crash (ran past the startup window) EXITS cleanly with the child's code (no relaunch onto
 // the held-open, already-handshaked pipe) so the client reconnects with a fresh handshake
 out.postInit = L.restartDecision({code:70, signal:null, ranForMs:40000, shuttingDown:false, triedHeal:true, recentRestartCount:1});
+// the readiness-marker fix: a FAST crash (well within EARLY_FAILURE_MS) that nonetheless wrote its marker
+// (servedInit=true) is POST-INIT, not a startup failure -> exit cleanly, do NOT relaunch in place
+out.fastServed = L.restartDecision({code:70, signal:null, ranForMs:200, shuttingDown:false, triedHeal:false, recentRestartCount:0, servedInit:true});
+// ...and a shuttingDown exit returns code 0 even when the child reported a non-zero code (Windows SIGTERM
+// maps to a numeric signum with signal=null) — an ordinary shutdown must never look like a crash
+out.shutCode = L.restartDecision({code:143, signal:null, ranForMs:1e9, shuttingDown:true, triedHeal:false, recentRestartCount:0});
 process.stdout.write(JSON.stringify(out));
 """)
     assert out["backoff"] == [200, 400, 800, 1600, 3200, 5000, 5000]
@@ -327,6 +333,14 @@ process.stdout.write(JSON.stringify(out));
     assert out["postInit"]["action"] == "exit"
     assert out["postInit"]["reason"] == "post-init-exit"
     assert out["postInit"]["code"] == 70
+    # a fast crash that DID serve init (marker present) is treated as post-init regardless of wall-clock
+    assert out["fastServed"]["action"] == "exit"
+    assert out["fastServed"]["reason"] == "post-init-exit"
+    assert out["fastServed"]["code"] == 70
+    # a shuttingDown exit is always code 0 (the Windows non-zero-signum-on-clean-shutdown fix)
+    assert out["shutCode"]["action"] == "exit"
+    assert out["shutCode"]["code"] == 0
+    assert out["shutCode"]["reason"] == "clean-exit"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -407,6 +421,40 @@ process.stdout.write(JSON.stringify({ spawns: children.length, pending: pending.
 """)
     assert out["spawns"] == 1, "a post-init crash must NOT relaunch"
     assert out["pending"] == 0
+    assert out["exitCode"] == 70, "exits with the engine's crash code so the client reconnects"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_supervisor_fast_post_init_crash_with_marker_exits_no_relaunch():
+    """The readiness-marker fix end-to-end through the REAL loop: an engine that came up and served
+    `initialize` (servedInit -> true) but then crashes FAST (well within EARLY_FAILURE_MS, the window that
+    used to be misread as a startup failure) must EXIT cleanly with the child's code — NOT heal/relaunch in
+    place onto the held-open, already-handshaked pipe. A clearMarker stub keeps the loop hermetic."""
+    out = _run_node_harness(r"""
+import { EventEmitter } from "node:events";
+let t = 1e6;
+const children = [], pending = [];
+let exitCode = null, healCalls = 0, cleared = 0;
+const sup = L.createSupervisor({
+  spawnEngine: () => { const c = new EventEmitter(); children.push(c); return c; },
+  exit: (code) => { exitCode = code; },
+  heal: () => { healCalls++; },
+  now: () => t,
+  schedule: (fn) => pending.push(fn),
+  log: () => {},
+  servedInit: () => true,            // the engine wrote its readiness marker (it began serving)
+  clearMarker: () => { cleared++; }, // hermetic: no real filesystem marker
+});
+sup.start();
+t += 200;                            // crashes FAST (< EARLY_FAILURE_MS) but AFTER serving init
+children[0].emit("exit", 70, null);
+process.stdout.write(JSON.stringify({ spawns: children.length, pending: pending.length, heal: healCalls,
+                                      cleared, exitCode }));
+""")
+    assert out["spawns"] == 1, "a served-init crash must NOT relaunch even when it died fast"
+    assert out["heal"] == 0, "a post-init crash must not trigger a venv heal"
+    assert out["pending"] == 0
+    assert out["cleared"] >= 1, "the marker is cleared before (re)spawn"
     assert out["exitCode"] == 70, "exits with the engine's crash code so the client reconnects"
 
 

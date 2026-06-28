@@ -34,8 +34,19 @@ if (!py) {
 const env = withPythonpath(process.env, SCRIPTS);
 
 // Pass git's [%O, %A, %B] straight through; inherit stdio so the driver's stderr notes reach the user.
+// A timeout caps a wedged canonmerge so it can never hang `git merge` indefinitely (review-low); a
+// timed-out OR failed-to-spawn (ENOENT) run sets r.error -> emit a one-line note (mirroring the no-python
+// branch) and exit non-zero so git reports the file conflicted rather than silently taking one side.
 const r = spawnSync(py, ["-m", "kg_engine.canonmerge", ...process.argv.slice(2)], {
   stdio: "inherit",
   env,
+  timeout: 60000,
 });
+if (r.error) {
+  process.stderr.write(
+    "[creativity-graph] canon merge driver: failed to run the engine " +
+      `(${r.error.code || r.error.message}); leaving the merge to git's default driver.\n`
+  );
+  process.exit(1);
+}
 process.exit(r.status === null ? 1 : r.status);

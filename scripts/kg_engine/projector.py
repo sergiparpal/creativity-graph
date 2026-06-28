@@ -319,10 +319,14 @@ class Projector:
         # uses `und.neighbors`, deduped) and from the glossary ("count of a node's connections" =
         # neighbours). The persisted `degree` drives query_graph ranking, the bridge advisory, and the
         # kg_agenda hub detector, so the two co-located signals must agree on what a connection is.
-        degree = {n: len(set(und.neighbors(n))) for n in und.nodes()}
+        # Exclude a node from its OWN neighbour set in BOTH the degree and the bridge-community span:
+        # to_undirected keeps self-loops, so `und.neighbors(n)` yields `n` itself when one exists. A
+        # self-loop is not a connection to another node — counting it would inflate degree by one and
+        # could falsely flag a node as a structural_bridge (its own community would join the span).
+        degree = {n: len(set(und.neighbors(n)) - {n}) for n in und.nodes()}
         bridges = {}
         for n in G.nodes():
-            neigh_comms = {comm.get(nb) for nb in und.neighbors(n)}
+            neigh_comms = {comm.get(nb) for nb in set(und.neighbors(n)) - {n}}
             neigh_comms.discard(None)
             bridges[n] = len(neigh_comms)
 
@@ -448,7 +452,10 @@ class Projector:
         # already-flagged edges (so a re-grounded/deleted one CLEARS) AND scan the edges on THIS
         # projection's `changed` notes — so a divergence introduced via the CANON (a hand-edited span on
         # an already-grounded edge) is caught too, without a full O(N) source scan.
-        sources = self._source_set() if self._source_set else None
+        try:
+            sources = self._source_set() if self._source_set else None
+        except Exception:  # noqa: BLE001 — degrade to no-source (no staleness scan) rather than crash the projection
+            sources = None
         changed = [] if do_full else [n for n in nodes if cur_hashes.get(n.id) != prior_hashes.get(n.id)]
         removed = [] if do_full else [nid for nid in prior_hashes if nid not in cur_hashes]
         if do_full or cur_source_hash != prior.get("source_hash", ""):
@@ -512,48 +519,61 @@ class Projector:
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
-        con.execute("PRAGMA busy_timeout=5000")  # wait, don't raise, if another writer holds the lock
-        con.execute("PRAGMA journal_mode=WAL")
-        con.executescript(
-            f"""
-            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-            {self._NODES_DDL};
-            -- verdict_by/verdict_at are intentionally NOT columns here: verdict attribution lives
-            -- authoritatively in the canon frontmatter + audit log (reconciler reads them from there).
-            -- "derived contains nothing the canon does not" is one-directional — the derived layer MAY
-            -- omit canon fields, so this is contractually allowed, not a gap.
-            {self._EDGES_DDL};
-            CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
-            CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
-            CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree);
-            """
-        )
-        # CREATE TABLE IF NOT EXISTS cannot add the Stage-2 columns to a pre-existing 11-column `nodes`
-        # table. If they are missing, drop and recreate it empty (a full reprojection — forced by
-        # _schema_outdated — repopulates it). Done here so every connect path heals the schema.
-        cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
-        if not _NEW_NODE_COLUMNS <= cols:
-            # Heal a pre-Stage-2 schema by dropping + recreating `nodes` empty (a full reproject, forced
-            # by _schema_outdated, repopulates it). Do the DROP+CREATE inside ONE IMMEDIATE transaction so
-            # a concurrent lease-free WAL reader sees either the old table or the new one — never the
-            # intermediate no-`nodes`-table state, which would raise "no such table: nodes". executescript
-            # auto-commits between statements (reopening that window), so drive explicit statements under
-            # manual transaction control instead.
-            prior_iso = con.isolation_level
-            con.isolation_level = None  # autocommit: BEGIN/COMMIT are explicit + predictable cross-version
-            try:
-                con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute("PRAGMA busy_timeout=5000")  # wait, don't raise, if another writer holds the lock
+            con.execute("PRAGMA journal_mode=WAL")
+            con.executescript(
+                f"""
+                CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+                {self._NODES_DDL};
+                -- verdict_by/verdict_at are intentionally NOT columns here: verdict attribution lives
+                -- authoritatively in the canon frontmatter + audit log (reconciler reads them from there).
+                -- "derived contains nothing the canon does not" is one-directional — the derived layer MAY
+                -- omit canon fields, so this is contractually allowed, not a gap.
+                {self._EDGES_DDL};
+                CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
+                CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
+                CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree);
+                """
+            )
+            # CREATE TABLE IF NOT EXISTS cannot add the Stage-2 columns to a pre-existing 11-column
+            # `nodes` table. If they are missing, drop and recreate it empty (a full reprojection —
+            # forced by _schema_outdated — repopulates it). Done here so every connect path heals the
+            # schema. The pre-BEGIN read below is only a cheap fast-path skip; the authoritative decision
+            # re-reads the columns under the exclusive lock (TOCTOU guard).
+            cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
+            if not _NEW_NODE_COLUMNS <= cols:
+                # Heal a pre-Stage-2 schema by dropping + recreating `nodes` empty (a full reproject,
+                # forced by _schema_outdated, repopulates it). Do the DROP+CREATE inside ONE IMMEDIATE
+                # transaction so a concurrent lease-free WAL reader sees either the old table or the new
+                # one — never the intermediate no-`nodes`-table state, which would raise "no such table:
+                # nodes". executescript auto-commits between statements (reopening that window), so drive
+                # explicit statements under manual transaction control instead.
+                prior_iso = con.isolation_level
+                con.isolation_level = None  # autocommit: BEGIN/COMMIT are explicit + predictable cross-version
                 try:
-                    con.execute("DROP TABLE IF EXISTS nodes")
-                    con.execute(self._NODES_DDL)
-                    con.execute("CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree)")
-                    con.execute("COMMIT")
-                except Exception:
-                    con.execute("ROLLBACK")
-                    raise
-            finally:
-                con.isolation_level = prior_iso
-        return con
+                    con.execute("BEGIN IMMEDIATE")
+                    try:
+                        # Re-read the columns INSIDE the immediate transaction: a concurrent rebuild may
+                        # have already healed + populated `nodes` between the pre-BEGIN read above and
+                        # acquiring this exclusive lock. Dropping on that stale read would discard the
+                        # freshly-projected rows, so only DROP/recreate if the table is STILL pre-Stage-2
+                        # under the lock.
+                        cols = {r[1] for r in con.execute("PRAGMA table_info(nodes)")}
+                        if not _NEW_NODE_COLUMNS <= cols:
+                            con.execute("DROP TABLE IF EXISTS nodes")
+                            con.execute(self._NODES_DDL)
+                            con.execute("CREATE INDEX IF NOT EXISTS idx_nodes_degree ON nodes(degree)")
+                        con.execute("COMMIT")
+                    except Exception:
+                        con.execute("ROLLBACK")
+                        raise
+                finally:
+                    con.isolation_level = prior_iso
+            return con
+        except Exception:
+            con.close()  # never leak the connection if a PRAGMA/schema-heal step raises (returned only on success)
+            raise
 
     def _schema_outdated(self) -> bool:
         """True if an index.sqlite exists but its `nodes` table predates the Stage-2 columns — forces a
@@ -690,8 +710,11 @@ class Projector:
         """sha256 of the source payload (the SourceSet concat); '' when no source. R3's stale-verdict
         recompute pre-gate — moves on any add/remove/edit of any source file. Computed only inside a
         projection (off the hot path); is_stale is left source-blind (Q3 one-projection-lag)."""
-        sources = self._source_set() if self._source_set else None
-        payload = sources.concat if sources is not None else self._src_text()
+        try:
+            sources = self._source_set() if self._source_set else None
+            payload = sources.concat if sources is not None else self._src_text()
+        except Exception:  # noqa: BLE001 — a source-read hiccup degrades to "" (no source), matching _src_text's posture
+            return ""
         return hashlib.sha256(payload.encode()).hexdigest() if payload else ""
 
     @staticmethod
@@ -760,19 +783,21 @@ class Projector:
         finally:
             con.close()  # always close, even if the query raised (no leaked connection)
         out = {"built_from_commit": rows.get("built_from_commit", "")}
+        # Catch TypeError too (not just ValueError): a NULL/non-string meta value (corruption) makes
+        # json.loads raise TypeError, which must degrade to the default — matching _read_stale_advisory.
         try:
             out["file_hashes"] = json.loads(rows.get("file_hashes", "{}"))
-        except ValueError:
+        except (ValueError, TypeError):
             out["file_hashes"] = {}
         try:
             out["cheap_sig"] = json.loads(rows.get("cheap_sig", "null"))
-        except ValueError:
+        except (ValueError, TypeError):
             out["cheap_sig"] = None
         out["source_hash"] = rows.get("source_hash", "")  # R3 stale-verdict recompute pre-gate
         out["topo_sig"] = rows.get("topo_sig", "")         # projector-1 betweenness-reuse signature
         try:
             out["stale_verdicts"] = json.loads(rows.get("stale_verdicts", "[]"))
-        except ValueError:
+        except (ValueError, TypeError):
             out["stale_verdicts"] = []
         return out
 
@@ -940,17 +965,25 @@ class Projector:
             con.close()
         if source == target:
             return [source]
+        # Predecessor-map BFS (O(V+E)) over the UNDIRECTED reachability of the MultiDiGraph (adjacency
+        # added both ways above): carry only one predecessor per visited node instead of a full path list
+        # per frontier entry (the old O(V·L) frontier), then reconstruct the path from `source` at the end.
         from collections import deque
-        q, seen = deque([[source]]), {source}
+        pred: dict[str, str] = {source: source}  # source is its own predecessor — the reconstruction stop
+        q = deque([source])
         while q:
-            path = q.popleft()
-            for nb in adj.get(path[-1], []):
-                if nb in seen:
+            cur = q.popleft()
+            for nb in adj.get(cur, []):
+                if nb in pred:
                     continue
+                pred[nb] = cur
                 if nb == target:
-                    return path + [nb]
-                seen.add(nb)
-                q.append(path + [nb])
+                    path = [target]
+                    while path[-1] != source:
+                        path.append(pred[path[-1]])
+                    path.reverse()
+                    return path
+                q.append(nb)
         return None
 
     @staticmethod
