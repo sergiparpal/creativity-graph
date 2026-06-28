@@ -14,6 +14,22 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lease release no longer orphans the lock on a transient Windows sharing violation.** On Windows
+  `os.replace()` of the lock file raises `ERROR_SHARING_VIOLATION` (a `PermissionError`) while another
+  session momentarily has it open for read — which the spinning waiters of a full parallel `/kg-build`
+  wave do constantly (Python's `open()` does not grant `FILE_SHARE_DELETE`). `LeaseLock.release()` caught
+  that as `except (FileNotFoundError, OSError): return`, mistaking a *transient* violation for "already
+  gone" and returning **without dropping the lock**. Because the orphaned record names a foreign host
+  (never pid-probed stale, only TTL-stale), it then blocked every other waiter for the full 120 s TTL —
+  far past the 30 s acquire budget — so a whole wave's writers spuriously failed with `canon vault is
+  locked by another live session`. The rename-aside CAS in `release()` and `_reclaim_stale()` now retries
+  the transient violation within a bounded budget (`LOCK_REPLACE_RETRY_TIMEOUT`, the reader closes within
+  ms), `FileNotFoundError` still propagates immediately (genuinely reclaimed), and a *persistent* error
+  still degrades gracefully (the TTL is the backstop). Fixes the flaky Windows CI failure of
+  `test_full_wave_of_concurrent_writers_all_commit_none_corrupted`; new coverage in `tests/test_fix_canon.py`.
+
 ## [0.5.3] — 2026-06-27
 
 A new write tool: **`kg_merge`** — the deliberate node-merge that `kg_rename` (deliberately) refuses. A

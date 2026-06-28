@@ -29,6 +29,7 @@ from kg_engine.canon import (
     LeaseLock,
     LOCK_NAME,
     TRANSIENT_REAP_TTL,
+    _replace_lockfile,
 )
 from kg_engine.model import Edge, EpistemicState, Node, Provenance
 
@@ -146,6 +147,76 @@ def test_release_removes_our_own_lock(tmp_path):
     assert not p.exists()
     # no stray sidelined artifacts left behind
     assert not list(tmp_path.glob(".kg-session-lock.release-*"))
+
+
+# ----------------------------------------------------- Windows sharing-violation on the release rename
+# On Windows os.replace() of the lock file fails with ERROR_SHARING_VIOLATION (a PermissionError) while a
+# concurrent waiter momentarily has it open for read — which the spinning writers in a parallel /kg-build
+# wave do constantly. release() used to treat that transient OSError as "already gone" and return WITHOUT
+# removing the lock. The orphaned record names a foreign host (never pid-probed stale, only TTL-stale), so
+# it would block every other waiter for the full TTL — far past the acquire budget — making a whole wave's
+# writers spuriously fail with "canon vault is locked by another live session". release() must instead
+# RETRY the rename (the reader closes within ms) and actually drop the lock.
+
+
+def test_release_retries_transient_sharing_violation_then_removes_lock(tmp_path, monkeypatch):
+    """release() must not abandon the lock on a transient Windows sharing violation: it retries the
+    rename-aside (the reader closes within ms) and the lock is genuinely removed, not orphaned."""
+    p = tmp_path / LOCK_NAME
+    lock = LeaseLock(p, ttl=120)
+    assert lock.acquire()
+    assert p.exists()
+
+    real_replace = canon_mod.os.replace
+    failures = {"n": 0}
+
+    def flaky_replace(src, dst, *a, **k):
+        # Simulate ERROR_SHARING_VIOLATION on the FIRST two release rename-aside attempts only.
+        if ".release-" in Path(dst).name and failures["n"] < 2:
+            failures["n"] += 1
+            raise PermissionError("[WinError 32] sharing violation")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(canon_mod.os, "replace", flaky_replace)
+
+    lock.release()  # must retry past the two violations and succeed, never raise
+
+    assert failures["n"] == 2  # it really did hit (and survive) the transient violations
+    assert not p.exists()  # the lock is gone — not orphaned to block successors until the TTL
+    assert not list(tmp_path.glob(f"{LOCK_NAME}.release-*"))  # sideline cleaned up
+
+
+def test_replace_lockfile_propagates_filenotfound_immediately(tmp_path, monkeypatch):
+    """A genuinely-gone source is NOT a transient violation: FileNotFoundError propagates at once
+    (no retry/backoff) so release()/reclaim treat it as 'already reclaimed', not 'try again'."""
+    calls = {"n": 0}
+
+    def gone(src, dst, *a, **k):
+        calls["n"] += 1
+        raise FileNotFoundError(src)
+
+    monkeypatch.setattr(canon_mod.os, "replace", gone)
+
+    with pytest.raises(FileNotFoundError):
+        _replace_lockfile(tmp_path / "a", tmp_path / "b")
+    assert calls["n"] == 1  # propagated on the first attempt, did not enter the retry loop
+
+
+def test_replace_lockfile_reraises_persistent_oserror_after_budget(tmp_path, monkeypatch):
+    """A sharing violation that NEVER clears is re-raised after the bounded budget (so the caller's own
+    except clause degrades gracefully and the TTL becomes the backstop) — it does not spin forever."""
+    monkeypatch.setattr(canon_mod, "LOCK_REPLACE_RETRY_TIMEOUT", 0.1)
+
+    def always_locked(src, dst, *a, **k):
+        raise PermissionError("[WinError 32] sharing violation")
+
+    monkeypatch.setattr(canon_mod.os, "replace", always_locked)
+
+    start = time.monotonic()
+    with pytest.raises(OSError):
+        _replace_lockfile(tmp_path / "a", tmp_path / "b")
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0  # bounded by the (shortened) budget, not the 5s default — definitely not forever
 
 
 # --------------------------------------------------------------------------- F16

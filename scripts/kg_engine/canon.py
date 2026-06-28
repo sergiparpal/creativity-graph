@@ -55,6 +55,17 @@ TRANSIENT_REAP_TTL = 3600.0
 LOCK_ACQUIRE_TIMEOUT = 30.0
 LOCK_RETRY_INITIAL = 0.05
 LOCK_RETRY_MAX = 0.5
+# Bounded retry budget for the lease-file rename-aside CAS (release + stale-reclaim). On Windows,
+# os.replace() on the lock file fails with a sharing violation (PermissionError/ERROR_SHARING_VIOLATION)
+# while ANOTHER session momentarily holds it open for read — which the spinning waiters in
+# _acquire_lease_blocking do constantly. The reader closes within milliseconds, so retry briefly instead
+# of treating a transient violation as "gone": a release() that gives up leaves the lock file in place,
+# and because that orphaned record names a foreign host (never pid-probed stale, only TTL-stale) it would
+# block every waiter for the full TTL — far past LOCK_ACQUIRE_TIMEOUT — surfacing as a spurious
+# locked-vault error for a whole parallel wave. Kept well under the acquire budget; in practice it
+# succeeds on the first attempt or two (there are always reader-free windows between the waiters' backoff
+# sleeps). Same fail-closed posture as the lock reader/heartbeat (a transient IO error never "succeeds").
+LOCK_REPLACE_RETRY_TIMEOUT = 5.0
 # Grounding audit log (kg_ground tamper-evidence). Defined here — the lowest layer that must keep it
 # out of git — and re-exported by reconciler so server/tests have one source of truth.
 GROUND_AUDIT = ".kg-ground-audit.jsonl"
@@ -169,11 +180,11 @@ class LeaseLock:
         """
         sidelined = self.path.with_name(f"{self.path.name}.stale-{self.pid}-{int(now * 1000)}")
         try:
-            os.replace(self.path, sidelined)
+            _replace_lockfile(self.path, sidelined)  # retry transient Windows sharing violations
         except FileNotFoundError:
             return True  # already reclaimed/removed; just try to create
         except OSError:
-            return False
+            return False  # persisted past the retry budget — lose this acquire and let the caller retry
         # Re-validate the record we actually moved: if the owner refreshed its heartbeat in the
         # window between our is_stale() read and this move, we just sidelined a LIVE lock. Put it
         # back and lose the race rather than steal it (closes the residual reclaim TOCTOU).
@@ -284,9 +295,9 @@ class LeaseLock:
             return
         sidelined = self.path.with_name(f"{self.path.name}.release-{self.pid}-{int(time.time() * 1000)}")
         try:
-            os.replace(self.path, sidelined)
+            _replace_lockfile(self.path, sidelined)  # retry transient Windows sharing violations
         except (FileNotFoundError, OSError):
-            return  # already gone/reclaimed — nothing of ours to release
+            return  # already gone/reclaimed (or a persistent IO error) — nothing of ours to release
         moved = self._read_path(sidelined, tolerant=True)
         if moved is not None and self._owned_by_self(moved):
             try:
@@ -302,6 +313,32 @@ class LeaseLock:
                 os.unlink(sidelined)
             except OSError:
                 pass
+
+
+def _replace_lockfile(src: Path, dst: Path) -> None:
+    """os.replace(src, dst) for the lease file, resilient to transient Windows sharing violations.
+
+    The rename-aside CAS (release/_reclaim_stale) moves `self.path` while concurrent waiters may have it
+    open for read; on Windows that raises PermissionError (ERROR_SHARING_VIOLATION) because Python's
+    open() does not grant FILE_SHARE_DELETE. The reader closes within milliseconds, so retry within a
+    bounded budget rather than mistaking the violation for a free path. FileNotFoundError propagates
+    IMMEDIATELY (the source is genuinely gone — already reclaimed), and a persistent OSError is re-raised
+    after the budget so the caller's own except clause still degrades gracefully (the TTL is the backstop).
+    """
+    deadline = time.monotonic() + LOCK_REPLACE_RETRY_TIMEOUT
+    backoff = LOCK_RETRY_INITIAL
+    while True:
+        try:
+            os.replace(src, dst)
+            return
+        except FileNotFoundError:
+            raise
+        except OSError:
+            now = time.monotonic()
+            if now >= deadline:
+                raise
+            time.sleep(min(backoff, deadline - now))
+            backoff = min(backoff * 2, LOCK_RETRY_MAX)
 
 
 def _pid_probe(pid: int, host: str, my_host: str) -> bool:
