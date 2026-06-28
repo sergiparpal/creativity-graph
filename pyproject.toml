@@ -38,6 +38,11 @@ dependencies = [
 backend = ["anthropic>=0.77"]
 # Test + dev tooling.
 dev = ["pytest>=8"]
+# Optional `lightrag` ideation-experiment arm (§Stage 8): a real, published GraphRAG baseline
+# (`kg_engine.lightrag_arm`) built over the SAME prose corpus as the flat `rag` arm. OFF by default —
+# install it AND set `KG_LIGHTRAG=1` + `OPENAI_API_KEY` to enable; absent it, the experiment runs its
+# original four arms unchanged. Bounded below its next (untested) major like every other dep.
+lightrag = ["lightrag-hku>=1.4,<2"]
 
 [build-system]
 requires = ["hatchling"]

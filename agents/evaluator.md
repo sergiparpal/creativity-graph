@@ -27,12 +27,39 @@ GRAPH+GENERATE, then all RAG — never interleave, and never let a later conditi
 | **graph** | `mcp__plugin_creativity-graph_creativity-graph__kg_context` `items[]` (+ the `advisory.signal:"structural-bridge"` hint) | Ground every idea in the returned **grounded** `items[]` edges and `advisory.nodes[]`. You MAY also call `query_graph` to expand. |
 | **graph+generate** | the same call's `items[]` **plus** its `hypotheses[]` (the unverified slate) | Ground each idea in the grounded `items[]` AND the hypothesized proposals — clearly treated as *unverified candidates*. Tests whether *generating* lifts ideation beyond grounded context alone (Stage 9). |
 | **rag** | flat retrieval over `examples/source.md` | Grep/read the raw source as undifferentiated text. NO graph structure: no epistemic_state, no bridges, no falsification counters, no degree. Just the prose. |
+| **lightrag** *(optional, off by default)* | a real LightRAG GraphRAG index over the **same** `examples/source.md` | Build/query a published GraphRAG baseline through its OWN retrieval. Same prose corpus as `rag`, structure-blind to OUR graph: it never reads our canon's epistemic_state, bridges, falsification counters, degree, or any `kg_*` output. Run **only** when available (see "The optional lightrag arm" below); otherwise OMIT the key entirely. |
 
 The GRAPH condition's whole advantage must come from *structure* — community bridges, grounded vs
 unverified edges, the memory of failures — that RAG cannot see in flat prose. GRAPH+GENERATE adds *only* the
 hypothesized slate on top of the same grounded context, so its delta over GRAPH isolates the value of
 generation. If you let GRAPH and RAG converge, or GRAPH+GENERATE and GRAPH converge, the experiment proves
-nothing.
+nothing. The optional **lightrag** arm is a stronger strawman than flat `rag`: a genuine GraphRAG over the
+same prose, so beating it (not just beating `rag`) is the real test of whether grounding-with-falsification
+adds value over a published graph-retrieval system.
+
+### The optional `lightrag` arm (add-only, never required)
+LightRAG is a separate framework (`pip install lightrag-hku`) that builds its own graph index over prose and
+answers from it. It is an **opt-in** comparison arm and is **off by default**. Run it **only** when the
+engine reports it available, and never let its absence break the run:
+
+```bash
+# is the arm runnable here? (needs KG_LIGHTRAG=1, the lightrag-hku package, and OPENAI_API_KEY)
+PYTHONPATH="$SCRIPTS" "$PY" -m kg_engine.lightrag_arm check    # -> {"available": true|false, "reason": "..."}
+```
+
+- If `available` is **false**: **omit** the `lightrag` key from `outputs` entirely and proceed with the four
+  standard arms. Do not fabricate answers, do not error — a missing optional arm is normal.
+- If `available` is **true**: write your fixed prompt set to a JSON file (an array of strings) and let the
+  isolated helper build/load the index over `examples/source.md` **once** and answer every prompt:
+  ```bash
+  PYTHONPATH="$SCRIPTS" "$PY" -m kg_engine.lightrag_arm answer \
+      --source /home/sergi/creativity-graph/examples/source.md \
+      --prompts prompts.json --out lightrag_answers.json    # -> {"answers": ["...", ...]}
+  ```
+  Read `lightrag_answers.json` (`answers[k]` is the response to prompt `k`, same order as every other arm)
+  into `outputs.lightrag`. The helper owns the LightRAG dependency, the OpenAI calls, and the gitignored
+  working store under the derived dir — you only shuttle prompts in and answers out. This arm reads **prose
+  only**, through LightRAG's retrieval; it must never see OUR graph's structure.
 
 ### Blindness, concretely
 - You know the labels (you have to, to route the tools). The point of "labels withheld" is
@@ -104,20 +131,25 @@ Emit a single JSON object. `outputs` holds the raw answer strings per condition,
     "control":        ["<answer to prompt 1>", "<answer to prompt 2>", "..."],
     "graph":          ["<answer to prompt 1>", "<answer to prompt 2>", "..."],
     "graph+generate": ["<answer to prompt 1>", "<answer to prompt 2>", "..."],
-    "rag":            ["<answer to prompt 1>", "<answer to prompt 2>", "..."]
+    "rag":            ["<answer to prompt 1>", "<answer to prompt 2>", "..."],
+    "lightrag":       ["<answer to prompt 1>", "<answer to prompt 2>", "..."]
   },
   "source": "<full text of examples/source.md>"
 }
 ```
 
-All four lists MUST have the same length (= number of prompts). This object is consumed verbatim by:
+`lightrag` is **optional** — include it only when the arm was available (see above); otherwise omit the key
+entirely and emit the standard four. **Every present arm's list MUST have the same length** (= number of
+prompts), in the same prompt order. The harness scores whatever arms are present, so a missing optional arm
+is simply absent from its table — never an error. This object is consumed verbatim by:
 
 ```bash
 python -m kg_engine.harness ideation outputs.json
 ```
 
-which returns `{"table": {control,graph,graph+generate,rag → {n,diversity,novelty,utility,unsupported_rate}},
-"verdict": "...", "generate_verdict": "..."}`. The headline `verdict` fires "graph condition produced more
+which returns `{"table": {control,graph,graph+generate,rag[,lightrag] → {n,diversity,novelty,utility,unsupported_rate}},
+"verdict": "...", "generate_verdict": "..."[, "lightrag_verdict": "..."]}` — the `lightrag` row and its
+`lightrag_verdict` (graph-vs-LightRAG) appear only when the optional arm was present. The headline `verdict` fires "graph condition produced more
 diverse/novel ideas without more unsupported claims" only when GRAPH's diversity AND novelty meet-or-beat
 CONTROL (with a strict gain on at least one) **and** GRAPH's `unsupported_rate <= control + 0.05`. That last
 clause is the anti-smuggling gate — keep it. The second `generate_verdict` applies the same bar to
@@ -153,7 +185,14 @@ GRAPH+GENERATE.
    surrounding flat prose, answer from that text *as undifferentiated source* — no epistemic state,
    no bridge ranks, no failure memory. Collect into `outputs.rag`.
 
-7. **Assemble & emit** the JSON object above. Write it to a file (e.g. `outputs.json`) so the harness
+7. **LIGHTRAG pass (optional).** Run `kg_engine.lightrag_arm check`. If it reports `available:false`,
+   **skip this arm** and omit the `lightrag` key. If `available:true`, write the fixed prompt set to a
+   JSON array file and run `kg_engine.lightrag_arm answer --source examples/source.md --prompts … --out …`
+   (it builds/loads the index over the same corpus once and answers every prompt via LightRAG's own
+   retrieval), then read its `answers[]` into `outputs.lightrag`. You do NOT feed our graph into this
+   arm — it sees prose only. See "The optional lightrag arm" above for the exact commands.
+
+8. **Assemble & emit** the JSON object above. Write it to a file (e.g. `outputs.json`) so the harness
    can read it, and print the path. Do NOT score it yourself — invoking the harness is the caller's
    step (you may run it as a convenience and echo the JSON verdict, but the verdict is the harness's).
 
@@ -234,8 +273,8 @@ python -m kg_engine.harness ideation outputs.json
 ---
 
 ## Self-check before you emit
-- [ ] `len(control) == len(graph) == len(graph+generate) == len(rag) == n` (default 12), all in the same prompt order.
-- [ ] CONTROL used no tools/files; RAG used only flat `examples/source.md`; GRAPH used `kg_context` `items[]`/`query_graph`; GRAPH+GENERATE reused the same `kg_context` call's `hypotheses[]` on top of `items[]`.
+- [ ] Every **present** arm's list has length `n` (default 12), all in the same prompt order. The four standard arms (`control`, `graph`, `graph+generate`, `rag`) are always present; `lightrag` is present **iff** the arm was available — when omitted, the other four still each have length `n`.
+- [ ] CONTROL used no tools/files; RAG used only flat `examples/source.md`; GRAPH used `kg_context` `items[]`/`query_graph`; GRAPH+GENERATE reused the same `kg_context` call's `hypotheses[]` on top of `items[]`; LIGHTRAG (if present) used only the isolated `kg_engine.lightrag_arm` over the same prose corpus — never OUR graph's structure.
 - [ ] Every GRAPH idea traces to a real `items[]` edge or `advisory.nodes[]` node — no invented structure; every GRAPH+GENERATE idea traces to a real `items[]` edge or a returned `hypotheses[]` candidate (flagged unverified).
 - [ ] No GRAPH sentence asserts a vague node "connects everything" (generality confound, §1.6).
 - [ ] If `failed_or_rejected_edges > 0`, no GRAPH idea re-treads a known-failed connection.

@@ -11,5 +11,10 @@ __pycache__/
 /derived/
 uv.lock
 
+# Optional LightRAG experiment-arm working store (index/vectors/cache): derived & disposable, never
+# source of truth. Normally lives under .kg-data/derived/ (already ignored); pinned here explicitly so
+# a relocated derived dir can't leak it into the canon.
+**/derived/lightrag/
+
 # Detached bootstrap worker log (runtime artifact)
 provision.log

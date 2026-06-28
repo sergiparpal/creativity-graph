@@ -14,6 +14,33 @@ JSON back across the MCP boundary.
 
 ## [Unreleased]
 
+### Added
+
+- **Stronger model pinned on the two adversarial reasoning roles.** `agents/grounder.md` (verifies the
+  unverified queue, rejects vague/unfalsifiable relations) and `agents/adversarial-grounder.md`
+  (red-teams hub nodes, sets genuinely falsified edges to `failed`) now carry `model: opus` in their
+  frontmatter — the `opus` alias, mirroring how `extractor.md` already pins `model: sonnet`. These are
+  the roles where model capability most changes a verdict; previously they silently inherited the
+  session default. Frontmatter-only change: no agent body, tool list, or graph data touched, and no
+  new verdict/edge path — verdicts still flow only through `kg_ground`. `extractor.md` stays on
+  `sonnet`; no other agent gains a `model:` line.
+- **Optional `lightrag` GraphRAG arm in the blind ideation experiment (§Stage 8).** A fifth experiment
+  arm, `lightrag`, compares the graph against a real, published **GraphRAG** baseline (LightRAG,
+  `lightrag-hku`) instead of only the flat-grep `rag` strawman — so "grounding-with-falsification is
+  worth it" can stand against a strong graph-retrieval system. It is **add-only and off by default**:
+  enabled only when `KG_LIGHTRAG=1` **and** the `lightrag-hku` package is installed **and**
+  `OPENAI_API_KEY` is set; otherwise the evaluator omits the arm and the original four-arm experiment
+  runs unchanged. The arm is built from the **same** `examples/source.md` corpus the `rag` arm uses and
+  is **structure-blind** — it reads flat prose through LightRAG's own retrieval and never touches the
+  canon's `epistemic_state`, bridges, falsification counters, degree, or any `kg_*` output. The
+  integration is quarantined in a new isolated module `scripts/kg_engine/lightrag_arm.py` (no other
+  engine module imports it; the `lightrag` import is function-local) exposing a `check`/`answer` CLI;
+  its working store lives under the gitignored derived dir and is disposable. `harness.ideation` is now
+  arm-tolerant — it scores every condition key present (canonical order, missing optional arms simply
+  absent, never an error) and emits a `lightrag_verdict` (graph-vs-LightRAG) when the arm is present.
+  `evaluator.md` / `commands/kg-experiment.md` document the opt-in (install, env vars, cost); a new
+  `lightrag` extra is declared in `pyproject.toml`. New no-network coverage in `tests/test_harness.py`.
+
 ### Fixed
 
 - **Lease release no longer orphans the lock on a transient Windows sharing violation.** On Windows

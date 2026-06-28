@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -80,6 +81,68 @@ def test_ideation_table_and_verdict():
     for cond in res["table"].values():
         assert 0.0 <= cond["unsupported_rate"] <= 1.0
     assert isinstance(res["verdict"], str)
+
+
+# --------------------------------------------------------------------------- optional lightrag arm
+
+
+_METRIC_KEYS = {"n", "diversity", "novelty", "utility", "unsupported_rate"}
+
+
+def test_ideation_scores_lightrag_arm_when_present():
+    """The optional fifth arm `lightrag` (a real GraphRAG baseline) is scored with the SAME metric keys
+    as every other arm, and a graph-vs-LightRAG `lightrag_verdict` is emitted when both are present."""
+    src = "entropy grounds the arrow of time and betweenness measures bridges"
+    outputs = {
+        "control": ["A relates to B.", "B relates to C."],
+        "graph": ["Entropy bridges thermodynamics and information because it grounds the arrow of time.",
+                  "Betweenness connects communities if a node is specific."],
+        "rag": ["entropy grounds the arrow of time", "betweenness measures bridges"],
+        "lightrag": ["A GraphRAG index links entropy to the arrow of time.",
+                     "Betweenness clusters surface bridges between communities."],
+    }
+    res = ideation(outputs, src)
+    assert "lightrag" in res["table"]
+    # the lightrag row carries exactly the same metric keys as the others
+    assert set(res["table"]["lightrag"]) == _METRIC_KEYS == set(res["table"]["control"])
+    assert res["table"]["lightrag"]["n"] == 2
+    for v in res["table"]["lightrag"].values():
+        assert isinstance(v, (int, float))
+    assert isinstance(res.get("lightrag_verdict"), str) and "LightRAG" in res["lightrag_verdict"]
+
+
+def test_ideation_omits_lightrag_when_absent():
+    """Without a lightrag arm the scorer still returns a valid four-arm table — no error, no empty row,
+    and no lightrag_verdict. The default (no-LightRAG) experiment is byte-for-byte unchanged."""
+    src = "entropy grounds the arrow of time and betweenness measures bridges"
+    outputs = {
+        "control": ["A relates to B."],
+        "graph": ["Entropy bridges thermodynamics because it grounds the arrow of time."],
+        "graph+generate": ["A hypothesized bridge connects betweenness and specificity."],
+        "rag": ["entropy grounds the arrow of time"],
+    }
+    res = ideation(outputs, src)
+    assert set(res["table"]) == {"control", "graph", "graph+generate", "rag"}
+    assert "lightrag" not in res["table"]
+    assert "lightrag_verdict" not in res
+    assert isinstance(res["verdict"], str)
+
+
+def test_ideation_table_is_canonically_ordered_regardless_of_input_order():
+    """Arms are emitted in canonical order (…rag, lightrag) no matter the input dict order, and any
+    non-canonical extra arm is tolerated (scored and appended), never an error."""
+    src = "entropy grounds the arrow of time"
+    outputs = {
+        "lightrag": ["entropy links to time"],
+        "rag": ["entropy grounds the arrow of time"],
+        "graph": ["entropy bridges time because it grounds the arrow"],
+        "control": ["a relates to b"],
+        "experimental": ["a novel extra arm"],   # non-canonical: must still be scored
+    }
+    res = ideation(outputs, src)
+    keys = list(res["table"])
+    assert keys[:4] == ["control", "graph", "rag", "lightrag"]   # canonical order, input order ignored
+    assert "experimental" in res["table"]                        # extra arm tolerated, not dropped
 
 
 # --------------------------------------------------------------------------- harness-f4-1
@@ -244,3 +307,61 @@ def test_agreement_whitespace_variants_are_one_category():
     as agreement, not as two distinct nominal categories."""
     a = agreement([{"u1": "correct "}, {"u1": "correct"}])
     assert abs(a - 1.0) < 1e-9
+
+
+# --------------------------------------------------------------------------- optional lightrag arm module
+# These exercise ONLY the isolated arm's gating/inspection surface. They never import the `lightrag`
+# package and never hit the network — per the task constraint, the real LightRAG integration is not
+# unit-tested here; the harness scoring (above) covers a synthesised `lightrag` arm.
+
+from kg_engine import lightrag_arm  # safe: no top-level lightrag import in the module
+
+
+def test_lightrag_arm_off_by_default(monkeypatch):
+    """With no opt-in env var the arm reports unavailable and names the opt-in as the missing piece —
+    so even if the package happened to be installed, the arm stays off until KG_LIGHTRAG=1."""
+    monkeypatch.delenv("KG_LIGHTRAG", raising=False)
+    ok, reason = lightrag_arm.availability()
+    assert ok is False
+    assert "KG_LIGHTRAG" in reason
+
+
+def test_lightrag_arm_check_cli_unavailable_is_clean(monkeypatch, capsys):
+    """`check` always exits 0 and prints a JSON {available, reason} blob — the evaluator parses this to
+    decide whether to include the arm; an unavailable arm is a normal, non-error outcome."""
+    monkeypatch.delenv("KG_LIGHTRAG", raising=False)
+    rc = lightrag_arm._main(["check"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["available"] is False and isinstance(out["reason"], str)
+
+
+def test_lightrag_answer_cli_omits_cleanly_when_unavailable(monkeypatch, tmp_path, capsys):
+    """`answer` exits with the distinct 'cleanly unavailable' code (3) and writes nothing when the arm
+    is off — the evaluator treats that as 'omit the lightrag key', never a crash."""
+    monkeypatch.delenv("KG_LIGHTRAG", raising=False)
+    prompts = tmp_path / "p.json"
+    prompts.write_text('["q1", "q2"]', encoding="utf-8")
+    out = tmp_path / "answers.json"
+    rc = lightrag_arm._main(["answer", "--source", "examples/source.md",
+                             "--prompts", str(prompts), "--out", str(out)])
+    assert rc == 3
+    assert not out.exists()  # no answers written on a cleanly-unavailable arm
+    err = json.loads(capsys.readouterr().err)
+    assert err["available"] is False
+
+
+def test_lightrag_store_lives_under_gitignored_derived_dir(monkeypatch, tmp_path):
+    """The working store sits under <KG_DATA>/derived/lightrag — inside the already-gitignored derived
+    tree, never the canon."""
+    monkeypatch.setenv("KG_DATA", str(tmp_path))
+    assert lightrag_arm.default_store_dir() == tmp_path / "derived" / "lightrag"
+
+
+def test_lightrag_load_prompts_accepts_array_object_and_lines(tmp_path):
+    arr = tmp_path / "a.json"; arr.write_text('["one", "two"]', encoding="utf-8")
+    obj = tmp_path / "o.json"; obj.write_text('{"prompts": ["one", "two"]}', encoding="utf-8")
+    lines = tmp_path / "l.txt"; lines.write_text("one\ntwo\n", encoding="utf-8")
+    assert lightrag_arm._load_prompts(arr) == ["one", "two"]
+    assert lightrag_arm._load_prompts(obj) == ["one", "two"]
+    assert lightrag_arm._load_prompts(lines) == ["one", "two"]

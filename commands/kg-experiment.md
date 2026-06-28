@@ -15,6 +15,11 @@ set of ideation prompts, in four conditions that differ ONLY in what context the
   / a `/kg-generate` run): the generative layer's proposals, clearly flagged as unverified candidates.
   Tests whether *generating* lifts ideation beyond grounded context alone (PLAN Stage 9).
 - **rag** — the prompt + a naive flat-text retrieval slice of the source document (the strawman to beat).
+- **lightrag** *(optional, off by default)* — the prompt answered from a real, published **GraphRAG**
+  baseline (LightRAG) built over the **same** `examples/source.md` corpus. A stronger strawman than flat
+  `rag`: it lets the central claim stand against a genuine graph-retrieval system, not only against grep.
+  This arm is **add-only and opt-in** — see "The optional lightrag arm" below. When it is not enabled the
+  experiment runs its original four arms, unchanged.
 
 The generator is BLIND to which condition it is in (it receives only an opaque context block), so the
 scoring is not contaminated by the model "trying harder" for one arm. Scoring is **deterministic** —
@@ -53,6 +58,29 @@ Confirm the graph is queryable before spending tokens generating ideas:
   and stop. Note the `falsification_counters.failed_or_rejected_edges`; a graph with **zero** recorded
   failures (§1.7) is suspect and the `graph` arm will look artificially clean — surface that caveat in the
   final report.
+
+### The optional `lightrag` arm (opt-in, off by default)
+
+A fifth arm, `lightrag`, compares the graph against a **real published GraphRAG baseline** instead of only
+the flat-grep `rag` strawman. It is **off by default** and entirely add-only: when it is not enabled, this
+command runs exactly the original four arms and nothing changes.
+
+To enable it, all three must hold (the evaluator probes this with
+`python -m kg_engine.lightrag_arm check`, which prints `{"available": …, "reason": …}`):
+
+1. **Install** the optional dependency: `pip install lightrag-hku` (or `pip install -e ".[lightrag]"` from
+   the repo). It is **not** part of the default install.
+2. **Opt in** with the env var `KG_LIGHTRAG=1` (the arm stays off even if the package is installed unless you
+   set this). Optional tuning: `KG_LIGHTRAG_QUERY_MODE` (default `mix`).
+3. **Provide credentials**: `OPENAI_API_KEY` — LightRAG's default LLM + embedding backend is OpenAI, so this
+   arm makes **network + paid API calls**. That cost is the price of the stronger baseline; it is why the arm
+   is opt-in, not automatic.
+
+When enabled, the evaluator builds a LightRAG index over the **same** `examples/source.md` corpus the `rag`
+arm uses (so the comparison is fair), under a **gitignored, disposable** working store in the derived dir, and
+answers each prompt through LightRAG's own retrieval — it never reads our graph's structure. When **not**
+enabled, the `lightrag` arm is omitted and the harness simply scores the four arms present. Either way the run
+proceeds; the arm never blocks the experiment.
 
 ---
 
@@ -105,8 +133,14 @@ generation; this command never sees which arm is which until the JSON comes back
      AND the generative proposals; it still must not fabricate verdicts or spans.
    - **rag** → a naive flat slice of `examples/source.md`: the top text chunks by keyword overlap with the
      prompt, no graph structure. This is the honest strawman.
-2. Present the four blocks to the generator **without labels** (shuffle; refer to them only as context A/B/C/D),
+2. Present these four blocks to the generator **without labels** (shuffle; refer to them only as context A/B/C/D),
    generate one idea per (prompt × condition), then **de-shuffle** when emitting JSON.
+   - **lightrag (optional)** → NOT one of the blinded context blocks — its answers come from the external
+     LightRAG system, not from the evaluator's own generation. Run it separately via the isolated helper
+     (`python -m kg_engine.lightrag_arm check`, then `… answer --source examples/source.md --prompts … --out …`)
+     and collect its `answers[]` into `outputs.lightrag`, in the same prompt order. **Include the key only when
+     the arm is available** (`KG_LIGHTRAG=1` + `lightrag-hku` + `OPENAI_API_KEY`); otherwise omit it. It reads
+     the same prose corpus as `rag`, through LightRAG's retrieval — never our graph's structure.
 3. Emit a single JSON object in EXACTLY the shape `harness ideation` consumes — write it to
    `${CLAUDE_PLUGIN_DATA:-/tmp}/derived/ideation_outputs.json`:
 
@@ -116,7 +150,8 @@ generation; this command never sees which arm is which until the JSON comes back
     "control":        ["…one string per prompt…"],
     "graph":          ["…"],
     "graph+generate": ["…"],
-    "rag":            ["…"]
+    "rag":            ["…"],
+    "lightrag":       ["… (OPTIONAL — present only when the lightrag arm was enabled+available) …"]
   },
   "source": "<the full text of examples/source.md>"
 }
@@ -125,12 +160,14 @@ generation; this command never sees which arm is which until the JSON comes back
 `harness ideation` scores every condition key it finds. When `graph+generate` is present it emits a second
 **`generate_verdict`** alongside the headline graph-vs-control `verdict`: whether *generating* (graph context
 + the hypothesized slate) lifted diversity/novelty beyond control without materially more unsupported
-claims, and whether it exceeded `graph` alone.
+claims, and whether it exceeded `graph` alone. When the optional `lightrag` arm is present it emits a
+**`lightrag_verdict`** (graph-vs-LightRAG): whether the grounded `graph` arm beat the published GraphRAG
+baseline. All of these are absent when their arm is — a missing optional arm is never an error.
 
-Constraints to put in the Task prompt: each `outputs` list has the **same length** (= number of prompts);
-one output string per prompt per condition; `source` is the verbatim source text so the harness can compute
-`novelty` (n-gram overlap with source) and `unsupported_rate` (sentences whose key terms never appear in
-source). The evaluator returns the **file path** it wrote.
+Constraints to put in the Task prompt: each **present** `outputs` list has the **same length** (= number of
+prompts); one output string per prompt per condition; `source` is the verbatim source text so the harness can
+compute `novelty` (n-gram overlap with source) and `unsupported_rate` (sentences whose key terms never appear
+in source). The evaluator returns the **file path** it wrote.
 
 ---
 
@@ -172,6 +209,14 @@ When the `graph+generate` arm is present, a second **`generate_verdict`** (graph
 - `"graph+generate beat control on diversity/novelty without more unsupported claims"` → generating helped.
 - `"graph+generate did NOT clearly beat control"` → it did not.
 
+When the optional `lightrag` arm is present, a **`lightrag_verdict`** (graph-vs-LightRAG) is one of:
+- `"graph condition beat the LightRAG GraphRAG baseline on diversity/novelty without more unsupported claims"`
+  → grounding beat the published GraphRAG, not just flat grep.
+- `"graph condition did NOT clearly beat the LightRAG GraphRAG baseline"` → it did not.
+
+(Both the `lightrag` table row and `lightrag_verdict` are present **only** when the optional arm was run; when
+it was not enabled the harness emits the original four-arm table with no `lightrag_verdict` and no error.)
+
 ---
 
 ## Step 4 — append to PROGRESS.md (then return, win or lose — §4)
@@ -193,8 +238,12 @@ PROGRESS="${CLAUDE_PROJECT_DIR:-.}/PROGRESS.md"
   printf '| graph          | %s | %s | %s | %s | %s |\n' "$g_n"  "$g_div"  "$g_nov"  "$g_util"  "$g_unsup"
   printf '| graph+generate | %s | %s | %s | %s | %s |\n' "$gg_n" "$gg_div" "$gg_nov" "$gg_util" "$gg_unsup"
   printf '| rag            | %s | %s | %s | %s | %s |\n' "$r_n"  "$r_div"  "$r_nov"  "$r_util"  "$r_unsup"
+  # OPTIONAL row — emit only if the lightrag arm was present in the harness table (else skip it):
+  [ -n "$lr_n" ] && printf '| lightrag       | %s | %s | %s | %s | %s |\n' "$lr_n" "$lr_div" "$lr_nov" "$lr_util" "$lr_unsup"
   printf '\n**Verdict:** %s\n' "$VERDICT"
   printf '\n**Generate verdict:** %s\n' "$GEN_VERDICT"
+  # OPTIONAL — only when the harness emitted a lightrag_verdict:
+  [ -n "$LIGHTRAG_VERDICT" ] && printf '\n**LightRAG verdict:** %s\n' "$LIGHTRAG_VERDICT"
 } >> "$PROGRESS"
 ```
 
@@ -203,6 +252,9 @@ Then print a one-paragraph summary to the user:
 - The verdict, verbatim, plus the head-to-head: `graph` vs `control` on diversity / novelty / unsupported_rate.
 - Whether `graph` also beat the `rag` strawman (the honest comparison — beating control is the bar, beating
   rag is the bonus).
+- If the optional `lightrag` arm ran: the `lightrag_verdict` — whether `graph` beat the **published GraphRAG
+  baseline**, the strongest comparison available (beating LightRAG, not just flat `rag`, is what shows
+  grounding-with-falsification earns its keep against real graph retrieval).
 - The **caveat from Step 0** if `falsification_counters.failed_or_rejected_edges == 0`: a graph with no
   recorded failures (§1.7) makes `graph` look cleaner than it has earned; recommend running `/kg-ground` with
   the adversarial grounder before trusting a `graph`-wins verdict.

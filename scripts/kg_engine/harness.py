@@ -277,14 +277,42 @@ def _beats(a: dict, c: dict) -> bool:
     return no_regression and strict_gain
 
 
+# the canonical arm order for a STABLE, readable `table` — but the scorer never requires any of
+# these to be present. `lightrag` (a real, published GraphRAG baseline built over the SAME corpus as
+# the flat `rag` arm) is OPTIONAL and off by default: when its outputs are absent the arm is simply
+# missing from `table`, never an error. Any non-canonical key is still scored and appended in input
+# order, so the harness tolerates whatever arms the evaluator actually emitted.
+_CANONICAL_ARMS = ("control", "graph", "graph+generate", "rag", "lightrag")
+
+
+def _ordered_conditions(outputs_by_condition: dict):
+    """Yield (cond, outputs) in canonical arm order, then any extra keys in input order."""
+    seen = set()
+    for cond in _CANONICAL_ARMS:
+        if cond in outputs_by_condition:
+            seen.add(cond)
+            yield cond, outputs_by_condition[cond]
+    for cond, outs in outputs_by_condition.items():
+        if cond not in seen:
+            yield cond, outs
+
+
 def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
-    """Score pooled outputs per condition (control | graph | graph+generate | rag) and emit a verdict.
+    """Score pooled outputs per condition and emit a verdict.
+
+    Arm-tolerant: every condition key actually present in `outputs_by_condition` is scored (canonical
+    arms — control | graph | graph+generate | rag | lightrag — first, then any extras), and a missing
+    optional arm is simply absent from `table` rather than an error. The default experiment ships four
+    arms (control/graph/graph+generate/rag); `lightrag` is the optional fifth (§Stage 8).
 
     The headline `verdict` is graph-vs-control. When a `graph+generate` arm is present (the graph context
     PLUS the hypothesized slate from /kg-generate, PLAN Stage 9), a second `generate_verdict` reports
     whether generation lifted ideation further — diversity/novelty up vs control without materially more
-    unsupported claims, and whether it exceeded `graph` alone."""
-    table = {cond: _score_condition(outs, source_text) for cond, outs in outputs_by_condition.items()}
+    unsupported claims, and whether it exceeded `graph` alone. When the optional `lightrag` arm is present
+    (a published GraphRAG baseline over the same prose corpus), a `lightrag_verdict` reports whether the
+    grounded `graph` arm beat that baseline — letting "grounding-with-falsification is worth it" stand
+    against a real GraphRAG, not only against flat retrieval."""
+    table = {cond: _score_condition(outs, source_text) for cond, outs in _ordered_conditions(outputs_by_condition)}
     g, c = table.get("graph"), table.get("control")
     verdict = "insufficient data"
     if g and c and g["n"] and c["n"]:
@@ -300,6 +328,12 @@ def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
                                                                else " (on par with graph alone)"))
         else:
             out["generate_verdict"] = "graph+generate did NOT clearly beat control"
+    lr = table.get("lightrag")
+    if lr and g and lr["n"] and g["n"]:
+        out["lightrag_verdict"] = (
+            "graph condition beat the LightRAG GraphRAG baseline on diversity/novelty without more "
+            "unsupported claims" if _beats(g, lr)
+            else "graph condition did NOT clearly beat the LightRAG GraphRAG baseline")
     return out
 
 

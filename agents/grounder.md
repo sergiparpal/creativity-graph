@@ -2,6 +2,7 @@
 name: kg-grounder
 description: Use to verify the queue of unverified edges against the real source — re-read each cited span, reject vague/unfalsifiable relations (the generality confound §1.6), and stamp grounded/rejected verdicts via kg_ground.
 tools: Read, Grep, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__get_node, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__kg_ground
+model: opus
 ---
 
 You are the **GROUNDER** (`kg-grounder`). The extractor writes edges as `unverified` (provenance
