@@ -286,6 +286,12 @@ actually hold up against what you wrote, and which ones don't.
 Think of it as a careful research assistant who refuses to repeat a claim back to you unless they can point
 to the exact sentence that supports it.
 
+> **What "checking" means here — and what it doesn't.** This plugin guarantees **fidelity to your source
+> document**, not **truth about the world**. Every check confirms that a connection is actually supported by
+> the exact words you wrote — never that what you wrote is correct. If your source is wrong, the map
+> faithfully encodes the same error. The checker reads only your document; it never accesses the web or any
+> outside knowledge.
+
 ### Two ways things happen
 
 1. **Commands you type yourself.** These start with a slash (`/`), like `/kg-build`. You type them straight
@@ -326,24 +332,25 @@ it's quick — and builds the map. Every connection it draws has to quote an exa
 if it can't, that connection is thrown out. When it finishes, you have a first draft of the map. *(There's
 also an optional speed setting, `extract_wave_size`, in the config table above — you can ignore it to start.)*
 
-**Step 4 (optional) — Check the map is accurate.**
+**Step 4 (optional) — Check how faithfully the map reflects your source.**
 
 ```
 /kg-eval [graph.json]
 ```
 
-Grades how accurate the map is *before* you rely on it (leave the bracket off to grade the current map). If
-the score is too low, the map isn't trustworthy yet, and you'd want to revisit your source document.
+Grades how faithfully the map reflects your source *before* you rely on it (leave the bracket off to grade
+the current map) — it measures extraction fidelity, not whether your source is right. If the score is too
+low, the map isn't a faithful rendering of your document yet, and you'd want to revisit your source document.
 
-**Step 5 — Fact-check the connections.**
+**Step 5 — Ground the connections in the source.**
 
 ```
 /kg-ground [query-or-node-filter]
 ```
 
 The heart of the plugin. It goes through every connection that hasn't been checked yet and decides whether
-it really holds up — keeping the good ones, rejecting the vague or unsupported ones, and even actively trying
-to *disprove* the strongest claims. Anything that fails is kept on record as a known weakness, **not** quietly
+your source actually supports it — keeping the supported ones, rejecting the vague or unsupported ones, and
+even actively trying to *knock down* the strongest claims using the source itself. Anything that fails is kept on record as a known weakness, **not** quietly
 deleted. Leave the bracket off to check everything not yet checked; add a topic or area to check just that part.
 
 **Step 6 — Ask questions.**
@@ -359,8 +366,8 @@ The question is **required** — it's the thing you want answered. For example:
 ```
 
 Claude answers using only what's in the map, and for every part of its answer it shows you the supporting
-evidence and whether that evidence has been fact-checked. If something hasn't been verified, it says so
-instead of pretending it's solid.
+evidence and whether that evidence has been grounded against the source. If something hasn't been checked
+yet, it says so instead of pretending it's solid.
 
 **Step 7 (optional) — Test whether it actually helps.**
 
@@ -377,16 +384,16 @@ find out whether it's worth the effort instead of assuming (leave the bracket of
   project, one file per idea. Nothing is hidden in a black box.
 - **You can't break it by deleting the working copy.** The plugin keeps a separate, regenerable copy for
   speed; if it ever gets messy, you can rebuild it and lose nothing.
-- **The usual order is:** point at a document → build → (check) → fact-check → ask questions. The two optional
+- **The usual order is:** point at a document → build → (check) → ground → ask questions. The two optional
   steps (`/kg-eval`, `/kg-experiment`) are about measuring quality, not everyday use.
 
 ### Going further — turn the map into an idea generator (optional)
 
-So far you've **built** a map and **fact-checked** it. You can also flip it around: instead of only
-*verifying* what's already in your document, ask the map to **propose new ideas** from the way its concepts
-connect — and then fact-check those the exact same way. The design idea is **generate freely, judge
+So far you've **built** a map and **grounded** it. You can also flip it around: instead of only
+*checking* what's already in your document, ask the map to **propose new ideas** from the way its concepts
+connect — and then ground those the exact same way. The design idea is **generate freely, judge
 strictly**: new candidates are never accepted just because they look clever; they only "stick" once grounding
-finds real support for them, and the ones that fail are remembered, not deleted. Three optional commands:
+finds support for them in your document, and the ones that fail are remembered, not deleted. Three optional commands:
 
 - **`/kg-generate [mechanism] [k]`** — ask the map to suggest new idea candidates from its own structure (for
   example, surprising links between distant topics, or a single idea that could absorb a whole cluster of
@@ -406,9 +413,9 @@ The first five are the everyday flow; the last three are the optional "going fur
 | Command | What it does | The detail in brackets |
 | --- | --- | --- |
 | `/kg-build [source_path]` | Build the map of ideas | *Optional:* a document to build from (defaults to your settings) |
-| `/kg-ground [query-or-node-filter]` | Fact-check the connections | *Optional:* limit it to one topic or area (defaults to everything) |
+| `/kg-ground [query-or-node-filter]` | Ground the connections in the source | *Optional:* limit it to one topic or area (defaults to everything) |
 | `/kg-query <question>` | Ask a question, answered from the map | **Required:** your question |
-| `/kg-eval [graph.json]` | Grade how accurate the map is | *Optional:* which map file to grade (defaults to the current one) |
+| `/kg-eval [graph.json]` | Grade how faithfully the map reflects the source | *Optional:* which map file to grade (defaults to the current one) |
 | `/kg-experiment [prompts_path]` | Test whether the map really helps | *Optional:* a file of test prompts (defaults to the built-in set) |
 | `/kg-generate [mechanism] [k]` | Propose new idea candidates from the map | *Optional:* which mechanism, and how many (defaults to a sensible set) |
 | `/kg-perturb [second_source_or_pack]` | Stress-test coverage with a second map | *Optional:* a second document or setup (defaults to a re-angle of the same source) |
