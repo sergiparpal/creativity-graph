@@ -35,7 +35,10 @@ from .model import edge_id
 # The mechanism vocabulary. The DEFAULT_SET is what `/kg-generate` runs unless the user opts into all
 # six (PLAN Stage 6 non-blocking survey). "all" runs ALL_SET.
 DEFAULT_SET = ["bridge", "seed", "compression"]
-ALL_SET = ["bridge", "seed", "compression", "regroup", "transplant", "ensemble"]
+# `periphery` (§5, low-degree sources) is ALL-only: it deliberately stays OUT of DEFAULT_SET so the
+# default `/kg-generate` slate — and every golden expectation built on it — is byte-identical, exactly
+# like regroup/transplant/ensemble. "all" runs ALL_SET.
+ALL_SET = ["bridge", "seed", "compression", "regroup", "transplant", "ensemble", "periphery"]
 
 # The relation emitted by every structural-bridge mechanism (bridge/seed/regroup/ensemble). It MUST
 # exist in pack.yaml edge_types or the candidate is QUARANTINED at the kg_write boundary; and within a
@@ -181,7 +184,7 @@ def _edge_cand(mechanism, source, target, relation, *, score, specificity, ratio
                      rationale=rationale, section=section)
 
 
-# --------------------------------------------------------------------------- the six mechanisms
+# --------------------------------------------------------------------------- the mechanisms (six core + periphery §5)
 
 
 def bridge(G, *, pack, corpus, failures, k=10, adj=None) -> list:
@@ -458,6 +461,66 @@ def ensemble(G, *, pack, corpus, failures, k=10, second_graph=None, und=None, ad
     return _rank(cands, k)
 
 
+def periphery(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
+    """§5 — explore the periphery. Source candidates from LOW-degree nodes (the periphery the
+    hub-seeking mechanisms ignore): for each peripheral node, propose a `bridges` edge to a
+    non-adjacent anchor that maximises connectability (shared-neighbour count), specificity-
+    controlled. Distinct from transplant (hubs) and seed (any residual-rich pair): here the SOURCE
+    is deliberately low-degree, surfacing hypotheses that challenge the dense centre's status quo.
+
+    The peripheral band is ADAPTIVE (Stage-1 survey): the bottom quartile of the live degree
+    distribution — nodes whose precomputed `degree` is > 0 (degree-0 orphans are surfaced by
+    kg_agenda, not re-proposed here) and <= the 25th-percentile degree, computed by the nearest-rank
+    rule (no interpolation) so the threshold is byte-stable across repeated runs over the same graph
+    (G6). Reuses BRIDGES_RELATION (an existing pack edge_type) — never a new type."""
+    und, adj = _shared(G, und, adj)
+    nodes = list(G.nodes())
+    degree = {n: int(_attr(G, n, "degree", 0)) for n in nodes}
+    # the live degree distribution over CONNECTED nodes (degree-0 orphans excluded — kg_agenda surfaces
+    # those; a peripheral SOURCE with no neighbours has no shared-neighbour anchor anyway).
+    deg_values = sorted(d for d in degree.values() if d > 0)
+    if not deg_values:
+        return []
+    # adaptive 25th-percentile threshold via the nearest-rank rule: deterministic, no interpolation,
+    # corpus-size-independent. p_idx is 0-based, so an all-equal-degree distribution yields its single
+    # degree as the threshold (every connected node is then in-band — honest for a flat graph).
+    p_idx = max(0, math.ceil(0.25 * len(deg_values)) - 1)
+    threshold = deg_values[p_idx]
+    peripheral = sorted(n for n in nodes if 0 < degree[n] <= threshold)
+    cands: list = []
+    for u in peripheral:
+        nbu = adj[u]
+        # the best non-adjacent connectable anchor: most shared neighbours, then the MORE SPECIFIC
+        # anchor, then the smaller id (the deterministic tie rule, §4 generality-control / G6). A
+        # failed/rejected pair (forward OR reverse) is excluded from anchor candidacy so failure memory
+        # never re-proposes what was refuted (§13).
+        options = []
+        for v in nodes:
+            if v == u or v in nbu:
+                continue
+            shared = len(nbu & adj[v])
+            if shared <= 0:
+                continue  # not connectable — no shared neighbour, nothing to bridge through
+            if _is_failure(failures, u, BRIDGES_RELATION, v):
+                continue
+            options.append((shared, float(_attr(G, v, "specificity", 1.0)), v))
+        if not options:
+            continue  # no non-adjacent connectable anchor — skip this peripheral source
+        shared, _spec_v, v = min(options, key=lambda t: (-t[0], -t[1], t[2]))
+        deg_u = degree[u]
+        # score = peripherality (low source degree) × connectability (shared-neighbour count): monotone
+        # in BOTH, never collapsed with specificity (which travels in its own field — §4 / G4).
+        score = (1.0 / (deg_u + 1)) * (shared + 1)
+        spec = _pair_specificity(G, u, v)
+        cands.append(_edge_cand(
+            "periphery", u, v, BRIDGES_RELATION, score=score, specificity=spec, section="§5",
+            rationale=(f"periphery bridge: low-degree source '{_attr(G, u, 'label', u)}' (degree {deg_u}, "
+                       f"bottom-quartile ≤ {threshold}) ⇄ '{_attr(G, v, 'label', v)}' sharing {shared} "
+                       f"neighbour(s) — sourced FROM the periphery the hub-seeking mechanisms ignore, "
+                       f"NOT a hub transplant")))
+    return _rank(cands, k)
+
+
 # --------------------------------------------------------------------------- partition / loading helpers
 
 
@@ -498,7 +561,7 @@ def load_second_graph(path: str | Path) -> nx.MultiDiGraph:
 
 
 _DISPATCH = {"bridge": bridge, "bridges": bridge, "seed": seed, "compression": compression,
-             "regroup": regroup, "transplant": transplant, "ensemble": ensemble}
+             "regroup": regroup, "transplant": transplant, "ensemble": ensemble, "periphery": periphery}
 
 
 def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=None, k=10,
@@ -567,6 +630,8 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
             ens_repart = repart_of() if second_graph is None else _UNSET
             out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, second_graph=second_graph,
                       und=und_of(), adj=adj_of(), new_comm=ens_repart)
+        elif fn is periphery:
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(), adj=adj_of())
     # Dedup EDGE candidates across mechanisms by (source, target, relation) — the triple the canonical
     # edge_id derives from (review-low): with `second_graph=None`, ensemble degrades to regroup and
     # re-emits the SAME edges under a second mechanism name; other mechanisms can also independently

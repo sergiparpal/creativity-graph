@@ -7,7 +7,7 @@ import itertools
 
 from kg_engine import generate as gen
 from kg_engine.canon import Canon
-from kg_engine.generate import ALL_SET, Candidate
+from kg_engine.generate import ALL_SET, DEFAULT_SET, Candidate
 from kg_engine.model import Edge, Node, edge_id
 from kg_engine.projector import Projector
 
@@ -306,3 +306,77 @@ def test_kg_generate_single_mechanism(engine):
     out = engine.kg_generate(mechanism="bridge", k=3)
     assert out["mechanism"] == "bridge" and len(out["candidates"]) <= 3
     assert all(c["mechanism"] == "bridge" for c in out["candidates"])
+
+
+# --------------------------------------------------------------------------- periphery (§5, low-degree sources)
+
+# two small hubs, each with three degree-1 leaves, joined by one edge: a clear hub/periphery split that
+# periphery must source FROM the leaves, never the hubs (the hub-seeking mechanisms' territory).
+_PERIPHERY_EDGES = [("h1", "a1"), ("h1", "a2"), ("h1", "a3"),
+                    ("h2", "b1"), ("h2", "b2"), ("h2", "b3"), ("h1", "h2")]
+
+
+def test_periphery_sources_from_low_degree_not_hubs(canon: Canon):
+    G = _ranked(canon, _PERIPHERY_EDGES)
+    cands = gen.periphery(G, pack=None, corpus=[_UNIFORM], failures=set(), k=20)
+    assert cands
+    _well_formed(cands, "periphery")
+    und_adj = gen._undirected_adjacency(G)
+    hub_degree = int(G.nodes["h1"].get("degree", 0))
+    for c in cands:
+        assert c.relation == "bridges"
+        assert c.source in {"a1", "a2", "a3", "b1", "b2", "b3"}      # sourced FROM the periphery ...
+        assert c.source not in {"h1", "h2"}                          # ... never a hub
+        assert int(G.nodes[c.source].get("degree", 0)) < hub_degree  # strictly below the hubs
+        assert c.target not in und_adj[c.source]                     # non-adjacent (undirected)
+
+
+def test_periphery_respects_failure_memory(canon: Canon):
+    G = _ranked(canon, _PERIPHERY_EDGES)
+    base = {frozenset((c.source, c.target))
+            for c in gen.periphery(G, pack=None, corpus=[_UNIFORM], failures=set(), k=20)}
+    assert frozenset(("a1", "a2")) in base                          # something periphery proposes, to drop
+    # seed the FORWARD identity; its reverse must be dropped too (failure memory is symmetric, §13)
+    failures = {edge_id("a1", "bridges", "a2")}
+    after = {frozenset((c.source, c.target))
+             for c in gen.periphery(G, pack=None, corpus=[_UNIFORM], failures=failures, k=20)}
+    assert frozenset(("a1", "a2")) not in after
+
+
+def test_periphery_specificity_controlled(canon: Canon):
+    # u shares its single neighbour m with TWO non-adjacent anchors of EQUAL connectability (shared=1):
+    # a VAGUE one (id 'aaa', sorts FIRST, common label) and a SPECIFIC one (id 'zzz', sorts last, rare
+    # label). The specificity tie-break must pick the SPECIFIC anchor despite the vague one's lower id —
+    # so a vague anchor never outranks a specific one at equal connectability (§4 generality control).
+    edges = [("mmm", "u"), ("mmm", "aaa"), ("mmm", "zzz")]
+    labels = {"aaa": "system", "zzz": "falsification", "u": "peripheral source", "mmm": "hub"}
+    corpus = "\n".join(["## intro"]
+                       + ["## s the system idea thing common system idea"] * 15
+                       + ["## s falsification rare technical term"])
+    G = _ranked(canon, edges, corpus=corpus, labels=labels)
+    assert float(G.nodes["zzz"].get("specificity", 0)) > float(G.nodes["aaa"].get("specificity", 0))
+    cands = gen.periphery(G, pack=None, corpus=[corpus], failures=set(), k=20)
+    u_cand = next(c for c in cands if c.source == "u")
+    assert u_cand.target == "zzz"                                   # the specific anchor, not the vaguer 'aaa'
+
+
+def test_periphery_in_all_set_and_readonly(canon: Canon):
+    # all-only registration, mirroring regroup/transplant/ensemble (keeps the DEFAULT slate byte-stable)
+    assert "periphery" in ALL_SET and "periphery" not in DEFAULT_SET
+    G = _ranked(canon, _PERIPHERY_EDGES)
+    before_nodes = {n.id for n in canon.all_nodes()}
+    before_edges = {e.id for e in canon.all_edges()}
+    # the run_generators ladder genuinely dispatches periphery — single-mechanism dispatch exercises the
+    # IDENTICAL `elif fn is periphery` branch the "all" slate uses, so a non-empty well-formed result here
+    # proves periphery is wired into "all", not merely listed.
+    via_dispatch = gen.run_generators(G, mechanism="periphery", pack=None, corpus=[_UNIFORM],
+                                      failures=set(), k=20)
+    assert via_dispatch and all(c.mechanism == "periphery" for c in via_dispatch)
+    _well_formed(via_dispatch, "periphery")
+    # the full slate runs periphery too and stays well-formed + READ-ONLY. periphery's duplicates of
+    # regroup/bridge pairs are correctly collapsed by the orientation-independent dedup (periphery is
+    # last, so it loses ties) — that absorption is by design (generate offensively; judge later).
+    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=20)
+    _well_formed(out)
+    assert {n.id for n in canon.all_nodes()} == before_nodes
+    assert {e.id for e in canon.all_edges()} == before_edges
