@@ -12,6 +12,52 @@ NetworkX/SQLite **derived** layer. The deterministic Python engine (`scripts/kg_
 hard guarantees; the Claude Code session and its subagents do the language work and hand structured
 JSON back across the MCP boundary.
 
+## [0.6.0] — 2026-06-30
+
+Three additions, all **below the grounding boundary** — additive, backward-compatible, and respecting
+every anti-nonsense invariant (no forged verdicts, no span-less written edges, no composite scalar,
+generation never gated on a metric, fully deterministic).
+
+### Added
+
+- **`periphery` discovery mechanism (§5 "Explore the Periphery").** A seventh deterministic generator
+  that sources candidates from the graph's **low-degree** nodes — the periphery the hub-seeking
+  mechanisms (`bridge`/`transplant`) and the residual-rich `seed` pairs structurally never reach. For
+  each peripheral source it proposes a `bridges` edge (an existing pack edge_type — no new type) to a
+  non-adjacent anchor maximising shared-neighbour connectability, tie-broken toward the more specific
+  anchor (§4 generality control) and failure-memory-aware (§13). The peripheral band is **adaptive** —
+  the bottom quartile of the live degree distribution (25th-percentile by the nearest-rank rule:
+  deterministic, no interpolation, corpus-size-independent). It is **ALL-only** (in `ALL_SET`, not
+  `DEFAULT_SET`), so the default `/kg-generate` slate and every golden expectation stay byte-identical.
+  Pure, read-only, hypothesized-lane only.
+- **`kg_explain_path` read-only egress (§2).** A new MCP tool (the 20th) + `KGEngine.explain_path` that
+  traces the associative chain connecting two-or-more concepts **over `grounded` edges only**, carrying
+  each hop's relation + verbatim span for audit, and reports the path edge-count as an **advisory**
+  `leap` ("creative-leap" / creative-distance) signal. For >2 nodes the visiting order comes from a
+  deterministic NetworkX TSP approximation (`greedy_tsp`, sorted input) over the grounded shortest-path
+  closure — no external solver, no new dependency. When no fully-grounded path exists it returns an empty
+  path + an honest `reason` (itself informative: the concepts are joined only through unverified /
+  hypothesized / refuted links). `leap` is **never** a verdict, **never** written to the canon, **never**
+  a score — it lives only in the tool response.
+- **Advisory `convergence` count across mechanisms (§4 "CONVERGENT", adapted).** When `kg_generate` runs
+  multiple mechanisms, each surviving candidate now carries `convergence` — the number of *distinct*
+  mechanisms that independently proposed the same (orientation-independent) edge. It is a **ranking prior
+  for the grounding queue** (which hypotheses to ground first), **never** folded into `Candidate.score`
+  and **never** written onto a canon edge. A new **`harness.convergence`** gate (structurally mirroring
+  `harness.specificity`) decides — from a history of past candidates' convergence + grounding outcome —
+  whether higher convergence actually predicts grounding success before convergence is ever allowed to
+  *reorder* the queue; until the gate passes it is displayed but decides nothing (advisory by default).
+  The degraded-ensemble path (no second construction) is folded back into `regroup` so it can never
+  inflate the count. CLI: `python -m kg_engine.harness convergence`.
+
+### Deferred
+
+- **Persisted convergence history → automatic projector-level gate.** This release keeps the convergence
+  gate a *harness verdict the `/kg-ground` command consults and reports*, not a stored projector flag —
+  the engine does not yet persist grounding history in a harness-readable form. Persisting that history
+  so the gate can be computed automatically at projection time (as the specificity gate's `gate_on` is)
+  is a deliberately deferred follow-up.
+
 ## [0.5.4] — 2026-06-28
 
 ### Added

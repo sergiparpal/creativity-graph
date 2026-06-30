@@ -16,9 +16,10 @@ the boundary stores the restored original span in the canon (the span still veri
 source, §5). For a no-PII source the scrub is a no-op (`redactions=0`). The full tool surface adds the
 generative layer's tools on top of the original eleven: `kg_ping`, `kg_scrub`, `kg_write`, **`kg_propose`**
 (§5a), `kg_ground`, `kg_rename`, `kg_merge` (deliberate node-merge with edge dedup), `kg_metrics`, `kg_status`,
-`query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda` (read-only structural
-agenda), `kg_export` (read-only human-facing render) (plus `kg_generate`, `kg_operate`, `kg_absorption` — see
-the generative-layer references) — nineteen in all.
+`query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path` (read-only grounded-only
+associative chain + advisory `leap`, §2), `kg_context`, `kg_agenda` (read-only structural agenda),
+`kg_export` (read-only human-facing render) (plus `kg_generate`, `kg_operate`, `kg_absorption` — see
+the generative-layer references) — twenty in all.
 
 ---
 

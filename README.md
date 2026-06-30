@@ -7,8 +7,8 @@ NetworkX/SQLite derived layer.
 
 It both **generates** ideas and **grounds** them — in that order, and never confusing the two.
 The graph *generates offensively*: deterministic discovery mechanisms (bridges, residual
-connectability, compression, re-partition, hub transplant, cross-construction ensemble) propose
-candidates into a separate **hypothesized** lane, never gatekept by a quality metric. Then it
+connectability, compression, re-partition, hub transplant, cross-construction ensemble, periphery
+exploration) propose candidates into a separate **hypothesized** lane, never gatekept by a quality metric. Then it
 *judges defensively*: the **same** grounding loop is the filter, applied afterward. A generated
 candidate is a *hypothesis under test* — `provenance=hypothesized`, `epistemic_state=unverified`,
 **no span** — and becomes grounded knowledge only when a grounder supplies support, which *upgrades*
@@ -396,9 +396,15 @@ strictly**: new candidates are never accepted just because they look clever; the
 finds support for them in your document, and the ones that fail are remembered, not deleted. Three optional commands:
 
 - **`/kg-generate [mechanism] [k]`** — ask the map to suggest new idea candidates from its own structure (for
-  example, surprising links between distant topics, or a single idea that could absorb a whole cluster of
-  others). They land as clearly-marked *proposals* — then the very next `/kg-ground` is the filter that keeps
-  only the ones it can support.
+  example, surprising links between distant topics, a single idea that could absorb a whole cluster of
+  others, or — via the **periphery** mechanism — links *out of* the map's neglected, low-degree edges that the
+  hub-seeking mechanisms ignore). They land as clearly-marked *proposals* — then the very next `/kg-ground` is
+  the filter that keeps only the ones it can support. Each proposal also shows a `convergence` count (how many
+  distinct mechanisms independently suggested it) — an advisory hint for which to ground first, never a verdict
+  and only allowed to *reorder* grounding once a harness check proves it predicts grounding success.
+- **`/kg-query`** can also trace **`kg_explain_path`** — *how did these two concepts come to be connected, over
+  links that have actually been verified?* It walks **grounded edges only** and reports the chain length as an
+  advisory "creative-leap" signal; if the only connection runs through unverified guesses, it says so honestly.
 - **`/kg-perturb [second_source_or_pack]`** — build a *second* version of the map (a different angle on the
   same material, or a second document) and cross-compare, to surface connections the first map would have
   missed on its own.
@@ -476,11 +482,11 @@ creativity-graph/
 ## The MCP tool surface
 
 Server name `creativity-graph` ⇒ tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`. The
-**fifteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_merge`, `kg_metrics`,
-`kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`, `kg_export`) plus the
-**four** generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
-mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) are the
-**nineteen** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
+**sixteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_merge`, `kg_metrics`,
+`kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path`, `kg_context`, `kg_agenda`,
+`kg_export`) plus the **four** generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the
+discovery mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) are the
+**twenty** and **only** graph tools (no `kg_build`/`kg_query`/`kg_project` tools exist — those are slash
 commands).
 
 | tool | purpose |
@@ -497,11 +503,12 @@ commands).
 | `get_node(node_id)` | a node dict with its incident edges. |
 | `get_neighbors(node_id, relation)` | `[edge dicts]`. |
 | `shortest_path(source, target)` | `{path: [node_ids] | null}`. |
+| `kg_explain_path(nodes)` | **read-only** egress (§2) → `{path[], edges[{source,target,relation,span}], leap, grounded_only, reason?}`; traces the associative chain connecting `nodes` over **grounded edges only** (>2 nodes ordered by a deterministic TSP over the grounded shortest-path closure). `leap` (= path length) is an **advisory** "creative-leap" signal — never a verdict, never written, never a score. Empty `path`/`leap=null` with a `reason` when no fully-grounded path exists. |
 | `kg_context(query, budget)` | budgeted context pack: `{items[]` (grounded), `hypotheses[]` (the separate hypothesized lane), `approx_tokens, budget, falsification_counters:{failed_or_rejected_edges}, advisory:{signal:"structural-bridge", note, nodes[], bridge_metric, stale_verdicts[]}}`. |
 | `kg_agenda(limit=5)` | **read-only** structural "suggested questions" (R6) → `{answerable_now[]` (well-grounded), `blocked_on_grounding[]` (orphans / hypothesized-only / under-grounded hubs / disconnected clusters)`, ranked_by, gate_on, count, note}`. Suggests, never acts; heuristic, not a guarantee. |
 | `kg_export(kind="all")` | **read-only** human-facing render (R1) → `{ok, kind, html_path, report_path}`; writes a self-contained offline `graph.html` (three axes on independent visual channels; failed/rejected edges drawn) + `GRAPH_REPORT.md` under the derived dir. `kind ∈ {html, report, all}`. Disposable view, never a write to the canon. |
 | `kg_propose(payload)` | the **hypothesized** write lane → the `kg_write` shape `+ {propose_lane, refused_text_claims}`; forces `provenance=hypothesized`, refuses text claims. |
-| `kg_generate(mechanism, k, second_graph)` | **read-only** discovery → `{mechanism, k, gate_on, count, candidates[], note}`; `bridge\|seed\|compression\|regroup\|transplant\|ensemble`. |
+| `kg_generate(mechanism, k, second_graph)` | **read-only** discovery → `{mechanism, k, gate_on, count, candidates[], note}`; `bridge\|seed\|compression\|regroup\|transplant\|ensemble\|periphery` (or `all`/`default`). Each candidate carries an advisory `convergence` (# distinct mechanisms that independently proposed it) — a ranking prior for the grounding queue, never a score and never written to the canon. |
 | `kg_operate(op, …)` | the four §8 endo ops (`collapse\|explode\|regroup\|open`) — write via the propose lane → the `kg_propose` shape `+ {ok, op, info}`. |
 | `kg_absorption()` | the §14 absorption window → `{tracked, summary, nodes:{id:{half_life, status}}, note}`. |
 
@@ -590,8 +597,8 @@ forgeries) · `groundaudit` (`GroundAuditLog` — the §1.8 grounding-audit log 
 forge detection) · `atomicio` (`atomic_write_bytes`/`atomic_write_text`) · `graphio` (node-link IO —
 `_node_link_data`/`node_link_graph`/`node_attr`) · `projector` (`project`, `kg_context`) · `scrub`
 (`Scrubber`) · `pack` (`PackContract`, `coverage`) · `sources` (`SourceSet` — R4 multi-doc ingestion) ·
-`harness` (`agreement`/`specificity`/`ideation`) · `generate` (`run_generators` — the six discovery
-mechanisms) · `operations` (the four §8 endo ops) · `export` (`build_html`/`build_report`/`export` —
+`harness` (`agreement`/`specificity`/`ideation`/`convergence`) · `generate` (`run_generators` — the seven
+discovery mechanisms) · `operations` (the four §8 endo ops) · `export` (`build_html`/`build_report`/`export` —
 R1 human-facing render) · `canonmerge` (semantic git merge driver — mirror of
 `Canon._merge_into_existing`) · `backend` (`BackendExtractor` — headless extract) · `server`
 (`KGEngine` + FastMCP tool registration).

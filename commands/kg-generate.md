@@ -1,5 +1,5 @@
 ---
-description: Generate hypothesized idea candidates from the graph's structure (bridge|seed|compression|regroup|transplant|ensemble), phrase them via the language layer, and write them to the hypothesized lane — then hand off to /kg-ground as the filter.
+description: Generate hypothesized idea candidates from the graph's structure (bridge|seed|compression|regroup|transplant|ensemble|periphery), phrase them via the language layer, and write them to the hypothesized lane — then hand off to /kg-ground as the filter.
 argument-hint: "[mechanism-set] [k]"
 allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_generate, mcp__plugin_creativity-graph_creativity-graph__kg_propose, mcp__plugin_creativity-graph_creativity-graph__kg_operate, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_absorption
 ---
@@ -31,10 +31,11 @@ specificity-weighted betweenness is the trusted bridge signal this projection) a
 
 Ask the user exactly once, then proceed with the default if they don't redirect:
 
-> **Run the default mechanism set `{bridge, seed, compression}` or all six? [default/all]** (default: `default`)
+> **Run the default mechanism set `{bridge, seed, compression}` or all seven? [default/all]** (default: `default`)
 
 - `default` (or no answer, or `$1` empty) → the three default mechanisms.
-- `all` → all six (`bridge, seed, compression, regroup, transplant, ensemble`).
+- `all` → all seven (`bridge, seed, compression, regroup, transplant, ensemble, periphery`). `periphery` (§5)
+  sources candidates from the graph's **low-degree** nodes — the periphery the hub-seeking mechanisms ignore.
 - a single mechanism name → just that one.
 
 This is a **non-blocking checkpoint**: invite a reply, but never make progress conditional on it. Default
@@ -45,7 +46,10 @@ This is a **non-blocking checkpoint**: invite a reply, but never make progress c
 Call `mcp__plugin_creativity-graph_creativity-graph__kg_generate(mechanism=<chosen>, k=<k>)` (use
 `mechanism="all"` for the full set; it runs the default set on `"default"`). It returns
 `{mechanism, k, gate_on, count, candidates[], note}`. Each candidate carries
-`{kind, mechanism, source, target, relation, label, node_type, score, specificity, rationale, section}`.
+`{kind, mechanism, source, target, relation, label, node_type, score, specificity, rationale, section, convergence}`.
+`convergence` is **advisory** — the number of *distinct* mechanisms that independently proposed the same edge
+(≥1). It is a **ranking prior for the grounding queue** (which hypotheses to ground first), **never** a score,
+**never** a verdict, and **never** written onto a canon edge; it does not change the slate's `score`/ranking.
 This call is **READ-ONLY** — nothing is written yet. If `count==0`, report that the structure surfaced no
 candidates for the chosen mechanisms (the demo graph is small; try `all`, a larger `k`, or `/kg-perturb`),
 and stop. Note the `note` (e.g. ensemble degraded to regroup with no second construction).

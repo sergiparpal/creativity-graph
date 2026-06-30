@@ -14,15 +14,16 @@ call never crashes the session; success returns and domain `{ok:false}` results 
 
 A plugin-bundled MCP server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>` — here both the
 plugin and the server are named `creativity-graph`, so every tool is `mcp__plugin_creativity-graph_creativity-graph__<tool>`
-(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **eighteen** are the **only**
-graph tools — the eleven verify/read tools (§1.1–§1.11) plus the four generative-layer tools (§1.12–§1.15)
+(use this exact form in agent `tools:` / command `allowed-tools:` grants). These **twenty** are the **only**
+graph tools — the verify/read tools (§1.1–§1.11, including `kg_merge` §1.5b and the read-only egress
+`kg_explain_path` §1.10b) plus the four generative-layer tools (§1.12–§1.15)
 plus the read-only `kg_agenda` (§1.16), `kg_export` (§1.17), and the projection-free `kg_status` (§1.18).
 There is no `kg_build` / `kg_query` /
 `kg_project` MCP tool — those are slash commands (`/kg-build`, …) that *orchestrate* these tools.
 
 Mutation tools (`kg_write`, `kg_propose`, `kg_ground`, `kg_rename`, `kg_merge`) write the **canon** (human-editable Markdown,
 the single source of truth) — `kg_propose` (§1.12) is the hypothesized write lane and `kg_operate` (§1.14) writes
-through it. Read tools (`get_node`, `get_neighbors`, `shortest_path`, `query_graph`, `kg_context`) and the
+through it. Read tools (`get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path`, `query_graph`, `kg_context`) and the
 generative reads (`kg_generate` §1.13, `kg_absorption` §1.15) read the **derived** layer; they call
 `_ensure_projected()` first, which reprojects only if `index.sqlite`/`graph.json` is missing or
 `projector.is_stale()` — a content-driven check (a cheap per-note `(name, size, mtime)` signature pre-gate,
@@ -264,6 +265,26 @@ BFS over the derived edge list, treated as **undirected** (no centrality is comp
 
 `{"path": ["x"]}` when `source == target`; `{"path": null}` when no path exists.
 
+### 1.10b `mcp__plugin_creativity-graph_creativity-graph__kg_explain_path(nodes)`
+
+**READ-ONLY egress** (§2). Traces the associative chain connecting `nodes` over **`grounded` edges only** —
+`unverified`/`hypothesized`/`failed`/`rejected` edges are excluded entirely, so a returned chain is one that
+has actually been verified. For >2 nodes the visiting order comes from a deterministic NetworkX TSP
+approximation (`greedy_tsp`, sorted input) over the grounded shortest-path closure; 2 nodes use a
+deterministic sorted-neighbour BFS. Each hop carries its grounded `relation` + verbatim `span` for audit, and
+`leap` (= path edge-count) is an **advisory** "creative-leap"/creative-distance signal — never a verdict,
+never written, never a score.
+
+```json
+{"path": ["entropy", "time", "betweenness"],
+ "edges": [{"source": "entropy", "target": "time", "relation": "grounds", "span": "Entropy grounds the arrow of time"}],
+ "leap": 2, "grounded_only": true}
+```
+
+When no fully-grounded path exists: `{"path": [], "edges": [], "leap": null, "grounded_only": true,
+"reason": "no fully-grounded path between <a> and <b>"}` — an honest absence (the concepts are joined only
+through unverified/hypothesized/refuted links, or not at all), never an exception.
+
 ### 1.11 `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=None, budget=2000)`
 
 The **grounding-aware, provenance-carrying, token-budgeted** context tool — the one to call before reasoning
@@ -366,7 +387,8 @@ candidates through `kg_propose`.
 
 - `mechanism` — `bridge` (§2/§4) | `seed` (§3 residual `c − E[c|d]`) | `compression` (§7 dense-cluster MDL) |
   `regroup` (§8 re-partition bridges) | `transplant` (§5 hub pattern) | `ensemble` (§9 cross two
-  constructions), or `all`/`default`.
+  constructions) | `periphery` (§5 low-degree sources → max-connectability anchor; the periphery the
+  hub-seeking mechanisms ignore), or `all`/`default`.
 - `k: int = 10` — max candidates returned (ranked).
 - `second_graph: str | None` — path to a second construction's `graph.json` for `ensemble`; without one,
   `ensemble`/`all` **degrades to `regroup`** and says so in `note` (run `/kg-perturb` to supply one).
@@ -376,13 +398,15 @@ candidates through `kg_propose`.
  "candidates": [
    {"kind": "edge", "mechanism": "bridge", "source": "entropy", "target": "time", "relation": "bridges",
     "label": "", "node_type": "", "score": 0.81, "specificity": 2.1,
-    "rationale": "cross-community pair, generality-controlled", "section": "§4"}
+    "rationale": "cross-community pair, generality-controlled", "section": "§4", "convergence": 2}
  ]}
 ```
 
 Each candidate is a `Candidate` dict: `{kind, mechanism, source, target, relation, label, node_type, score,
-specificity, rationale, section}` (`provenance` is always `hypothesized`, never carried — the propose lane
-forces it).
+specificity, rationale, section, convergence}` (`provenance` is always `hypothesized`, never carried — the
+propose lane forces it). `convergence` is **advisory** — the number of *distinct* mechanisms that
+independently proposed the same edge (≥1); a grounding-queue ranking prior, never folded into `score` and
+never written to the canon, harness-gated (`harness.convergence`) before it may reorder grounding.
 
 ### 1.14 `mcp__plugin_creativity-graph_creativity-graph__kg_operate(op, target=None, label="", body="", members=None, k=None)`
 
@@ -661,7 +685,8 @@ The `graph` condition "wins" only if it is `>=` control on diversity AND novelty
 | browse by type/relation/state, ranked by degree | `query_graph(...)` |
 | one node + its edges | `get_node(id)` |
 | a node's edges (list) | `get_neighbors(id, relation=?)` |
-| connect two nodes | `shortest_path(a, b)` |
+| connect two nodes (structural) | `shortest_path(a, b)` |
+| connect concepts over GROUNDED edges only (+ advisory leap) | `kg_explain_path(nodes)` |
 | budgeted, grounding-aware context (+ failures + bridges) | `kg_context(query=?, budget=?)` |
 | propose hypothesized candidates (the offensive lane) | `kg_propose(payload)` |
 | generate structural idea candidates (read-only) | `kg_generate(mechanism=?, k=?, second_graph=?)` |

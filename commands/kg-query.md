@@ -1,7 +1,7 @@
 ---
 description: Answer a question against the knowledge graph with provenance and falsification counters attached.
 argument-hint: <question>
-allowed-tools: mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__get_node, mcp__plugin_creativity-graph_creativity-graph__get_neighbors, mcp__plugin_creativity-graph_creativity-graph__shortest_path, mcp__plugin_creativity-graph_creativity-graph__kg_agenda
+allowed-tools: mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__get_node, mcp__plugin_creativity-graph_creativity-graph__get_neighbors, mcp__plugin_creativity-graph_creativity-graph__shortest_path, mcp__plugin_creativity-graph_creativity-graph__kg_explain_path, mcp__plugin_creativity-graph_creativity-graph__kg_agenda
 ---
 
 You are answering a question **against the grounded knowledge graph**, not against your own prior
@@ -60,6 +60,11 @@ Use these to follow specific relationships rather than to re-rank context:
 - `mcp__plugin_creativity-graph_creativity-graph__get_neighbors(node_id, relation=…)` — incident edges, optionally one relation.
 - `mcp__plugin_creativity-graph_creativity-graph__shortest_path(source, target)` — `{path: [node_ids] | null}` over the derived graph.
   A path is a *structural* connection only; it is **not** evidence the chain of claims is grounded.
+- `mcp__plugin_creativity-graph_creativity-graph__kg_explain_path(nodes)` — the associative chain connecting `nodes`
+  over **grounded edges only** → `{path[], edges[{source,target,relation,span}], leap, grounded_only, reason?}`.
+  Unlike `shortest_path`, every hop here has actually been verified; `leap` (= path length) is an **advisory**
+  creative-distance signal, never a verdict. Empty `path`/`leap=null` with a `reason` when the only connection
+  runs through unverified/hypothesized links — say so honestly rather than implying a grounded chain exists.
 
 ### 3. Answer with provenance attached
 For every edge you cite, surface its axes inline. A compact convention:

@@ -138,8 +138,12 @@ edit, or a non-git vault — still reprojects.
   `ideation(outputs_by_condition, source_text="") -> dict` (`{table, verdict}`, the headline graph-vs-control
   verdict, plus a `generate_verdict` when a `graph+generate` arm is present); `absorption(graph, history, *, now) -> dict` (§14 window).
 - `generate`: `run_generators(G, mechanism, *, pack, corpus, failures, k, second_graph) -> list[Candidate]`
-  — the six discovery mechanisms `bridge/seed/compression/regroup/transplant/ensemble` (read-only, hypothesized
-  candidates); `load_second_graph(path)` for the §9 ensemble.
+  — the seven discovery mechanisms `bridge/seed/compression/regroup/transplant/ensemble/periphery` (read-only,
+  hypothesized candidates); `periphery` (§5) sources from low-degree nodes (the adaptive bottom-quartile band)
+  toward a max-connectability anchor — the region the hub-seeking mechanisms ignore. `load_second_graph(path)`
+  for the §9 ensemble. Each `Candidate` carries an advisory `convergence` (# distinct mechanisms that
+  independently proposed the edge), set in the dedup pass — a grounding-queue ranking prior, never in `score`
+  or on a canon edge; the degraded-ensemble path is folded back into regroup so it can't inflate the count.
 - `operations`: the four §8 endo operations `collapse_payload/explode_payload/regroup_payload/open_payload`
   (+ `DISPATCH`), each returning a propose-lane payload (`provenance=hypothesized`, no span, no verdict).
 - `backend`: `BackendExtractor` + `main(argv)` — the headless `python -m kg_engine.backend extract` driver
@@ -162,8 +166,9 @@ edit, or a non-git vault — still reprojects.
 - `canonmerge`: `merge_nodes` / `merge_note_files` / `main` — the R5 semantic git merge driver for
   per-node canon Markdown (union edges by `edge_id`, demote a cross-branch verdict conflict to
   `unverified`); structurally incapable of forging a verdict.
-- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 19 tools: `kg_ping`,
-  `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda`
+- `server`: `KGEngine` facade wrapping the above + FastMCP tool registration — all 20 tools: `kg_ping`,
+  `kg_scrub`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path` (read-only egress —
+  the grounded-only associative chain + advisory `leap`; §2), `kg_context`, `kg_agenda`
   (read-only structural agenda), `kg_export` (read-only human-facing render), `kg_write`, `kg_ground`,
   `kg_rename`, `kg_merge` (deliberate node-merge with edge dedup), `kg_metrics`, `kg_status`, plus the four
   generative-layer tools `kg_propose`, `kg_generate`, `kg_operate`, `kg_absorption`.

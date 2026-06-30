@@ -35,6 +35,14 @@ ground". Otherwise proceed.
 > `blocked_on_grounding[]` lane is a read-only structural shortlist of what grounding would unblock —
 > under-grounded hubs and hypothesized-only neighbourhoods, ranked by the honest gate-aware signal. Use it to
 > pick which hubs/edges to drain first; it suggests, never grounds (verdicts still flow only through `kg_ground`).
+>
+> **Convergence prior (advisory, §4).** Candidates from `/kg-generate` carry a `convergence` count (how many
+> *distinct* mechanisms independently proposed the same edge). You **may display** it alongside the queue, and
+> **only once the harness gate is ON** (`python -m kg_engine.harness convergence <grounding-history.json>` →
+> `gate_on=true`, i.e. higher convergence has been shown to predict grounding success) you **may** sort the
+> `unverified` queue by `convergence` DESC as a tie-aware prior for *which to ground first*. Until the gate
+> passes the headline ordering stays the honest one. Convergence **never** decides a verdict and **never** lets
+> an edge skip grounding — it only reorders the queue (G5).
 
 ## Stage 0b — Drain stale verdicts (source-staleness advisory, R3)
 

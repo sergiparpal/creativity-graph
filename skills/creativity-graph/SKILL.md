@@ -52,14 +52,16 @@ afterward. The portico moved from the door of imagination to after generation.
    *falsify* surviving edges, recording `attacked_by` edges + `kg_ground(verdict="failed")`.
 3. **`/kg-generate [mechanism] [k]`** — turn the graph into an idea generator. `kg_generate` runs the
    deterministic discovery mechanisms (bridge §2/§4, seed §3, compression §7, regroup §8, transplant §5,
-   ensemble §9) over the derived graph and emits ranked structural candidates; **kg-generator** phrases &
+   ensemble §9, periphery §5 — low-degree sources) over the derived graph and emits ranked structural
+   candidates, each with an advisory `convergence` count (distinct mechanisms agreeing — a grounding-queue
+   ranking prior, never a verdict); **kg-generator** phrases &
    names them; they are written `hypothesized`/`unverified` via the propose lane (`kg_propose`/`kg_operate`).
    **`/kg-perturb [second]`** imports external structure and cross-generates against it (§9/§15).
    **Generation never gates on a metric** — the next `/kg-ground` is the filter.
 4. **`/kg-query [question]`** — read the grounded graph: `query_graph`, `get_node`,
-   `get_neighbors`, `shortest_path`, and `kg_context` (budgeted, falsification-aware) for grounded
-   answers with provenance. Hypothesized candidates appear in a SEPARATE `hypotheses[]` block, never in the
-   grounded `items[]`.
+   `get_neighbors`, `shortest_path`, `kg_explain_path` (the grounded-only associative chain + advisory `leap`),
+   and `kg_context` (budgeted, falsification-aware) for grounded answers with provenance. Hypothesized
+   candidates appear in a SEPARATE `hypotheses[]` block, never in the grounded `items[]`.
 5. **`/kg-eval`** — run the deterministic gates: extraction precision (`f4_probe.py score`, gate
    ≥ 0.70), inter-coder agreement (`harness agreement`, Krippendorff α ≥ 0.67), and the
    bridge-metric gate (`harness specificity`). **kg-annotator** drives these and reports verdicts.
@@ -73,18 +75,19 @@ afterward. The portico moved from the door of imagination to after generation.
 | `/kg-ground` | `kg-grounder`, `kg-adversarial-grounder` | `kg_ground`, `query_graph`, `kg_write` |
 | `/kg-generate` | `kg-generator` | `kg_generate`, `kg_propose`, `kg_operate`, `kg_absorption`, `kg_context` |
 | `/kg-perturb` | `kg-generator` | `kg_generate` (ensemble), `kg_propose` |
-| `/kg-query` | (none; direct reads) | `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context` |
+| `/kg-query` | (none; direct reads) | `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path`, `kg_context` |
 | `/kg-view` | (none; direct render) | `kg_export` |
 | `/kg-eval` | `kg-annotator` | `f4_probe.py`, `kg_engine.harness`, `query_graph` |
 | `/kg-experiment` | `kg-evaluator` | `kg_engine.harness ideation` |
 
 The MCP server is named `creativity-graph`; tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`.
-The fifteen read/write/ground tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_merge`,
-`kg_metrics`, `kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_context`, `kg_agenda` — the
-read-only structural agenda, `kg_export` — the read-only human-facing render) plus the four
-**generative-layer** tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the discovery
-mechanisms; `kg_operate` — the §8 endo operations; `kg_absorption` — the §14 absorption window) make
-**nineteen** tools. These are the ONLY graph tools — `kg-build`, `kg-generate`, etc. are slash commands.
+The sixteen read/write/ground tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_merge`,
+`kg_metrics`, `kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path` — the
+read-only grounded-only associative chain, `kg_context`, `kg_agenda` — the read-only structural agenda,
+`kg_export` — the read-only human-facing render) plus the four **generative-layer** tools (`kg_propose` — the
+hypothesized write lane; `kg_generate` — the discovery mechanisms; `kg_operate` — the §8 endo operations;
+`kg_absorption` — the §14 absorption window) make **twenty** tools. These are the ONLY graph tools —
+`kg-build`, `kg-generate`, etc. are slash commands.
 
 ## Core invariants — non-negotiable, enforced by the boundary
 
