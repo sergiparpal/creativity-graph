@@ -1397,6 +1397,107 @@ class KGEngine:
     def shortest_path(self, source: str, target: str):
         return self._proj.shortest_path(source, target)
 
+    def explain_path(self, nodes: list[str]) -> dict:
+        """Trace the associative chain connecting `nodes` over GROUNDED edges only (read-only egress, §2).
+        Returns the ordered node `path`, the grounded `edges` used (relation + span, for audit), and an
+        ADVISORY `leap` = the path edge-count — never a verdict, never written, never folded into a score
+        (G1/G4). For >2 nodes the visiting order comes from a deterministic NetworkX TSP approximation
+        over the grounded shortest-path closure (no external solver, no new dependency). The result is
+        EMPTY (path=[], leap=null) with a `reason` when no fully-grounded path exists — itself informative:
+        the concepts are joined only through unverified/hypothesized/refuted links, or not at all. Mirrors
+        shortest_path's `projection_degraded` surfacing so an empty result is never confused with a
+        degraded projection."""
+        import itertools
+        from collections import deque
+
+        import networkx as nx
+        from networkx.algorithms.approximation import greedy_tsp, traveling_salesman_problem
+
+        G = self._proj.load_graph()
+        # the grounded-ONLY undirected graph: an undirected pair {u,v} exists iff at least one parallel
+        # edge between them (either direction) is epistemic_state == grounded. Carry ONE representative
+        # grounded edge's relation+span — deterministically the smallest edge id — for the audit trail.
+        # unverified / hypothesized / failed / rejected edges are excluded ENTIRELY: routing a chain
+        # through them would manufacture a false "explanation", defeating the auditability purpose (§2).
+        Gg = nx.Graph()
+        Gg.add_nodes_from(G.nodes())
+        reps: dict = {}  # frozenset({u,v}) -> (edge_id, relation, span) representative grounded edge
+        for u, v, d in G.edges(data=True):
+            if u == v or d.get("epistemic_state") != EpistemicState.GROUNDED.value:
+                continue
+            key = frozenset((u, v))
+            eid = d.get("id", "") or ""
+            prior = reps.get(key)
+            if prior is None or eid < prior[0]:
+                reps[key] = (eid, d.get("relation", "") or "", d.get("span", "") or "")
+        for key, (_eid, rel, span) in reps.items():
+            a, b = sorted(key)
+            Gg.add_edge(a, b, relation=rel, span=span)
+
+        def _grounded_path(s, t):
+            """Deterministic shortest path s->t over Gg (sorted-neighbour predecessor BFS); None when no
+            fully-grounded path exists."""
+            if s == t:
+                return [s]
+            if s not in Gg or t not in Gg:
+                return None
+            pred = {s: s}
+            q = deque([s])
+            while q:
+                cur = q.popleft()
+                for nb in sorted(Gg.neighbors(cur)):  # sorted -> byte-stable path among equal-length ties
+                    if nb in pred:
+                        continue
+                    pred[nb] = cur
+                    if nb == t:
+                        path = [t]
+                        while path[-1] != s:
+                            path.append(pred[path[-1]])
+                        path.reverse()
+                        return path
+                    q.append(nb)
+            return None
+
+        def _unreachable(reason):
+            return self._with_degraded({"path": [], "edges": [], "leap": None,
+                                        "grounded_only": True, "reason": reason})
+
+        uniq = sorted(set(str(n) for n in (nodes or [])))
+        if not uniq:
+            return _unreachable("no nodes requested")
+        missing = [n for n in uniq if n not in Gg]
+        if missing:
+            return _unreachable(f"node not in graph: {missing[0]}")
+        if len(uniq) == 1:
+            return self._with_degraded({"path": [uniq[0]], "edges": [], "leap": 0, "grounded_only": True})
+
+        if len(uniq) == 2:
+            full = _grounded_path(uniq[0], uniq[1])
+            if full is None:
+                return _unreachable(f"no fully-grounded path between {uniq[0]} and {uniq[1]}")
+        else:
+            # every requested concept must be mutually reachable over grounded edges; report the FIRST
+            # offending pair (combinations of the sorted set -> deterministic) before the TSP ordering.
+            for a, b in itertools.combinations(uniq, 2):
+                if _grounded_path(a, b) is None:
+                    return _unreachable(f"no fully-grounded path between {a} and {b}")
+            # deterministic TSP over the grounded shortest-path closure: sorted input + a pinned method
+            # make the visiting order byte-stable across repeated calls. The returned path is already
+            # EXPANDED through the grounded intermediates (every consecutive pair is a Gg edge).
+            full = traveling_salesman_problem(Gg, nodes=uniq, cycle=False, method=greedy_tsp)
+
+        # collect the grounded edges along the full chain (relation+span per hop, for audit). Every
+        # consecutive pair is a Gg edge by construction; guard defensively all the same.
+        edges_used = []
+        for a, b in zip(full, full[1:]):
+            d = Gg.get_edge_data(a, b)
+            if d is None:
+                return _unreachable(f"no fully-grounded path between {a} and {b}")
+            edges_used.append({"source": a, "target": b,
+                               "relation": d.get("relation", ""), "span": d.get("span", "")})
+        return self._with_degraded({"path": full, "edges": edges_used, "leap": len(edges_used),
+                                    "grounded_only": True})
+
     def query_graph(self, **kw) -> dict:
         return self._with_degraded(self._proj.query_graph(**kw))
 
@@ -1630,6 +1731,17 @@ def _register(mcp, engine: KGEngine) -> None:
         if engine._projection_degraded:
             out["projection_degraded"] = engine._projection_degraded
         return out
+
+    @mcp.tool()
+    @_tool_result
+    def kg_explain_path(nodes: list[str]) -> dict:
+        """Trace the associative chain between concepts over GROUNDED edges only (read-only egress, §2).
+        Returns the ordered `path`, the grounded `edges` used (relation+span, for audit), and an ADVISORY
+        `leap` = path length signalling creative distance — never a verdict, never written, never a score.
+        For >2 nodes the order comes from a deterministic TSP over the grounded shortest-path closure.
+        EMPTY (path=[], leap=null) with a `reason` when no fully-grounded path exists — informative: the
+        concepts are joined only through unverified/hypothesized/refuted links, or not at all."""
+        return engine.explain_path(nodes)
 
     @mcp.tool()
     @_tool_result
