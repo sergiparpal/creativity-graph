@@ -269,8 +269,8 @@ BFS over the derived edge list, treated as **undirected** (no centrality is comp
 
 **READ-ONLY egress** (§2). Traces the associative chain connecting `nodes` over **`grounded` edges only** —
 `unverified`/`hypothesized`/`failed`/`rejected` edges are excluded entirely, so a returned chain is one that
-has actually been verified. For >2 nodes the visiting order comes from a deterministic NetworkX TSP
-approximation (`greedy_tsp`, sorted input) over the grounded shortest-path closure; 2 nodes use a
+has actually been verified. For >2 nodes the visiting order comes from a deterministic nearest-neighbour
+walk (a TSP approximation, byte-stable across processes) over the grounded shortest-path closure; 2 nodes use a
 deterministic sorted-neighbour BFS. Each hop carries its grounded `relation` + verbatim `span` for audit, and
 `leap` (= path edge-count) is an **advisory** "creative-leap"/creative-distance signal — never a verdict,
 never written, never a score.

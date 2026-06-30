@@ -34,8 +34,9 @@ generation never gated on a metric, fully deterministic).
   traces the associative chain connecting two-or-more concepts **over `grounded` edges only**, carrying
   each hop's relation + verbatim span for audit, and reports the path edge-count as an **advisory**
   `leap` ("creative-leap" / creative-distance) signal. For >2 nodes the visiting order comes from a
-  deterministic NetworkX TSP approximation (`greedy_tsp`, sorted input) over the grounded shortest-path
-  closure — no external solver, no new dependency. When no fully-grounded path exists it returns an empty
+  deterministic nearest-neighbour walk (a TSP approximation) over the grounded shortest-path closure —
+  byte-stable across processes via a (distance, id) tie-break, no external solver, no new dependency.
+  When no fully-grounded path exists it returns an empty
   path + an honest `reason` (itself informative: the concepts are joined only through unverified /
   hypothesized / refuted links). `leap` is **never** a verdict, **never** written to the canon, **never**
   a score — it lives only in the tool response.

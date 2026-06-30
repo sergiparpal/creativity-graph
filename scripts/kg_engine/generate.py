@@ -464,7 +464,7 @@ def ensemble(G, *, pack, corpus, failures, k=10, second_graph=None, und=None, ad
     return _rank(cands, k)
 
 
-def periphery(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
+def periphery(G, *, pack, corpus, failures, k=10, adj=None) -> list:
     """§5 — explore the periphery. Source candidates from LOW-degree nodes (the periphery the
     hub-seeking mechanisms ignore): for each peripheral node, propose a `bridges` edge to a
     non-adjacent anchor that maximises connectability (shared-neighbour count), specificity-
@@ -476,7 +476,10 @@ def periphery(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
     kg_agenda, not re-proposed here) and <= the 25th-percentile degree, computed by the nearest-rank
     rule (no interpolation) so the threshold is byte-stable across repeated runs over the same graph
     (G6). Reuses BRIDGES_RELATION (an existing pack edge_type) — never a new type."""
-    und, adj = _shared(G, und, adj)
+    # periphery only needs the undirected ADJACENCY (it never walks `und`); resolve adj like `bridge`
+    # does, so a standalone single-mechanism run pays no wasted `G.to_undirected()` build.
+    if adj is None:
+        adj = _undirected_adjacency(G)
     nodes = list(G.nodes())
     degree = {n: int(_attr(G, n, "degree", 0)) for n in nodes}
     # the live degree distribution over CONNECTED nodes (degree-0 orphans excluded — kg_agenda surfaces
@@ -634,7 +637,7 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
             out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, second_graph=second_graph,
                       und=und_of(), adj=adj_of(), new_comm=ens_repart)
         elif fn is periphery:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(), adj=adj_of())
+            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, adj=adj_of())
     # Dedup EDGE candidates across mechanisms by (source, target, relation) — the triple the canonical
     # edge_id derives from (review-low): with `second_graph=None`, ensemble degrades to regroup and
     # re-emits the SAME edges under a second mechanism name; other mechanisms can also independently

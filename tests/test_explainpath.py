@@ -7,8 +7,43 @@ is reported honestly (the concepts are joined only through unverified/hypothesiz
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 from kg_engine.model import EpistemicState, edge_id
+
+_PACK = Path(__file__).resolve().parents[1] / "pack" / "pack.yaml"
+
+# A self-contained worker (run in a fresh subprocess so PYTHONHASHSEED takes effect at interpreter
+# start): build a TIE-HEAVY grounded star (hub `h` grounded to five leaves; every leaf pair is distance
+# 2 through `h`, so the nearest-neighbour ordering's tie-break is exercised pervasively), then print the
+# explain_path visiting order. The ordering MUST be identical across hash seeds — networkx greedy_tsp's
+# internal min(set(...)) tie-breaks on hash-randomized set order, so this guards the G6 fix.
+_HASH_SEED_WORKER = '''
+import json, subprocess, sys, tempfile
+from pathlib import Path
+from kg_engine.server import KGEngine
+from kg_engine.model import edge_id
+
+PACK = sys.argv[1]
+SOURCE = "Alpha grounds one. Beta grounds two. Gamma grounds three. Delta grounds four. Epsilon grounds five.\\n"
+SPANS = ["Alpha grounds one", "Beta grounds two", "Gamma grounds three", "Delta grounds four", "Epsilon grounds five"]
+LEAVES = ["a", "b", "c", "d", "e"]
+d = Path(tempfile.mkdtemp())
+for c in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"],
+          ["commit", "-q", "--allow-empty", "-m", "i"]):
+    subprocess.run(["git", "-C", str(d)] + c, check=True)
+src = d / "source.md"; src.write_text(SOURCE, encoding="utf-8")
+eng = KGEngine(d, source_path=src, pack_path=PACK)
+eng.kg_write({"edges": [{"source": "h", "target": t, "relation": "grounds", "span": sp, "authored_by": "agent"}
+                        for t, sp in zip(LEAVES, SPANS)]})
+for t in LEAVES:
+    eng.kg_ground(edge_id("h", "grounds", t), "grounded")
+print(json.dumps(eng.explain_path(LEAVES)["path"]))
+'''
 
 # verbatim substrings of the conftest SOURCE, so every edge span-verifies at the kg_write boundary
 _S1 = "grounds the claims beneath it"
@@ -87,6 +122,27 @@ def test_explain_path_is_read_only(engine):
         assert not hasattr(e, "leap")
     raw = "".join(p.read_text(encoding="utf-8") for p in engine.canon.note_paths())
     assert "leap" not in raw
+
+
+def test_explain_path_order_stable_across_hash_seeds(tmp_path):
+    """G6 regression: the >2-node visiting order must be byte-stable ACROSS PROCESSES. The old
+    greedy_tsp path tie-broke on hash-randomized set iteration order, so the same grounded graph could
+    return different paths after a server restart (seeds 0 and 2 are known to diverge with greedy_tsp).
+    The deterministic (distance, id) nearest-neighbour walk must give one identical path for every seed.
+    """
+    worker = tmp_path / "hashseed_worker.py"
+    worker.write_text(_HASH_SEED_WORKER, encoding="utf-8")
+    outputs = []
+    for seed in ("0", "1", "2", "7"):
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        proc = subprocess.run([sys.executable, str(worker), str(_PACK)],
+                              capture_output=True, text=True, env=env)
+        assert proc.returncode == 0, proc.stderr
+        outputs.append(proc.stdout.strip())
+    assert len(set(outputs)) == 1, f"explain_path order varied across hash seeds: {outputs}"
+    path = json.loads(outputs[0])
+    assert path and path[0] == "a"                       # deterministic start (smallest id)
+    assert {"a", "b", "c", "d", "e"}.issubset(set(path))  # visits every requested concept
 
 
 def test_explain_path_unreachable_reports_honestly(engine):

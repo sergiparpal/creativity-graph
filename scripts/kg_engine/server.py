@@ -1401,17 +1401,17 @@ class KGEngine:
         """Trace the associative chain connecting `nodes` over GROUNDED edges only (read-only egress, §2).
         Returns the ordered node `path`, the grounded `edges` used (relation + span, for audit), and an
         ADVISORY `leap` = the path edge-count — never a verdict, never written, never folded into a score
-        (G1/G4). For >2 nodes the visiting order comes from a deterministic NetworkX TSP approximation
-        over the grounded shortest-path closure (no external solver, no new dependency). The result is
-        EMPTY (path=[], leap=null) with a `reason` when no fully-grounded path exists — itself informative:
-        the concepts are joined only through unverified/hypothesized/refuted links, or not at all. Mirrors
+        (G1/G4). For >2 nodes the visiting order comes from a deterministic nearest-neighbour walk (a TSP
+        approximation) over the grounded shortest-path closure — byte-stable across processes by a
+        (distance, id) tie-break, no external solver, no new dependency. The result is EMPTY (path=[],
+        leap=null) with a `reason` when no fully-grounded path exists — itself informative: the concepts
+        are joined only through unverified/hypothesized/refuted links, or not at all. Mirrors
         shortest_path's `projection_degraded` surfacing so an empty result is never confused with a
         degraded projection."""
         import itertools
         from collections import deque
 
         import networkx as nx
-        from networkx.algorithms.approximation import greedy_tsp, traveling_salesman_problem
 
         G = self._proj.load_graph()
         # the grounded-ONLY undirected graph: an undirected pair {u,v} exists iff at least one parallel
@@ -1471,20 +1471,48 @@ class KGEngine:
         if len(uniq) == 1:
             return self._with_degraded({"path": [uniq[0]], "edges": [], "leap": 0, "grounded_only": True})
 
+        # cache oriented grounded shortest paths between requested concepts (the BFS is deterministic).
+        seg_cache: dict = {}
+
+        def _seg(a, b):
+            if (a, b) not in seg_cache:
+                p = _grounded_path(a, b)
+                seg_cache[(a, b)] = p
+                if p is not None:
+                    seg_cache[(b, a)] = list(reversed(p))
+            return seg_cache[(a, b)]
+
         if len(uniq) == 2:
-            full = _grounded_path(uniq[0], uniq[1])
+            full = _seg(uniq[0], uniq[1])
             if full is None:
                 return _unreachable(f"no fully-grounded path between {uniq[0]} and {uniq[1]}")
         else:
             # every requested concept must be mutually reachable over grounded edges; report the FIRST
-            # offending pair (combinations of the sorted set -> deterministic) before the TSP ordering.
+            # offending pair (combinations of the sorted set -> deterministic). Build the metric closure.
+            dist: dict = {}
             for a, b in itertools.combinations(uniq, 2):
-                if _grounded_path(a, b) is None:
+                seg = _seg(a, b)
+                if seg is None:
                     return _unreachable(f"no fully-grounded path between {a} and {b}")
-            # deterministic TSP over the grounded shortest-path closure: sorted input + a pinned method
-            # make the visiting order byte-stable across repeated calls. The returned path is already
-            # EXPANDED through the grounded intermediates (every consecutive pair is a Gg edge).
-            full = traveling_salesman_problem(Gg, nodes=uniq, cycle=False, method=greedy_tsp)
+                dist[(a, b)] = dist[(b, a)] = len(seg) - 1
+            # order the concepts by a DETERMINISTIC nearest-neighbour walk over the grounded shortest-path
+            # closure (a TSP-path approximation): start at the smallest id, then repeatedly take the
+            # closest unvisited concept, tie-broken by id. The (distance, id) key is a TOTAL order, so
+            # `min` is byte-stable ACROSS PROCESSES — unlike networkx greedy_tsp, whose internal
+            # `min(set(...))` tie-breaks on hash-randomized set iteration order (a real G6 hazard here,
+            # since the grounded closure's unit-weight distances tie pervasively and server restarts are
+            # routine). Then expand each consecutive pair into its grounded shortest path.
+            order = [uniq[0]]
+            remaining = set(uniq[1:])
+            while remaining:
+                cur = order[-1]
+                nxt = min(remaining, key=lambda n: (dist[(cur, n)], n))
+                order.append(nxt)
+                remaining.discard(nxt)
+            full = []
+            for a, b in zip(order, order[1:]):
+                seg = _seg(a, b)
+                full += seg if not full else seg[1:]
 
         # collect the grounded edges along the full chain (relation+span per hop, for audit). Every
         # consecutive pair is a Gg edge by construction; guard defensively all the same.
@@ -1738,7 +1766,8 @@ def _register(mcp, engine: KGEngine) -> None:
         """Trace the associative chain between concepts over GROUNDED edges only (read-only egress, §2).
         Returns the ordered `path`, the grounded `edges` used (relation+span, for audit), and an ADVISORY
         `leap` = path length signalling creative distance — never a verdict, never written, never a score.
-        For >2 nodes the order comes from a deterministic TSP over the grounded shortest-path closure.
+        For >2 nodes the order comes from a deterministic nearest-neighbour walk (a TSP approximation,
+        byte-stable across processes) over the grounded shortest-path closure.
         EMPTY (path=[], leap=null) with a `reason` when no fully-grounded path exists — informative: the
         concepts are joined only through unverified/hypothesized/refuted links, or not at all."""
         return engine.explain_path(nodes)
