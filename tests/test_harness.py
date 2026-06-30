@@ -265,7 +265,7 @@ def test_cli_malformed_json_clean_diagnostic_no_demo_fallback(tmp_path, capsys):
 def test_cli_malformed_json_clean_for_all_subcommands(tmp_path, capsys):
     broken = tmp_path / "broken.json"
     broken.write_text("not json at all", encoding="utf-8")
-    for cmd in ("agreement", "specificity", "ideation"):
+    for cmd in ("agreement", "specificity", "ideation", "convergence"):
         assert _main([cmd, str(broken)]) == 2
         assert "failed to parse" in capsys.readouterr().err
 

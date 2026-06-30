@@ -380,3 +380,68 @@ def test_periphery_in_all_set_and_readonly(canon: Canon):
     _well_formed(out)
     assert {n.id for n in canon.all_nodes()} == before_nodes
     assert {e.id for e in canon.all_edges()} == before_edges
+
+
+# --------------------------------------------------------------------------- convergence (§4 advisory)
+
+# two triangles joined by a dense 4-edge cross-stitch — produces a cross-community bridges edge {a3,b2}
+# that bridge AND transplant BOTH propose independently (bridge+seed don't co-occur in a small
+# deterministic graph; the property under test — distinct-mechanism agreement raises convergence — is
+# identical for any two mechanisms).
+_CONVERGENCE_EDGES = [("a1", "a2"), ("a2", "a3"), ("a1", "a3"), ("b1", "b2"), ("b2", "b3"), ("b1", "b3"),
+                      ("a1", "b1"), ("a2", "b1"), ("a1", "b2"), ("a2", "b2")]
+
+
+def _proposers(G, pair, mechs=("bridge", "seed", "regroup", "transplant", "periphery")):
+    """The set of DISTINCT mechanisms that independently propose `pair` (an undirected frozenset)."""
+    return {m for m in mechs
+            if any(frozenset((c.source, c.target)) == pair
+                   for c in gen._DISPATCH[m](G, pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+                   if c.kind == "edge")}
+
+
+def test_convergence_counts_distinct_mechanisms(canon: Canon):
+    G = _ranked(canon, _CONVERGENCE_EDGES)
+    pair = frozenset(("a3", "b2"))
+    proposers = _proposers(G, pair)
+    assert len(proposers) >= 2, proposers                         # two distinct mechanisms agree on it
+    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+    surv = next(c for c in out if c.kind == "edge" and frozenset((c.source, c.target)) == pair)
+    assert surv.convergence == len(proposers) >= 2                # advisory count == # distinct mechanisms
+
+
+def test_convergence_default_is_one(canon: Canon):
+    G = _ranked(canon, _CONVERGENCE_EDGES)
+    # a SINGLE-mechanism run: every surviving edge was proposed by exactly one mechanism -> convergence 1
+    out = gen.run_generators(G, mechanism="bridge", pack=None, corpus=[_UNIFORM], failures=set(), k=40)
+    assert out
+    assert all(c.convergence == 1 for c in out if c.kind == "edge")
+    # and a freshly-constructed Candidate defaults to convergence 1
+    assert Candidate(kind="edge", mechanism="bridge").convergence == 1
+
+
+def test_convergence_not_inflated_by_ensemble_degrade(canon: Canon):
+    # with second_graph=None, ensemble degrades to regroup and re-emits regroup's edges under a SECOND
+    # name. That is the SAME construction, not a second independent one, so it must NOT add a count.
+    G = _ranked(canon, _PERIPHERY_EDGES)
+    pair = frozenset(("a1", "a2"))
+    proposers = _proposers(G, pair)                               # {regroup, periphery} — the GENUINE two
+    assert "regroup" in proposers
+    out = gen.run_generators(G, mechanism="all", pack=None, corpus=[_UNIFORM], failures=set(), k=60)
+    surv = next(c for c in out if c.kind == "edge" and frozenset((c.source, c.target)) == pair)
+    # the degraded-ensemble shadow of the regroup edge is folded back into regroup, so convergence is the
+    # count of GENUINE distinct mechanisms — NOT len(proposers)+1 (which is what no-collapse would give).
+    assert surv.convergence == len(proposers)
+
+
+def test_convergence_does_not_change_score_or_rank(canon: Canon):
+    # _rank's ordering key is (-score, identity) — convergence is NOT part of it, so setting convergence
+    # can neither reorder candidates nor alter any score (it is purely additive advisory metadata, G3/G4).
+    cands = [gen._edge_cand("bridge", "x", "y", "bridges", score=2.0, specificity=1.0, rationale="r", section="s"),
+             gen._edge_cand("bridge", "a", "b", "bridges", score=1.0, specificity=1.0, rationale="r", section="s"),
+             gen._edge_cand("bridge", "c", "d", "bridges", score=2.0, specificity=1.0, rationale="r", section="s")]
+    baseline = [(c.source, c.target, c.score) for c in gen._rank(list(cands), 10)]
+    for i, c in enumerate(cands):
+        c.convergence = i + 5                                     # arbitrary distinct convergence values
+    after = [(c.source, c.target, c.score) for c in gen._rank(list(cands), 10)]
+    assert after == baseline                                      # convergence changes neither score nor order

@@ -158,6 +158,63 @@ def specificity(graph_data: dict, corpus: list[str], *, precomputed_betweenness:
     }
 
 
+# --------------------------------------------------------------------------- convergence gate (§4)
+
+# the high band only EARNS the right to reorder the grounding queue when its grounded-rate beats the
+# low band by more than this margin (the §1.6-style "earn promotion before you gate" rule). Advisory
+# knob — the harness measures, never gates the pipeline.
+_CONVERGENCE_MARGIN = 0.10
+# minimum samples PER BAND before the gate may fire — stays closed on a degenerate/small split, exactly
+# as the specificity gate stays advisory without IDF spread.
+_CONVERGENCE_MIN_BAND = 3
+
+
+def convergence(history: list[dict]) -> dict:
+    """Gate (mirrors §1.6 specificity gating): given a HISTORY of past candidates with their convergence
+    count and eventual grounding outcome — ``[{"convergence": int, "grounded": bool}, ...]`` — decide
+    whether higher convergence predicts grounding success beyond a margin.
+
+    Split the history into a HIGH band (convergence >= 2 — proposed by multiple distinct mechanisms) and
+    a LOW band (convergence == 1 — a single mechanism). If the high band's grounded-rate exceeds the low
+    band's by > MARGIN — and NEITHER band is degenerate / too small — convergence has earned the right to
+    REORDER the grounding queue (``gate_on=True``); otherwise it STAYS ADVISORY. Like the specificity
+    gate, it stays closed on a small or flat sample: until then convergence is displayed but decides
+    nothing (G5).
+    """
+    rows = [r for r in (history or []) if isinstance(r, dict)]
+
+    def _conv(r) -> int:
+        try:
+            return int(r.get("convergence", 1))
+        except (TypeError, ValueError):
+            return 1
+
+    high = [bool(r.get("grounded")) for r in rows if _conv(r) >= 2]
+    low = [bool(r.get("grounded")) for r in rows if _conv(r) <= 1]
+    n_high, n_low = len(high), len(low)
+    high_rate = (sum(high) / n_high) if n_high else 0.0
+    low_rate = (sum(low) / n_low) if n_low else 0.0
+    enough = n_high >= _CONVERGENCE_MIN_BAND and n_low >= _CONVERGENCE_MIN_BAND
+    gate_on = bool(enough and (high_rate - low_rate) > _CONVERGENCE_MARGIN)
+    if gate_on:
+        verdict = "convergence earns its place — gate ON"
+    elif not enough:
+        verdict = "sample too small per band — stays advisory"
+    else:
+        verdict = "convergence does not clearly predict grounding — stays advisory"
+    return {
+        "n": len(rows),
+        "n_high_band": n_high,
+        "n_low_band": n_low,
+        "high_band_rate": round(high_rate, 3),
+        "low_band_rate": round(low_rate, 3),
+        "margin": round(high_rate - low_rate, 3),
+        "min_band": _CONVERGENCE_MIN_BAND,
+        "gate_on": gate_on,
+        "verdict": verdict,
+    }
+
+
 # --------------------------------------------------------------------------- absorption window (§14)
 
 
@@ -370,7 +427,8 @@ def _load_json_or_demo(path, demo, *, notice: str):
 
 def _main(argv: list[str]) -> int:
     if not argv:
-        print("usage: python -m kg_engine.harness {agreement|specificity|ideation} [path...]", file=sys.stderr)
+        print("usage: python -m kg_engine.harness {agreement|specificity|ideation|convergence} [path...]",
+              file=sys.stderr)
         return 2
     cmd = argv[0]
     try:
@@ -424,6 +482,18 @@ def _dispatch(cmd: str, argv: list[str]) -> int:
         # never let the top-level "source" string leak in as a fake (char-iterated) condition.
         obc = blob.get("outputs", {k: v for k, v in blob.items() if k != "source"})
         res = ideation(obc, src)
+        print(json.dumps(res, indent=2))
+        return 0
+    if cmd == "convergence":
+        path = argv[1] if len(argv) > 1 else None
+        # demo: the high band (convergence>=2) grounds at 0.75, the low band (==1) at 0.25 — a clean
+        # separation across enough samples, so the gate fires ON (mirrors the specificity/ideation demos).
+        demo = [{"convergence": 2, "grounded": True}, {"convergence": 2, "grounded": True},
+                {"convergence": 2, "grounded": True}, {"convergence": 2, "grounded": False},
+                {"convergence": 1, "grounded": True}, {"convergence": 1, "grounded": False},
+                {"convergence": 1, "grounded": False}, {"convergence": 1, "grounded": False}]
+        history, _ = _load_json_or_demo(path, demo, notice="no history file; using demo convergence history")
+        res = convergence(history)
         print(json.dumps(res, indent=2))
         return 0
     print(f"unknown command: {cmd}", file=sys.stderr)

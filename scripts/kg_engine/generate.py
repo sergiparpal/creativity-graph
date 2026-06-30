@@ -84,6 +84,9 @@ class Candidate:
     specificity: float = 0.0
     rationale: str = ""
     section: str = ""    # the source-theory § the mechanism implements
+    convergence: int = 1  # advisory (§4): # of DISTINCT mechanisms that independently proposed this edge.
+    # A RANKING PRIOR for the grounding queue — NEVER a score, NEVER a verdict, NEVER folded into
+    # `score` or onto a canon edge (G3/G4). Set in run_generators' dedup pass; node candidates keep 1.
 
     def to_dict(self) -> dict:
         from dataclasses import asdict
@@ -646,16 +649,36 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
     # bridge can emit (a,b) while ensemble-exo emits (b,a) for the same undirected bridge — a directional
     # key would let both survive (review-M10). Key those orientation-independently; keep the directional
     # key for transplant, whose dominant_relation is genuinely directional.
+    def _edge_key(c):
+        # the SAME orientation-independent key the dedup uses (BRIDGES_RELATION is symmetric; the
+        # directional key is kept for transplant's genuinely-directional dominant_relation).
+        if c.relation == BRIDGES_RELATION:
+            return (frozenset((c.source, c.target)), c.relation)
+        return (c.source, c.target, c.relation)
+
+    # convergence (§4 advisory): tally how many DISTINCT mechanisms independently proposed each edge key
+    # BEFORE the dedup discards the duplicates' signal. The degraded-ensemble path (second_graph=None)
+    # re-emits regroup's edges under a SECOND name — but that is the SAME construction, not a second
+    # independent one, so collapse `ensemble`→`regroup` for the tally; otherwise the degrade path would
+    # spuriously inflate convergence to 2 on every regroup edge (asserted in a test). This is computed
+    # purely from mechanism agreement on STRUCTURE — no text, no span, no verdict — and only ever rides
+    # the response / queue ordering, never `score` and never a canon edge (G3/G4).
+    degraded_ensemble = second_graph is None
+    def _conv_mech(c):
+        return "regroup" if (degraded_ensemble and c.mechanism == "ensemble") else c.mechanism
+    mech_by_key: dict = defaultdict(set)
+    for c in out:
+        if c.kind == "edge":
+            mech_by_key[_edge_key(c)].add(_conv_mech(c))
+
     seen: set = set()
     deduped: list = []
     for c in out:
         if c.kind == "edge":
-            if c.relation == BRIDGES_RELATION:
-                key = (frozenset((c.source, c.target)), c.relation)
-            else:
-                key = (c.source, c.target, c.relation)
+            key = _edge_key(c)
             if key in seen:
                 continue
             seen.add(key)
+            c.convergence = len(mech_by_key[key])  # >=1; node candidates keep the default 1 (no identity)
         deduped.append(c)
     return deduped
