@@ -12,6 +12,37 @@ NetworkX/SQLite **derived** layer. The deterministic Python engine (`scripts/kg_
 hard guarantees; the Claude Code session and its subagents do the language work and hand structured
 JSON back across the MCP boundary.
 
+## [0.6.1] — 2026-07-01
+
+Project rename and documentation polish. **No engine behavior changed** — the write boundary, the
+grounding loop, the three-axis provenance model, and the deterministic derived layer are byte-identical
+to 0.6.0; the full test suite and `validate_plugin` pass unchanged. The changes are entirely naming and
+docs.
+
+### Changed
+
+- **Renamed the plugin `creativity-graph` → `Sproutgraph`** across the entire repository (41 files plus
+  the `skills/` directory). Casing is by role: **identifiers** are lowercase `sproutgraph` — the
+  `plugin.json`/`marketplace.json` name, the `.mcp.json` MCP-server key, the tool namespace
+  `mcp__plugin_sproutgraph_sproutgraph__…`, the skill name + directory, `PLUGIN_NAME`, the `FastMCP`
+  server and `kg_ping` name, the `[sproutgraph]` log tags, the install id, and the
+  `sproutgraph--v<version>` release-tag convention — while **prose, display titles, and real
+  filesystem/GitHub paths** use `Sproutgraph` (matching the repository's own name).
+  - **User-visible install changes** (existing installs must re-add and reinstall under the new names):
+    - marketplace: `/plugin marketplace add sergiparpal/Sproutgraph`
+    - install: `/plugin install sproutgraph@sergiparpal` (was `creativity-graph@sergiparpal`)
+    - the operating-guide skill is now invoked as `/sproutgraph` (was `/creativity-graph`)
+    - the MCP server and its tool namespace are now `sproutgraph` /
+      `mcp__plugin_sproutgraph_sproutgraph__`
+  - **Deliberately unchanged:** the `kg_engine` package, the `/kg-*` slash commands, and all `KG_*`
+    environment variables (the "knowledge-graph" abbreviation is orthogonal to the brand); the sibling
+    `creativity-amplifier` plugin; and the historical release tags, which keep their original
+    `creativity-graph--v*` names.
+
+### Added
+
+- **README hero image** (`images/rhizome-sprouts.jpg`) for the project landing page.
+
 ## [0.6.0] — 2026-07-01
 
 Three additions, all **below the grounding boundary** — additive, backward-compatible, and respecting

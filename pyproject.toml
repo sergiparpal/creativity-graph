@@ -1,6 +1,6 @@
 [project]
 name = "kg-engine"
-version = "0.6.0"
+version = "0.6.1"
 description = "Deterministic graph engine for the Sproutgraph Claude Code plugin"
 requires-python = ">=3.10"
 # Core, always-installed dependencies. Each is verified to install from wheels with no
