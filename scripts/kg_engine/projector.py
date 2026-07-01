@@ -144,6 +144,10 @@ class ProjectReport:
     touched_nodes: list[str] = field(default_factory=list)
     touched_edges: list[str] = field(default_factory=list)
     built_from_commit: str = ""
+    # True when project() could not acquire the canon lease and served/synthesized the existing (or an
+    # empty cold-start) derived layer instead of reprojecting — a 410-contention observability signal
+    # server.py:_ensure_projected reads. PINNED interface: the field name must stay exactly `contended`.
+    contended: bool = False
 
 
 @dataclass
@@ -343,8 +347,13 @@ class Projector:
         topo_sig = self._topo_sig(und)
         if und.number_of_nodes() <= 2:
             betweenness = {n: 0.0 for n in und}
-        elif prior_betweenness is not None and prior_topo_sig and prior_topo_sig == topo_sig:
-            betweenness = {n: float(prior_betweenness.get(n, 0.0)) for n in und.nodes()}
+        elif (prior_betweenness is not None and prior_topo_sig and prior_topo_sig == topo_sig
+              and all(n in prior_betweenness for n in und.nodes())):
+            # Reuse only when EVERY live node has a prior value. A dangling edge target (a node present in
+            # the undirected graph but never persisted to the nodes table) is absent from prior_betweenness,
+            # so `.get(n, 0.0)` would zero-fill it — diverging from a full rebuild's real centrality for the
+            # identical graph and destabilizing the specificity gate. If any such node exists, recompute.
+            betweenness = {n: float(prior_betweenness[n]) for n in und.nodes()}
         else:
             betweenness = nx.betweenness_centrality(und)
         corpus = self._corpus()
@@ -407,7 +416,8 @@ class Projector:
                 self._connect().close()
             if not self.graph_path.exists():
                 _atomic_write(self.graph_path, json.dumps(_node_link_data(nx.MultiDiGraph())))
-            return ProjectReport(up_to_date=self.db_path.exists() and self.graph_path.exists())
+            return ProjectReport(up_to_date=self.db_path.exists() and self.graph_path.exists(),
+                                 contended=True)
         try:
             return self._project_locked(incremental)
         finally:
@@ -947,7 +957,7 @@ class Projector:
             eq, ea = "SELECT * FROM edges", []
             if relation:
                 eq += " WHERE relation=?"; ea.append(relation)
-            eq += " LIMIT ?"; ea.append(limit)
+            eq += " ORDER BY id ASC LIMIT ?"; ea.append(limit)  # deterministic top-N (mirror the nodes query)
             edges = [dict(r) for r in con.execute(eq, ea)]
             return {"nodes": nodes, "edges": edges}
         finally:
@@ -1083,7 +1093,10 @@ class Projector:
             # GROUNDED LANE — items[] never includes a hypothesized proposal (PLAN Stage 8). A
             # hypothesized edge is a machine proposal, not grounded content, and must never be laundered
             # into a grounded answer.
-            iwhere = "provenance != 'hypothesized'"
+            # ...and never a refuted/obsolete edge: failed/rejected are negative information (surfaced
+            # only via falsification_counters, never as an answer) and obsolete is superseded content,
+            # so the answer lane must exclude them. falsification_counters above still counts them.
+            iwhere = "provenance != 'hypothesized' AND epistemic_state NOT IN ('failed','rejected','obsolete')"
             iargs = list(term_args)
             if term_clause:
                 iwhere += " AND " + term_clause

@@ -32,14 +32,12 @@ def node_link_graph(data: dict):
     try:
         return nx.node_link_graph(data, edges="links", directed=data.get("directed", True))
     except TypeError:
-        # Symmetric with `_node_link_data`'s writer, which normalizes the on-disk edges key to "links".
-        # The bare `node_link_graph` (no `edges=` param) reads the version-default key ("edges" on
-        # 3.6.1), so rename "links" -> "edges" first; otherwise the edges would be silently dropped and
-        # we would reconstruct an EDGELESS graph. Copy so the caller's dict is never mutated.
-        d = dict(data)
-        if "links" in d and "edges" not in d:
-            d["edges"] = d.pop("links")
-        return nx.node_link_graph(d, directed=d.get("directed", True))
+        # Only the OLD networkx (3.0–3.3) that lacks the `edges=` keyword reaches this branch, and its
+        # bare `node_link_graph` reader expects the edges under the "links" key — exactly the key
+        # `_node_link_data` writes on disk. So do NOT rename "links" -> "edges" (that would hide the
+        # edges from the old reader and reconstruct an EDGELESS graph); pass the data through as-is.
+        # Copy so the caller's dict is never mutated.
+        return nx.node_link_graph(dict(data), directed=data.get("directed", True))
 
 
 def node_attr(G, n, key, default=None):

@@ -135,8 +135,20 @@ def _check_marketplace(version: str | None, errors: list[str]) -> None:
     """Validate that every marketplace.json creativity-graph entry agrees with the plugin version."""
     market = _load_json(".claude-plugin/marketplace.json", errors)
     if market is not None and version is not None:
+        # a malformed shape must produce the validator's clean failure list, not an AttributeError —
+        # mirror the defensive style of _check_plugin/_check_hooks.
+        plugins = market.get("plugins")
+        if not isinstance(plugins, list):
+            errors.append("marketplace.json: 'plugins' is missing or not a list")
+            return
         # check EVERY matching entry, not just the first — a duplicate with a wrong version must fail
-        mvs = [p.get("version") for p in market.get("plugins", []) if p.get("name") == PLUGIN_NAME]
+        mvs = []
+        for p in plugins:
+            if not isinstance(p, dict):
+                errors.append("marketplace.json: malformed plugin entry (not an object)")
+                continue
+            if p.get("name") == PLUGIN_NAME:
+                mvs.append(p.get("version"))
         if not mvs:
             errors.append(f"marketplace.json: no '{PLUGIN_NAME}' plugin entry")
         for mv in mvs:

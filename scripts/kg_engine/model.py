@@ -247,11 +247,16 @@ class Edge:
     @classmethod
     def from_dict(cls, d: dict[str, Any], *, source: str | None = None) -> "Edge":
         d = dict(d)
-        if source is not None:
-            d.setdefault("source", source)
-        # tolerate unknown keys
+        # tolerate unknown keys AND drop None-valued known keys: a hand-edited `source: null` /
+        # `relation: null` (or any explicit null) would otherwise be passed through and coerced to the
+        # literal string "None" by __post_init__ (str(None)). Mirroring node_from_markdown, drop the
+        # None so the field default applies instead — and, for `source`, so the resolved owning-node id
+        # below fills it (setdefault after the drop, so a null `source` still resolves to `source`).
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        kw = {k: v for k, v in d.items() if k in known and v is not None}
+        if source is not None:
+            kw.setdefault("source", source)
+        return cls(**kw)
 
 
 @dataclass

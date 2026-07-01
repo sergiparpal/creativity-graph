@@ -226,12 +226,19 @@ def _merge_body(base_body: str, ours_body: str, theirs_body: str) -> tuple[str, 
 
 def merge_note_files(base_text: str, ours_text: str, theirs_text: str) -> tuple[str, list[str], bool]:
     """3-way merge two canon note *files*. Returns ``(merged_text, conflicts, ok)`` (``ok`` is the
-    merge-clean flag → exit 0/1). If either side is not a parseable node-with-frontmatter, or NEITHER
-    side declares any edges, fall back to a plain ``git merge-file`` text merge — a non-canon / pure-prose
-    note has no edge structure to union, so forcing a semantic merge would only risk mangling it."""
+    merge-clean flag → exit 0/1). Fall back to a plain ``git merge-file`` text merge when a side is
+    genuinely not a parseable node-with-frontmatter, OR when NEITHER side declares an edge AND the two
+    sides already AGREE on the node-level ``epistemic_state``. That last case is a structureless note with
+    nothing to demote and no edges to union, so the raw text merge is preferred — it does not re-serialize
+    (``node_to_markdown`` drops any non-Node frontmatter key), so a pure-prose / non-canon note is kept
+    verbatim. But an edgeless node whose sides DISAGREE on ``epistemic_state`` (or any node with edges)
+    must go through ``merge_nodes`` so the node-level ``epistemic_state`` demote (and scalar 3-way) apply —
+    else an edgeless node's one-sided verdict would be silently kept, bypassing never-forge-a-verdict."""
     ours = _parse(ours_text)
     theirs = _parse(theirs_text)
-    if ours is None or theirs is None or (not ours.edges and not theirs.edges):
+    if ours is None or theirs is None:
+        return _git_merge_file(base_text, ours_text, theirs_text)
+    if not ours.edges and not theirs.edges and ours.epistemic_state == theirs.epistemic_state:
         return _git_merge_file(base_text, ours_text, theirs_text)
 
     base = _parse(base_text)  # may be None (file added on both sides, or an unparseable base)

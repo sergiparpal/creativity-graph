@@ -118,12 +118,21 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("CREDURL", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@[^\s]+", re.I)),  # creds in URL
     ("EMAIL", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
     ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
-    # 13-16 digit card runs; anchored on a digit at BOTH ends so a trailing space/dash is not captured
-    # (which would break placeholder consistency for the same number written two ways).
-    ("CC", re.compile(r"\b\d(?:[ -]?\d){12,15}\b")),
-    # IPv4 and (conservative) full-form IPv6 BEFORE phone, so the phone rule can't eat IP octets first.
+    # 13-19 digit card runs (covers 19-digit PANs, not just the 16-digit majors); anchored on a digit at
+    # BOTH ends so a trailing space/dash is not captured (which would break placeholder consistency for the
+    # same number written two ways). {12,18} = first digit + 12..18 more = 13..19 total.
+    ("CC", re.compile(r"\b\d(?:[ -]?\d){12,18}\b")),
+    # IPv4 and full-form IPv6 BEFORE phone, so the phone rule can't eat IP octets first.
     ("IP", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
     ("IP", re.compile(r"\b(?:[0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}\b")),
+    # RFC 5952 '::'-compressed IPv6 (the full-form rule above misses these): a single '::' with 0-6
+    # hextets on each side — covers 'fe80::1', '2001:db8::8a2e:370:7334', '::1' and bare '::'. Requiring
+    # the literal '::' (never a single colon) is what spares ordinary prose and clock times like '12:30'.
+    # Bracketed by lookarounds (not \b, which fails against a leading ':') so it doesn't fuse with an
+    # adjacent word char or extra colon.
+    ("IP", re.compile(
+        r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5})?::"
+        r"(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,5})?(?![\w:])")),
     # Phone numbers, but NOT bare 6-7 digit prose runs or dash-separated page ranges (F11/M5): the old
     # two-group `\d{3}[\s.-]?\d{3,4}` matched "100-200" and even separator-less "100200", over-redacting
     # ordinary figures into ⟦PHONE⟧ (restored on write, but it degraded extraction). A real number must

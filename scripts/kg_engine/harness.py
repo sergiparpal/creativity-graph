@@ -369,6 +369,11 @@ def ideation(outputs_by_condition: dict, source_text: str = "") -> dict:
     (a published GraphRAG baseline over the same prose corpus), a `lightrag_verdict` reports whether the
     grounded `graph` arm beat that baseline — letting "grounding-with-falsification is worth it" stand
     against a real GraphRAG, not only against flat retrieval."""
+    # shape guard (mirrors agreement()'s): a top-level JSON list — or any non-object — would otherwise
+    # reach _ordered_conditions' .items() and raise an opaque AttributeError. Surface a usage error so
+    # _main's ValueError handler prints a clean message instead.
+    if not isinstance(outputs_by_condition, dict):
+        raise ValueError("outputs must be a {condition: [outputs]} object")
     table = {cond: _score_condition(outs, source_text) for cond, outs in _ordered_conditions(outputs_by_condition)}
     g, c = table.get("graph"), table.get("control")
     verdict = "insufficient data"
@@ -462,10 +467,16 @@ def _dispatch(cmd: str, argv: list[str]) -> int:
         # gets an identical IDF — specificity collapses to a single value, spread≈0, and the gate
         # verdict is ALWAYS the degenerate "corpus too small / no IDF spread", never reflecting the
         # real graph. The production projector path already splits; this standalone CLI must too.
-        if spath and Path(spath).exists():
+        if spath:
+            # a GIVEN-but-missing source path must NOT silently fall back to the demo corpus — that
+            # would yield a degenerate gate verdict read as a real measurement (mirrors
+            # _load_json_or_demo, which only falls back when NO path was supplied).
+            if not Path(spath).exists():
+                raise _LoadError(f"source path not found: {spath}")
             text = Path(spath).read_text(encoding="utf-8")
             corpus = [s for s in text.split("\n## ") if s.strip()] or [text]
         else:
+            print("[harness] no source; using demo IDF corpus", file=sys.stderr)
             corpus = _demo_corpus()
         res = specificity(gdata, corpus)
         print(json.dumps(res, indent=2))

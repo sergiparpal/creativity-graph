@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -22,6 +23,7 @@ from .model import (
     EpistemicState,
     GROUNDABLE_STATES,
     Node,
+    UNDECLARED_TYPE,
     node_from_markdown,
     node_to_markdown,
     slug,
@@ -690,8 +692,24 @@ class Canon:
                         self.lock.heartbeat()
                         last_hb = now_mono
                     merged = self._merge_into_existing(node) if merge else node
+                    p = self.node_path(merged.id)
+                    # Idempotent no-op guard: if the note already on disk is byte-identical to what we
+                    # would write EXCEPT for created_at/updated_at, skip both the write and the
+                    # updated_at bump. Otherwise an idempotent re-run (edges all deduped, source nodes
+                    # re-written) would rewrite each note with a fresh timestamp — non-byte-stable canon
+                    # and timestamp-only commits. Compare a content hash that ignores the timestamps,
+                    # mirroring projector._file_hash (the same excluded fields).
+                    if p.exists():
+                        try:
+                            existing = node_from_markdown(
+                                p.read_text(encoding="utf-8"), fallback_id=merged.id
+                            )
+                        except Exception:  # noqa: BLE001 — unreadable existing note: fall through to write
+                            existing = None
+                        if existing is not None and self._content_hash(existing) == self._content_hash(merged):
+                            continue  # real content unchanged — leave the note (and its timestamp) as-is
                     merged.updated_at = utcnow()
-                    _atomic_write(self.node_path(merged.id), node_to_markdown(merged))
+                    _atomic_write(p, node_to_markdown(merged))
             except Exception as e:  # noqa: BLE001 — rollback must catch everything
                 return self._rollback(str(e), snapshot)
             # The writes have durably landed. Commit OUTSIDE the rollback try: a non-zero git exit must
@@ -707,10 +725,25 @@ class Canon:
                 # would otherwise force an EMPTY commit that pollutes vault history. A no-op commit
                 # exits non-zero, which check=False already ignores harmlessly — the writes have
                 # durably landed regardless of whether the commit records anything.
-                _git(repo, "commit", "-m", message, check=False)
+                # Scope the commit to this batch's paths too (mirror the scoped `add` above): a bare
+                # `git commit` with no pathspec would record the WHOLE staged index — including any
+                # unrelated file another process staged concurrently — into the vault history. The
+                # pathspec restricts the commit to exactly the notes this batch touched.
+                if snapshot:
+                    _git(repo, "commit", "-m", message, "--",
+                         *[str(p) for p in snapshot], check=False)
             return RollbackInfo(False)
         finally:
             self._release_lock()
+
+    @staticmethod
+    def _content_hash(node: Node) -> str:
+        """Content hash of a note EXCLUDING the created_at/updated_at timestamps — the same fields
+        projector._file_hash ignores. Used by write_nodes to detect an idempotent no-op re-write so it
+        does not churn the note's updated_at (and thus its bytes / git history) when nothing real
+        changed."""
+        fm = {k: v for k, v in node.frontmatter().items() if k not in ("created_at", "updated_at")}
+        return hashlib.sha256((json.dumps(fm, sort_keys=True) + node.body).encode()).hexdigest()
 
     def _merge_into_existing(self, node: Node) -> Node:
         """Apply the single-canonical-edge rule: merge incoming edges into an existing note."""
@@ -764,7 +797,7 @@ class Canon:
         # 'undeclared-type' guard just below).
         if node.label and node.label != node.id:
             cur.label = node.label
-        if node.node_type and node.node_type != "undeclared-type":
+        if node.node_type and node.node_type != UNDECLARED_TYPE:
             cur.node_type = node.node_type
         return cur
 

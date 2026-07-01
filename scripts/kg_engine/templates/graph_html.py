@@ -129,8 +129,21 @@ window.__KG_DATA__ = __KG_DATA_JSON__;
   var nodes = DATA.nodes.map(function (n) {
     return Object.assign({}, n, { x: (rng() - 0.5) * 2 * R + W / 2, y: (rng() - 0.5) * 2 * R + H / 2, vx: 0, vy: 0 }); });
   var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
+  // Resilience: an edge endpoint with no node row (a dangling target) is synthesized as a minimal
+  // placeholder here too, so the edge is DRAWN rather than silently dropped and links.length matches
+  // the legend's edge count. (export._render_data does this data-side; this is defense-in-depth.)
+  function ensureNode(id) {
+    if (id == null) return null;
+    var n = byId[id];
+    if (!n) {
+      n = { id: id, label: id, degree: 0, provenance: null, authored_by: null, community: null,
+            bridge: false, x: (rng() - 0.5) * 2 * R + W / 2, y: (rng() - 0.5) * 2 * R + H / 2, vx: 0, vy: 0 };
+      byId[id] = n; nodes.push(n);
+    }
+    return n;
+  }
   var links = []; (DATA.links || []).forEach(function (l) {
-    var s = byId[l.source], t = byId[l.target]; if (s && t) links.push(Object.assign({}, l, { s: s, t: t })); });
+    var s = ensureNode(l.source), t = ensureNode(l.target); if (s && t) links.push(Object.assign({}, l, { s: s, t: t })); });
 
   var view = { x: 0, y: 0, k: 1 }, alpha = 1;
 

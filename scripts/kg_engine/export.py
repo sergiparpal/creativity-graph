@@ -78,6 +78,26 @@ def _render_data(model: dict) -> dict:
         "community": n.get("community"),
         "bridge": n["id"] in bridges,              # gate-aware highlight (never the size channel)
     } for n in sorted(model["nodes"], key=lambda n: n["id"])]
+    # Mirror load_graph's dangling-target auto-create: an edge endpoint id that has no nodes-table row
+    # (a target referenced in graph.json but never itself a canon note) would leave the HTML's byId
+    # lookup empty and the JS would silently DROP that edge — yet the legend's edge count still includes
+    # it, so the count and the drawing diverge. Synthesize a minimal placeholder node (degree 0, null
+    # axes) for every such endpoint so those edges render and links.length matches the drawable count.
+    known = {n["id"] for n in nodes}
+    for e in model["edges"]:
+        for endpoint in (e.get("source"), e.get("target")):
+            if endpoint is not None and endpoint not in known:
+                known.add(endpoint)
+                nodes.append({
+                    "id": endpoint,
+                    "label": endpoint,
+                    "degree": 0,
+                    "provenance": None,
+                    "authored_by": None,
+                    "community": None,
+                    "bridge": endpoint in bridges,
+                })
+    nodes.sort(key=lambda n: n["id"])
     links = [{
         "source": e.get("source"),
         "target": e.get("target"),

@@ -282,6 +282,13 @@ class _Watchdog:
         self._name: str | None = None
         self._started: float = 0.0
         self._depth = 0
+        # A multi-file canon write (kg_rename/kg_merge/kg_write) marks a CRITICAL section: a force-exit
+        # mid-batch would leave the mutation half-applied (rename/merge are not crash-atomic across files).
+        # When a handler overruns while `_critical` is set, the watchdog grants ONE grace extension before
+        # tripping, so a slow (e.g. network-vault) atomic batch isn't killed mid-write (review:
+        # watchdog-force-exit-mid-multi-file-write). Bounded to a single extension per handler span.
+        self._critical = 0
+        self._extended = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -290,6 +297,15 @@ class _Watchdog:
             self._depth += 1
             if self._depth == 1:
                 self._name, self._started = name, time.monotonic()
+                self._extended = False
+
+    def begin_critical(self) -> None:
+        with self._lock:
+            self._critical += 1
+
+    def end_critical(self) -> None:
+        with self._lock:
+            self._critical = max(0, self._critical - 1)
 
     def exit(self) -> None:
         with self._lock:
@@ -303,6 +319,12 @@ class _Watchdog:
             if self._depth > 0 and self._name is not None:
                 elapsed = now - self._started
                 if elapsed > self.timeout:
+                    # A multi-file canon write in flight: grant ONE grace extension (reset the clock) so a
+                    # slow atomic batch isn't force-killed mid-write, leaving a half-applied rename/merge.
+                    if self._critical > 0 and not self._extended:
+                        self._extended = True
+                        self._started = now
+                        return None
                     return self._name, elapsed
         return None
 
@@ -344,6 +366,17 @@ class _Watchdog:
 # The active watchdog, set by main(). The tool envelope (_tool_result) feeds it without changing any
 # wrapper signature (so the manifest scrape and FastMCP schema are untouched); None disables feeding.
 _WATCHDOG: "_Watchdog | None" = None
+
+# The active engine, set by _register(). The module-scope tool envelope has no engine reference, so it
+# reads the CONFIGURED sensitivity from here to scrub raised-exception messages at the operator's chosen
+# tier (not a hardcoded 'medium') before they cross the §1.9 egress — mirroring the engine's own
+# _scrub_error path (review: error-envelope-ignores-configured-sensitivity). None → default 'medium'.
+_ACTIVE_ENGINE: "KGEngine | None" = None
+
+
+def _active_sensitivity() -> str:
+    eng = _ACTIVE_ENGINE
+    return eng.sensitivity if eng is not None else "medium"
 
 
 class _SourceResolver:
@@ -501,6 +534,22 @@ class KGEngine:
         sensitivity; never raises (see `_scrub_error_text`)."""
         return _scrub_error_text(msg, sensitivity=self.sensitivity)
 
+    @contextlib.contextmanager
+    def _critical_write(self):
+        """Mark a multi-file canon-mutation region as CRITICAL for the watchdog: while it is held, a
+        handler that overruns the watchdog timeout is granted ONE grace extension before the force-exit,
+        so a slow atomic batch (network vault, contended fsync) isn't killed mid-write leaving a
+        half-applied rename/merge (review: watchdog-force-exit-mid-multi-file-write). Best-effort — a
+        missing/disabled watchdog is a no-op."""
+        wd = _WATCHDOG
+        if wd is not None:
+            wd.begin_critical()
+        try:
+            yield
+        finally:
+            if wd is not None:
+                wd.end_critical()
+
     @staticmethod
     def _append_note(existing: str, addition: str) -> str:
         """Append `addition` to a notes field with the load-bearing ` | ` separator (the field is later
@@ -510,21 +559,34 @@ class KGEngine:
     @staticmethod
     def _payload_receipt(payload: dict) -> str:
         """A deterministic receipt token for a write payload: a short hash over the SORTED set of
-        canonical ids the payload targets (node ids by slug; edge ids by the deterministic
-        `edge_id(source,relation,target)`). Same payload → same receipt, independent of dedup status or
+        canonical ids the payload targets AND their content-bearing fields (node label/body/type/axes;
+        edge span/notes/confidence/axes). Same payload → same receipt, independent of dedup status or
         process restarts — so a lost transport response is harmless: re-sending the identical payload
         yields the identical `receipt`, and "did my write land?" becomes a cheap retry rather than an
-        out-of-band read of the canon dir."""
+        out-of-band read of the canon dir. Folding the content in (not just the ids) is what lets the
+        idempotency replay branch tell a genuine retry (identical content) apart from a same-ids payload
+        whose text CHANGED (e.g. a corrected span) — the latter must be processed, not silently replayed
+        (review: receipt-id-only-drops-content-correction)."""
         from .model import edge_id as _edge_id
-        ids = []
+        items = []
         for n in (payload or {}).get("nodes") or []:
-            nid = (n or {}).get("id") or (n or {}).get("label") or ""
-            ids.append("node:" + slug(str(nid)))
+            n = n or {}
+            nid = n.get("id") or n.get("label") or ""
+            content = {k: n.get(k) for k in
+                       ("label", "body", "node_type", "provenance", "authored_by",
+                        "epistemic_state", "confidence") if k in n}
+            items.append("node:" + slug(str(nid)) + "|"
+                         + json.dumps(content, sort_keys=True, ensure_ascii=True, default=str))
         for e in (payload or {}).get("edges") or []:
             e = e or {}
-            ids.append("edge:" + _edge_id(str(e.get("source", "")), str(e.get("relation", "")),
-                                          str(e.get("target", ""))))
-        digest = hashlib.sha1("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
+            eid = _edge_id(str(e.get("source", "")), str(e.get("relation", "")),
+                           str(e.get("target", "")))
+            content = {k: e.get(k) for k in
+                       ("span", "notes", "note", "confidence", "confidence_score", "provenance",
+                        "authored_by", "epistemic_state", "source_file") if k in e}
+            items.append("edge:" + eid + "|"
+                         + json.dumps(content, sort_keys=True, ensure_ascii=True, default=str))
+        digest = hashlib.sha1("\n".join(sorted(items)).encode("utf-8")).hexdigest()
         return f"rcpt_{digest[:16]}"
 
     def kg_write(self, payload: dict, *, message: str = "kg_write", existing_nodes=None,
@@ -571,7 +633,8 @@ class KGEngine:
                                    existing_node_ids={n.id for n in existing_nodes},
                                    restore=restore, max_edges_per_kb=self.max_edges_per_kb)
         nodes = merge_results_into_nodes(results)
-        info = self.canon.write_nodes(list(nodes.values()), message=message) if nodes else None
+        with self._critical_write():
+            info = self.canon.write_nodes(list(nodes.values()), message=message) if nodes else None
         rolled_back = bool(info and info.rolled_back)
         summary: dict = {d.value: 0 for d in Disposition}
         for r in results:
@@ -687,7 +750,14 @@ class KGEngine:
         # locking (the old order) let a concurrent multi-process grounding clobber our edits with a
         # whole-node overwrite (lost update, F17/L5). The lease also still guards the audit-append +
         # write + compensating-truncate sequence (server-3); write_one re-acquires it re-entrantly.
-        if not self.canon.try_acquire_lock():
+        # Use the bounded-BLOCKING acquire (as kg_write's write_nodes does), not the non-blocking
+        # try_acquire_lock: a verdict/rename/merge is a WRITER, so brief cross-process contention (the
+        # detached reconcile worker or a headless backend holding the lease for one note) must SERIALIZE
+        # cleanly instead of failing outright with a spurious locked-vault error. The 30s budget stays
+        # well under the watchdog timeout (review: writers-use-nonblocking-lock).
+        try:
+            self.canon._acquire_lock()
+        except RuntimeError:
             return {"ok": False, "error": "canon vault is locked by another live session"}
         try:
             if kind == "node":
@@ -873,7 +943,11 @@ class KGEngine:
         # unlink + commit sequence so the migrating records and their compensating truncate are atomic
         # w.r.t. other writers (server-3). write_nodes/_acquire_lock are re-entrant, so the inner write
         # still works.
-        if not self.canon.try_acquire_lock():
+        # bounded-BLOCKING acquire (mirrors kg_write) so brief cross-process contention serializes rather
+        # than failing this writer outright (review: writers-use-nonblocking-lock).
+        try:
+            self.canon._acquire_lock()
+        except RuntimeError:
             return {"ok": False, "error": "canon vault is locked by another live session",
                     "old": old, "new": new}
         try:
@@ -922,7 +996,8 @@ class KGEngine:
 
             records = [(new_key, EpistemicState.UNVERIFIED.value, state, "agent")
                        for new_key, state in migrations]
-            info = self._audit_log.audited_write(records, _attempt)
+            with self._critical_write():
+                info = self._audit_log.audited_write(records, _attempt)
             if info.rolled_back:
                 # the batch rolled back — do NOT unlink the old note, or the node would be lost entirely
                 # (its migrating audit records were already truncated by GroundAuditLog.audited_write).
@@ -939,7 +1014,10 @@ class KGEngine:
                 paths = [str(self.canon.node_path(n.id)) for n in touched]
                 paths.append(str(self.canon.node_path(old)))
                 _git(self.canon.root, "add", "--", *paths, check=False)
-                _git(self.canon.root, "commit", "-m", message, "--allow-empty", check=False)
+                # Scope the commit to THIS operation's paths (not a bare `git commit`, which would sweep
+                # any externally-staged files in the user's project repo into an engine commit) — mirrors
+                # the already-scoped `git add` (review: unscoped-commit-sweeps-staged-index).
+                _git(self.canon.root, "commit", "-m", message, "--allow-empty", "--", *paths, check=False)
             return {"ok": True, "old": old, "new": new, "touched": [n.id for n in touched]}
         finally:
             self.canon._release_lock()
@@ -999,10 +1077,18 @@ class KGEngine:
             if rewritten:
                 report["edges_rewritten"] += 1
                 changed = True
-            if e.source == e.target:  # the rewrite collapsed an endpoint pair into a self-loop — drop it
-                report["self_loops_dropped"].append(e.id)
+            if e.source == e.target:  # the rewrite collapsed an endpoint pair into a self-loop
+                # Negative information is NEVER pruned (§1.7): a failed/rejected edge lying directly
+                # between the two merged nodes must survive the merge as a degenerate self-loop so its
+                # verdict + span stay in falsification_counters. Only a positive/unverified self-loop is
+                # discarded (review: merge-selfloop-drops-negative-info). A preserved negative self-loop
+                # falls through to the survivors/dedup path below (its migrating audit record is emitted
+                # by kg_merge's precisely-sized `migrations` set, since its id changed).
+                if e.epistemic_state not in (EpistemicState.FAILED, EpistemicState.REJECTED):
+                    report["self_loops_dropped"].append(e.id)
+                    changed = True
+                    continue
                 changed = True
-                continue
             prev = survivors.get(e.id)
             if prev is None:
                 survivors[e.id] = e
@@ -1026,7 +1112,11 @@ class KGEngine:
         # Acquire the single-writer lease FIRST, then read everything FRESH under the lease — same
         # ordering as kg_rename/kg_ground (F17/L5): reading before locking would let a concurrent
         # cross-process verdict on a sibling edge be clobbered by our verbatim (merge=False) write.
-        if not self.canon.try_acquire_lock():
+        # bounded-BLOCKING acquire (mirrors kg_write) so brief cross-process contention serializes rather
+        # than failing this writer outright (review: writers-use-nonblocking-lock).
+        try:
+            self.canon._acquire_lock()
+        except RuntimeError:
             return {"ok": False, "error": "canon vault is locked by another live session",
                     "from": frm, "into": into}
         try:
@@ -1085,7 +1175,8 @@ class KGEngine:
                 info = self.canon.write_nodes(touched, message=message, commit=False, merge=False)
                 return (not info.rolled_back), info
 
-            info = self._audit_log.audited_write(records, _attempt)
+            with self._critical_write():
+                info = self._audit_log.audited_write(records, _attempt)
             if info.rolled_back:
                 # the batch rolled back — do NOT unlink `from` (its migrating records were already
                 # truncated by audited_write); the graph is left exactly as it was.
@@ -1102,7 +1193,10 @@ class KGEngine:
                 paths = [str(self.canon.node_path(n.id)) for n in touched]
                 paths.append(str(self.canon.node_path(frm)))
                 _git(self.canon.root, "add", "--", *paths, check=False)
-                _git(self.canon.root, "commit", "-m", message, "--allow-empty", check=False)
+                # Scope the commit to THIS operation's paths (not a bare `git commit`, which would sweep
+                # any externally-staged files in the user's project repo into an engine commit) — mirrors
+                # the already-scoped `git add` (review: unscoped-commit-sweeps-staged-index).
+                _git(self.canon.root, "commit", "-m", message, "--allow-empty", "--", *paths, check=False)
             return {"ok": True, "from": frm, "into": into, "touched": [n.id for n in touched],
                     "edges_rewritten": report["edges_rewritten"],
                     "edges_deduped": report["edges_deduped"],
@@ -1256,8 +1350,12 @@ class KGEngine:
             note = "no second construction supplied; ensemble degraded to regroup (run /kg-perturb to supply one)"
         cands = run_generators(G, mechanism, pack=self.pack, corpus=corpus, failures=failures,
                                k=k, second_graph=G2)
-        return {"mechanism": mechanism, "k": int(k), "gate_on": gate_on, "count": len(cands),
-                "candidates": [c.to_dict() for c in cands], "note": note}
+        # Echo projection_degraded like the sibling reads so a caller can tell "no candidates because the
+        # graph is genuinely empty" from "no candidates because projection failed/was contended"
+        # (review: generative-reads-omit-degraded-flag).
+        return self._with_degraded({"mechanism": mechanism, "k": int(k), "gate_on": gate_on,
+                                    "count": len(cands), "candidates": [c.to_dict() for c in cands],
+                                    "note": note})
 
     def _second_graph(self, path: str):
         """Load a SECOND construction's graph.json into a NetworkX graph (raises on failure)."""
@@ -1302,9 +1400,9 @@ class KGEngine:
         result = absorption(data, history, now=now)
         summary = {s: sum(1 for v in result.values() if v["status"] == s)
                    for s in ("fertile", "absorbed", "isolated")}
-        return {"tracked": len(result), "summary": summary, "nodes": result,
+        return self._with_degraded({"tracked": len(result), "summary": summary, "nodes": result,
                 "note": ("" if history else
-                         "no generations.json yet — run /kg-generate to start tracking the absorption window")}
+                         "no generations.json yet — run /kg-generate to start tracking the absorption window")})
 
     def kg_operate(self, op: str, *, target: str | None = None, label: str = "", body: str = "",
                    members=None, k: int | None = None) -> dict:
@@ -1343,9 +1441,18 @@ class KGEngine:
         blowing up on a missing table. Writes never come through here — kg_write/kg_propose/kg_ground/
         kg_rename touch only the canon — so projection can never block or fail a write (defense #6)."""
         try:
+            report = None
             if not self.projector.db_path.exists() or self.projector.is_stale():
-                self.projector.project()
-            self._projection_degraded = None
+                report = self.projector.project()
+            # A cold-start reproject that could NOT take the canon lease (another process holds it) bails
+            # out having synthesized an EMPTY/stale derived layer and returns contended=True. Surface that
+            # as a degraded read so an empty result is not mistaken for a genuinely empty graph — it
+            # self-heals on the next uncontended read (review: contended-projection-looks-empty).
+            if report is not None and getattr(report, "contended", False):
+                self._projection_degraded = ("projection contended: another process holds the canon lease; "
+                                             "serving an empty/stale derived layer (refreshes on next read)")
+            else:
+                self._projection_degraded = None
         except Exception as e:  # noqa: BLE001 — a projection failure degrades the read, never crashes it
             self._projection_degraded = f"{type(e).__name__}: {e}"
             logger.warning("projection failed (%s); serving degraded derived layer", e, exc_info=True)
@@ -1373,6 +1480,34 @@ class KGEngine:
             result = {**result, "projection_degraded": self._projection_degraded}
         return result
 
+    # Free-text fields of a read result that may quote canon/source content (a verbatim edge span, a
+    # verdict note, a node body). kg_write deliberately stores the ORIGINAL (un-scrubbed) span in the
+    # canon (§1.9 restore protects the egress, not the local canon), so a secret that was scrubbed BEFORE
+    # extraction lives in the canon span — and must be re-scrubbed on the READ path before it crosses back
+    # to the model. Structural fields (ids/relation/type/axes) are deliberately excluded so referential
+    # integrity is preserved (review: reads-return-canon-spans-unscrubbed).
+    _EGRESS_TEXT_KEYS = frozenset({"span", "notes", "note", "body", "support_note"})
+
+    def _scrub_egress(self, obj):
+        """Re-run the §1.9 egress scrub over the free-text fields of a read result before it returns to
+        the session, so a secret restored into a canon span can't round-trip to the model on a read. Uses
+        a THROWAWAY Scrubber at the engine's configured sensitivity (never pollutes the session's
+        write-restore map `_scrub_map`); a no-op on ordinary conceptual text (nothing matches). Recurses
+        through nested dicts/lists (items[]/hypotheses[]/edges[]/…)."""
+        scrubber = Scrubber(self.sensitivity)
+
+        def _walk(x):
+            if isinstance(x, dict):
+                return {k: (scrubber.scrub(v)[0]
+                            if (k in self._EGRESS_TEXT_KEYS and isinstance(v, str) and v)
+                            else _walk(v))
+                        for k, v in x.items()}
+            if isinstance(x, list):
+                return [_walk(v) for v in x]
+            return x
+
+        return _walk(obj)
+
     @property
     def _proj(self) -> Projector:
         """The lazy-projection read seam: ensure the derived layer is fresh, then return the projector.
@@ -1386,16 +1521,16 @@ class KGEngine:
         # the flag on the miss too so a caller can tell "not found" from "couldn't project" (review-M2).
         if res is None and self._projection_degraded:
             return {"error": "not found", "projection_degraded": self._projection_degraded}
-        return self._with_degraded(res)
+        return self._with_degraded(self._scrub_egress(res))
 
     def get_neighbors(self, node_id: str, relation: str | None = None) -> list:
         # Returns a LIST, which can't carry the projection_degraded flag without changing the tool's
         # shape; the degraded state is observable via the sibling reads (get_node/kg_context/query_graph/
         # kg_status) that DO carry it. _ensure_projected (via _proj) still degrades-not-raises here.
-        return self._proj.get_neighbors(node_id, relation=relation)
+        return self._scrub_egress(self._proj.get_neighbors(node_id, relation=relation))
 
     def shortest_path(self, source: str, target: str):
-        return self._proj.shortest_path(source, target)
+        return self._scrub_egress(self._proj.shortest_path(source, target))
 
     def explain_path(self, nodes: list[str]) -> dict:
         """Trace the associative chain connecting `nodes` over GROUNDED edges only (read-only egress, §2).
@@ -1523,14 +1658,16 @@ class KGEngine:
                 return _unreachable(f"no fully-grounded path between {a} and {b}")
             edges_used.append({"source": a, "target": b,
                                "relation": d.get("relation", ""), "span": d.get("span", "")})
-        return self._with_degraded({"path": full, "edges": edges_used, "leap": len(edges_used),
-                                    "grounded_only": True})
+        # re-scrub the grounded spans before egress (a secret restored into a canon span must not
+        # round-trip to the model — review: reads-return-canon-spans-unscrubbed).
+        return self._with_degraded(self._scrub_egress(
+            {"path": full, "edges": edges_used, "leap": len(edges_used), "grounded_only": True}))
 
     def query_graph(self, **kw) -> dict:
-        return self._with_degraded(self._proj.query_graph(**kw))
+        return self._with_degraded(self._scrub_egress(self._proj.query_graph(**kw)))
 
     def kg_context(self, query: str | None = None, budget: int = 2000) -> dict:
-        return self._with_degraded(self._proj.kg_context(query, budget=budget))
+        return self._with_degraded(self._scrub_egress(self._proj.kg_context(query, budget=budget)))
 
     def kg_agenda(self, *, limit: int = 5) -> dict:
         return self._with_degraded(self._proj.kg_agenda(limit=limit))
@@ -1541,7 +1678,7 @@ class KGEngine:
         the canon and never `_atomic_write`s graph.json/index.sqlite."""
         self._ensure_projected()
         from . import export as _export
-        return _export.export(self, kind=kind)
+        return self._with_degraded(_export.export(self, kind=kind))
 
 
 # --------------------------------------------------------------------------- MCP wiring
@@ -1613,7 +1750,8 @@ def _tool_result(fn):
             # returned `error` so a raised exception can't leak an absolute path or un-scrubbed canon
             # content back across the §1.9 egress to the session. `error_kind` (the type name) is verbatim.
             logger.warning("MCP tool %s raised %s: %s", fn.__name__, type(e).__name__, e, exc_info=True)
-            return {"ok": False, "error": _scrub_error_text(str(e)), "error_kind": type(e).__name__}
+            return {"ok": False, "error": _scrub_error_text(str(e), sensitivity=_active_sensitivity()),
+                    "error_kind": type(e).__name__}
         finally:
             if wd is not None:
                 wd.exit()
@@ -1621,6 +1759,11 @@ def _tool_result(fn):
 
 
 def _register(mcp, engine: KGEngine) -> None:
+    # Expose the engine to the module-scope tool envelope so it scrubs error egress at the CONFIGURED
+    # sensitivity (review: error-envelope-ignores-configured-sensitivity).
+    global _ACTIVE_ENGINE
+    _ACTIVE_ENGINE = engine
+
     @mcp.tool()
     @_tool_result
     def kg_ping() -> dict:

@@ -274,6 +274,9 @@ def main():
             sys.exit(__doc__)
     except FileNotFoundError as e:
         sys.exit(f"file not found: {e.filename}")
+    except (json.JSONDecodeError, csv.Error, UnicodeDecodeError) as e:
+        # a present-but-corrupt graph.json/labels.csv must fail cleanly, not surface a raw traceback
+        sys.exit(f"could not read '{path}': {e}")
 
 
 if __name__ == "__main__":

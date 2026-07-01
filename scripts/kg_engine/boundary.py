@@ -219,6 +219,12 @@ def validate_payload(
     # node flood baseline = raw count of existing ids (the node lane has no failure-state exemption,
     # unlike the edge baseline below).
     node_budget = None if budget is None else _FloodBudget(len(seen_nodes), budget)
+    # slug-collision detection (non-fatal): slug() is non-injective on trailing/leading punctuation, so
+    # two distinct labels in ONE payload ('C++' and 'C') can collapse onto one node id and silently
+    # alias. We can only see labels for the nodes IN THIS payload (the canon stores labels in canon.py,
+    # off-limits here), so detection is payload-scoped: remember the first signature seen per id and
+    # flag any later node whose label carries a DIFFERENT signature but the same id.
+    sig_by_id: dict[str, str] = {}
     for node_in in wp.nodes:
         node = _canon_node(node_in)
         # restore the egress-scrubbed placeholders in the HUMAN-FACING fields so the canon stores the
@@ -231,6 +237,13 @@ def validate_payload(
         # never-forge-a-state + never-forge-authorship (§1.4/§1.8), single-sourced with the edge lane.
         is_hypothesized = node.provenance == Provenance.HYPOTHESIZED
         disp, reason = _apply_forge_guards(node, node_in.epistemic_state, node_in.authored_by, is_hypothesized)
+        # slug-collision detection (non-fatal, §1.4): two labels differing beyond separator/case that
+        # collapse onto the same node id are aliased silently. Surface a warning in the result; never
+        # change the id (identity must stay deterministic/stable) and never reject on it.
+        sig = _slug_signature(node.label)
+        prior = sig_by_id.setdefault(node.id, sig)
+        if prior != sig:
+            reason = (reason + ";" if reason else "") + "slug-collision-warning"
         # undeclared type -> quarantine bucket (never silently accepted)
         if node_types is not None and node.node_type not in node_types:
             disp = Disposition.QUARANTINED
@@ -315,6 +328,23 @@ def _slug_label(label: str) -> str:
     return slug(label)
 
 
+def _slug_signature(label: str) -> str:
+    """A finer, PRE-strip signature of a label, for non-fatal slug-collision DETECTION only.
+
+    slug() is deliberately non-injective on trailing/leading punctuation: slug('C++')==slug('C#')==
+    slug('C')=='c' (the run-collapse + strip('-') drops the edge marks). This signature mirrors slug()
+    up to but NOT including that lossy strip('-')/run-collapse, so labels that differ ONLY by an
+    internal separator/case still share a signature (slug's intended unification — 'a b'/'a-b'/'a/b'
+    all -> 'a-b'), while labels that differ by dropped edge punctuation get DIFFERENT signatures
+    ('C++'->'c-' vs 'C'->'c'). It is never written to the canon and never affects identity — it only
+    feeds a warning when two DISTINCT-signature labels in one payload collapse onto one node id.
+    """
+    import unicodedata
+    s = unicodedata.normalize("NFC", str(label)).strip().lower()
+    s = re.sub(r"[^\w\s-]", "-", s)
+    return re.sub(r"[\s_-]+", "-", s)
+
+
 def _verify_span(edge, check_span, sources, norm_source) -> str | None:
     """Span-present enforcement (§1.5): return a REJECTED reason string, or None when the span verifies.
 
@@ -376,11 +406,14 @@ def _validate_edge(edge_in, edge_types, norm_source, restore, seen, failure_ids,
     is_hypothesized = edge.provenance == Provenance.HYPOTHESIZED
 
     # reject a degenerate endpoint: an empty / whitespace / punctuation-only source, relation, or
-    # target has NO word character, so slug() falls back to the literal "node" and edge_id aliases
+    # target has NO content character, so slug() falls back to the literal "node" and edge_id aliases
     # distinct edges onto one canonical id/file (e.g. edge_id('', 'grounds', '') == edge_id('---',
-    # 'grounds', '---')). Reject before that aliasing can dedup-merge unrelated claims (§1.4).
+    # 'grounds', '---')). Underscore is a \w character but slug() maps `[\s_-]+`->`-` and strips it, so
+    # an underscore-only endpoint ('_' / '___') ALSO collapses to the "node" fallback — test for a
+    # real content character `[^\W_]` (word chars minus underscore) so bare underscores/separators
+    # don't sneak past. Reject before that aliasing can dedup-merge unrelated claims (§1.4).
     for role, value in (("source", edge.source), ("relation", edge.relation), ("target", edge.target)):
-        if not re.search(r"\w", value or "", re.UNICODE):
+        if not re.search(r"[^\W_]", value or "", re.UNICODE):
             return _ok("edge", edge, Disposition.REJECTED, f"empty-{role}", False, canonical_id)
 
     # clamp the confidence hint into [0,1]; drop NaN/inf so it can't poison downstream calibration

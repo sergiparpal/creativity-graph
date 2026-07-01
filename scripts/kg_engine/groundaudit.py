@@ -20,7 +20,7 @@ import json
 import os
 from pathlib import Path
 
-from .atomicio import _fsync_dir
+from .atomicio import _fsync_dir, atomic_write_text
 from .model import utcnow
 
 
@@ -34,6 +34,11 @@ class OrphanAuditError(RuntimeError):
 class GroundAuditLog:
     def __init__(self, path: "str | os.PathLike"):
         self.path = Path(path)
+        # The §1.8 spend-ledger checkpoint lives in a SEPARATE sidecar that is atomically OVERWRITTEN each
+        # sweep — never appended to the append-only forgery/verdict log. Appending a whole-ledger snapshot
+        # per session grew the log superlinearly and forced every fresh reconciler to re-parse it; the
+        # sidecar keeps checkpoint storage O(1) and leaves the log bounded by real verdict volume.
+        self.checkpoint_path = self.path.with_name(self.path.name + ".ckpt")
 
     def size(self) -> int:
         """Byte size of the log (0 only if genuinely absent). Captured BEFORE an append so
@@ -77,57 +82,52 @@ class GroundAuditLog:
         except OSError:
             return False
 
-    def append_checkpoint(self, consumed: dict, epistemic: dict) -> bool:
-        """Append a durable spend-ledger CHECKPOINT to the (append-only) audit log: a snapshot of the
-        reconciler's ``consumed`` tally and ``epistemic`` baseline at the end of a sweep.
+    def write_checkpoint(self, consumed: dict, epistemic: dict) -> bool:
+        """Atomically OVERWRITE the spend-ledger CHECKPOINT sidecar with a snapshot of the reconciler's
+        ``consumed`` tally and ``epistemic`` baseline at the end of a sweep.
 
-        The audit log is the trust ROOT (fsync'd, committed alongside the canon) — unlike the
-        ``.kg-reconcile-state.json`` cache, which is git-ignored and fails open to ``{}`` on loss. Without
-        a durable checkpoint, deleting that disposable cache resets ``consumed`` to empty while every
-        historical record survives, so a previously-grounded-then-demoted edge can be re-forged and slip
-        past the count check (§1.8). A checkpoint lets the reconciler RECOVER the spend ledger from the
-        trust root instead of replaying the whole log.
+        The checkpoint lets the reconciler RECOVER the spend ledger from a durable source instead of
+        replaying the whole log: the ``.kg-reconcile-state.json`` cache is git-ignored and fails open to
+        ``{}`` on loss, so without a durable checkpoint deleting that cache resets ``consumed`` to empty
+        while every historical record survives, letting a previously-grounded-then-demoted edge be
+        re-forged and slip past the count check (§1.8).
+
+        Written to a SEPARATE sidecar that is atomically overwritten each sweep — NOT appended to the
+        append-only audit log. Appending one whole-ledger snapshot per session grew the log
+        superlinearly and forced every fresh reconciler to re-parse it; overwriting a sidecar keeps
+        checkpoint storage O(1) and leaves the forgery/verdict records in the log entirely untouched, so
+        forge detection is unchanged. The atomic temp+replace means a crash mid-write leaves either the
+        old checkpoint or the new one, never a torn one.
 
         Best-effort (returns False on OSError): a missing checkpoint only costs the recovery, never breaks
         a sweep, and the next sweep re-checkpoints. A stale checkpoint is only ever safe-HIGH (over-strict
-        re-quarantine), never a missed forgery. The record carries an ``_ckpt`` marker the reader's pair
-        fold skips, so it never counts as a verdict transition. ``ensure_ascii=True`` keeps the log
-        pure-ASCII like ``append`` (non-ASCII ids survive as \\u escapes)."""
+        re-quarantine), never a missed forgery. The record carries an ``_ckpt`` marker for symmetry with
+        the reader. ``ensure_ascii=True`` keeps the sidecar pure-ASCII (non-ASCII ids survive as \\u
+        escapes)."""
         rec = {"_ckpt": 1, "consumed": consumed, "epistemic": epistemic, "at": utcnow()}
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            _fsync_dir(self.path.parent)
+            atomic_write_text(self.checkpoint_path, json.dumps(rec, ensure_ascii=True) + "\n")
             return True
         except OSError:
             return False
 
     def last_checkpoint(self) -> "dict | None":
-        """The most recent checkpoint's ``{'consumed': {...}, 'epistemic': {...}}``, or None if the log
-        has none (or is absent/unreadable). Scans the whole log — recovery-only, called when the reconcile
-        cache is missing — tolerating corrupt lines and a single undecodable byte (``errors='replace'``).
-        The LAST checkpoint wins (latest sweep)."""
+        """The checkpoint sidecar's ``{'consumed': {...}, 'epistemic': {...}}``, or None if the sidecar is
+        absent/unreadable/corrupt. Recovery-only, called when the reconcile cache is missing; tolerates a
+        single undecodable byte (``errors='replace'``) and a malformed body (returns None). The sidecar is
+        overwritten each sweep, so it always holds the LATEST checkpoint."""
         try:
-            blob = self.path.read_bytes()
+            blob = self.checkpoint_path.read_bytes()
         except (FileNotFoundError, OSError):
             return None
-        found = None
-        for line in blob.decode("utf-8", "replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(rec, dict) and "_ckpt" in rec:
-                found = rec
-        if found is None:
+        try:
+            rec = json.loads(blob.decode("utf-8", "replace"))
+        except ValueError:
             return None
-        consumed = found.get("consumed")
-        epistemic = found.get("epistemic")
+        if not isinstance(rec, dict) or "_ckpt" not in rec:
+            return None
+        consumed = rec.get("consumed")
+        epistemic = rec.get("epistemic")
         return {
             "consumed": consumed if isinstance(consumed, dict) else {},
             "epistemic": epistemic if isinstance(epistemic, dict) else {},

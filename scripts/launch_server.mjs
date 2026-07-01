@@ -45,11 +45,21 @@ const SCRIPTS = join(ROOT, "scripts");
 const BOOTSTRAP = join(SCRIPTS, "bootstrap.py");
 const dir = venvDir(ROOT);
 
-// A server that exits non-zero within this window of starting is treated as an early failure (an
-// import error against a half-built / just-updated venv) and triggers the one self-heal retry. This is
-// only the FALLBACK proxy for "died before serving init" — the authoritative signal is the engine's
-// readiness marker (below), consulted first.
-const EARLY_FAILURE_MS = 5000;
+// A server that exits within this window of starting WITHOUT having written its readiness marker is
+// treated as a startup failure (an import error against a half-built / just-updated venv) and triggers
+// the one self-heal retry. The AUTHORITATIVE signal is the engine's readiness marker (servedInit,
+// below), consulted FIRST — a crash with the marker present is post-init regardless of how long it ran.
+// This window is only the SECONDARY tie-breaker used when the marker is ABSENT: it is deliberately wide
+// so a slow-surfacing startup import failure (a cold machine / slow disk taking well over a second to
+// fault) still gets the heal instead of being misread as post-init. A marker-less post-init crash inside
+// the window is bounded by the MAX_RESTARTS crash-loop cap.
+const EARLY_FAILURE_MS = 20000;
+
+// Signals that mean the engine CRASHED (a hard fault), as opposed to a graceful terminate we or the OS
+// requested (SIGTERM/SIGINT). A crash signal during STARTUP (e.g. SIGSEGV/SIGABRT while importing against
+// a broken venv, before `initialize` is served) must NOT be mislabeled a clean exit — it has to fall
+// through to the startup self-heal path, exactly like a non-zero startup exit code.
+const CRASH_SIGNALS = new Set(["SIGSEGV", "SIGABRT", "SIGBUS", "SIGILL", "SIGFPE", "SIGKILL"]);
 
 // Interpreter-probe / bootstrap-check spawnSync timeout (review-low). On Windows the `py`/`python` App
 // Execution Alias stub can stall indefinitely; a timed-out probe is treated as "not found"/"not fresh".
@@ -143,13 +153,17 @@ export function restartDecision(
   if (shuttingDown) {
     return { action: "exit", code: 0, reason: "clean-exit" };
   }
-  // A clean exit otherwise: the child was signalled, or it returned a zero/empty code. Honor it — do NOT
-  // relaunch (no thrashing on a deliberate shutdown).
-  if (signal || !code) {
+  // A clean exit otherwise: a GRACEFUL terminate signal (SIGTERM/SIGINT that we did not flag as a
+  // shutdown, or the OS asked for), or a zero/empty exit code. Honor it — do NOT relaunch. A CRASH signal
+  // (SIGSEGV/SIGABRT/… — see CRASH_SIGNALS) is deliberately NOT short-circuited here: a hard fault during
+  // startup, before `initialize` is served, must fall through to the startup self-heal logic below, so it
+  // is handled just like a non-zero startup exit code instead of being mislabeled a clean exit.
+  if ((signal && !CRASH_SIGNALS.has(signal)) || (!signal && !code)) {
     return { action: "exit", code: signal ? 0 : code ?? 0, reason: "clean-exit" };
   }
-  // Died during STARTUP — i.e. WITHOUT having written its readiness marker AND within the wall-clock
-  // window (before serving the buffered `initialize`): self-heal in place.
+  // Died during STARTUP — i.e. WITHOUT having written its readiness marker (servedInit is the AUTHORITATIVE
+  // gate: absent ⇒ startup) AND within the wide EARLY_FAILURE_MS window (the marker-absent secondary
+  // tie-breaker, before serving the buffered `initialize`): self-heal in place.
   if (!servedInit && ranForMs < S.EARLY_FAILURE_MS) {
     // A near-instant non-zero exit looks like an import error against a half-built / just-updated venv
     // (the --check fast-path can pass on a stamp-fresh-but-broken venv): force ONE rebuild before retrying.

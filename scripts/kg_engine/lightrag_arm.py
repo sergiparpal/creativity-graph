@@ -44,6 +44,34 @@ from pathlib import Path
 # A marker LightRAG writes once a document has been indexed into a working_dir, so a second run loads
 # the cached index instead of re-extracting (which would re-spend LLM tokens on entity extraction).
 _INDEX_MARKER = "kv_store_full_docs.json"
+# A sidecar recording the source content signature the current index was built from. Keying the rebuild
+# decision only on _INDEX_MARKER's presence served a CHANGED source from a stale index; comparing this
+# signature forces a re-insert when the corpus content changed.
+_SIGNATURE_FILE = "kg_source_signature.json"
+
+
+def _source_signature(source_path: Path) -> str:
+    """A cheap ``(name, size, mtime_ns)`` content signature of the corpus, mirroring
+    ``sources.SourceSet.signature`` (no content read). ``st_mtime_ns`` is nanosecond-resolution so even a
+    same-second in-place edit invalidates it. A missing/unstat-able source yields a stable placeholder
+    rather than raising, so callers can compare freely."""
+    try:
+        st = source_path.stat()
+        return json.dumps([source_path.name, st.st_size, st.st_mtime_ns])
+    except OSError:
+        return json.dumps([source_path.name, None, None])
+
+
+def _needs_rebuild(working_dir: Path, source_path: Path) -> bool:
+    """Rebuild the index when it's ABSENT or the source's content signature changed since it was built.
+    A recorded signature that matches the current source means the cached index is fresh and reusable."""
+    if not (working_dir / _INDEX_MARKER).exists():
+        return True
+    try:
+        cached = (working_dir / _SIGNATURE_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return True  # index present but no recorded signature → treat as stale and rebuild
+    return cached != _source_signature(source_path)
 
 
 def _clean_env(key: str) -> str | None:
@@ -106,9 +134,12 @@ async def _answer_async(prompts: list[str], source_path: Path, working_dir: Path
     await rag.initialize_storages()
     await initialize_pipeline_status()
     try:
-        # build the index only the first time — a populated working_dir is reused as a cache
-        if not (working_dir / _INDEX_MARKER).exists():
+        # build the index the first time OR when the source content changed — a populated working_dir
+        # matching the recorded signature is reused as a cache; a changed source re-inserts (and the
+        # signature is re-recorded) so a stale index is never served.
+        if _needs_rebuild(working_dir, source_path):
             await rag.ainsert(text)
+            (working_dir / _SIGNATURE_FILE).write_text(_source_signature(source_path), encoding="utf-8")
         answers: list[str] = []
         for prompt in prompts:
             ans = await rag.aquery(prompt, param=QueryParam(mode=mode))

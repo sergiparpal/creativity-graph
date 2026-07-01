@@ -89,8 +89,13 @@ def atomic_write_bytes(
         if fsync_dir:
             _fsync_dir(path.parent)  # make the rename itself durable, not just the contents
     finally:
+        # Best-effort cleanup: a failing unlink on the write-failure path (e.g. tmp already gone, or a
+        # transient Windows sharing violation) must NOT mask the true exception propagating from the try.
         if os.path.exists(tmp):
-            os.unlink(tmp)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def atomic_write_text(

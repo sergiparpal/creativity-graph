@@ -30,7 +30,13 @@ from pathlib import Path
 import networkx as nx
 
 from .graphio import node_attr, node_link_graph
-from .model import edge_id
+from .model import FAILURE_STATES, edge_id
+
+# The edge epistemic_state string values the generators must treat as NON-live (§1.7). Generators build
+# their adjacency/undirected topology over the SAME failure-EXCLUDED subgraph that node ranks were
+# computed over (projector._live_subgraph): a `failed`/`rejected` edge is negative information — it must
+# never seed a spurious shared-neighbour bridge/seed/periphery candidate or inflate absorption density.
+_FAILURE_VALUES = {s.value for s in FAILURE_STATES}
 
 # The mechanism vocabulary. The DEFAULT_SET is what `/kg-generate` runs unless the user opts into all
 # six (PLAN Stage 6 non-blocking survey). "all" runs ALL_SET.
@@ -128,10 +134,21 @@ def _pair_specificity(G, a, b) -> float:
     return min(float(_attr(G, a, "specificity", 1.0)), float(_attr(G, b, "specificity", 1.0)))
 
 
+def _live_undirected(G):
+    """Undirected projection with `failed`/`rejected` edges excluded (§1.7), mirroring
+    projector._live_subgraph so generators walk the SAME live topology their node ranks were computed
+    over. Nodes are all kept (an attacked hub whose edges are all refuted still appears at degree 0)."""
+    live = nx.MultiDiGraph()
+    live.add_nodes_from(G.nodes(data=True))
+    live.add_edges_from((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)
+                        if d.get("epistemic_state") not in _FAILURE_VALUES)
+    return live.to_undirected()
+
+
 def _undirected_adjacency(G) -> dict:
     adj: dict = defaultdict(set)
-    for u, v in G.edges():
-        if u != v:
+    for u, v, st in G.edges(data="epistemic_state"):
+        if u != v and st not in _FAILURE_VALUES:  # failure memory is not live topology (§1.7)
             adj[u].add(v)
             adj[v].add(u)
     return adj
@@ -156,10 +173,10 @@ def _shared(G, und, adj):
     """Resolve the per-run shared structures (perf #12). On a full `kg_generate('all')` run the
     undirected projection of G and its adjacency map are rebuilt once in `run_generators` and threaded
     through; called standalone each mechanism passes None and builds them lazily here. The lazily-built
-    values are byte-for-byte identical to the threaded ones — same `G.to_undirected()` /
+    values are byte-for-byte identical to the threaded ones — same `_live_undirected(G)` /
     `_undirected_adjacency(G)` constructors — so output never changes either way."""
     if und is None:
-        und = G.to_undirected()
+        und = _live_undirected(G)
     if adj is None:
         adj = _undirected_adjacency(G)
     return und, adj
@@ -280,7 +297,7 @@ def compression(G, *, pack, corpus, failures, k=10, und=None) -> list:
     cluster is not vague (mean member specificity ≥ the graph-wide mean specificity). The label is left BLANK for the
     language layer (Stage 6) to name. Members are carried in the rationale."""
     if und is None:
-        und = G.to_undirected()
+        und = _live_undirected(G)
     mean_spec = _mean_specificity(G)
     by_comm = _members_by_community(G)
     N = max(G.number_of_nodes(), 2)
@@ -314,7 +331,7 @@ def regroup(G, *, pack, corpus, failures, k=10, und=None, adj=None, new_comm=_UN
     before but becomes cross-community under the new partition is a bridge that "was invisible under the
     prior partition." This is the generative use of the freedom of resolution."""
     if und is None:
-        und = G.to_undirected()
+        und = _live_undirected(G)
     # perf #13 — the Leiden re-partition is the expensive step. On a full `kg_generate('all')` run it
     # is computed once in `run_generators` and threaded in (regroup AND ensemble's degraded path share
     # it), so Leiden runs once per run instead of twice. `_UNSET` vs None: see the sentinel def — a real
@@ -366,7 +383,7 @@ def transplant(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
     if G.number_of_nodes() < 4:
         return []
     if und is None:
-        und = G.to_undirected()  # hoisted once: absorption() reads its neighbours m times per call (perf)
+        und = _live_undirected(G)  # hoisted once: absorption() reads its neighbours m times per call (perf)
     by_comm = _members_by_community(G)
     if len([c for c in by_comm if c != NO_COMMUNITY]) < 2:
         return []
@@ -412,7 +429,11 @@ def transplant(G, *, pack, corpus, failures, k=10, und=None, adj=None) -> list:
         if _is_failure(failures, hub, dominant_relation, target_node):
             continue
         spec = _pair_specificity(G, hub, target_node)
-        score = float(_attr(G, hub, "degree", 0)) * best_absorption
+        # hub.degree * best_absorption is loop-INVARIANT across targets, so on its own every candidate
+        # ties and _rank collapses to target-id order — discarding the degree-desc intent the emit order
+        # already encodes. Fold in a per-target signal (the target's own live degree, +1 so a degree-0
+        # target still scores) so a higher-degree target genuinely outranks a lower-degree one (review).
+        score = float(_attr(G, hub, "degree", 0)) * best_absorption * (float(_attr(G, target_node, "degree", 0)) + 1.0)
         cands.append(_edge_cand(
             "transplant", hub, target_node, dominant_relation, score=score, specificity=spec, section="§5",
             rationale=(f"macro-bridge: transplant hub '{_attr(G, hub, 'label', hub)}' (c{hub_comm}, "
@@ -594,7 +615,7 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
     def und_of():
         nonlocal _shared_und
         if _shared_und is None:
-            _shared_und = G.to_undirected()
+            _shared_und = _live_undirected(G)
         return _shared_und
 
     def adj_of():
@@ -614,30 +635,43 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
             _shared_repart = _repartition(und_of(), resolution=4.0, seed=7)
         return _shared_repart
 
+    # Run every mechanism at a k large enough that NOTHING is truncated (its full pre-truncation
+    # candidate list), then surface only that mechanism's own top-k. `_BIG_K` >= any mechanism's
+    # candidate count (edge mechanisms are O(V^2); node/periphery/transplant are O(V)). Slicing a
+    # full ranked list to k is byte-identical to calling the mechanism with k (_rank sorts then
+    # truncates), so the SURFACED slate is unchanged — but the retained full lists let the convergence
+    # tally (below) count a pair proposed by two mechanisms even when it fell off ONE mechanism's top-k
+    # (review: convergence undercount).
+    _BIG_K = G.number_of_nodes() ** 2 + G.number_of_nodes() + 1
     out: list = []
+    full: list = []  # every mechanism's PRE-truncation candidate list — feeds the convergence tally only
     for m in mechs:
         # Each branch mirrors that mechanism's keyword-only signature, threading only the lazy thunks it
         # accepts (perf #12/#13). The ladder covers all six distinct _DISPATCH functions exhaustively.
         fn = _DISPATCH[m]
         if fn is bridge:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, adj=adj_of())
+            produced = fn(G, pack=pack, corpus=corpus, failures=failures, k=_BIG_K, adj=adj_of())
         elif fn is seed:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(), adj=adj_of())
+            produced = fn(G, pack=pack, corpus=corpus, failures=failures, k=_BIG_K, und=und_of(), adj=adj_of())
         elif fn is compression:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of())
+            produced = fn(G, pack=pack, corpus=corpus, failures=failures, k=_BIG_K, und=und_of())
         elif fn is regroup:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(),
-                      adj=adj_of(), new_comm=repart_of())
+            produced = fn(G, pack=pack, corpus=corpus, failures=failures, k=_BIG_K, und=und_of(),
+                          adj=adj_of(), new_comm=repart_of())
         elif fn is transplant:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, und=und_of(), adj=adj_of())
+            produced = fn(G, pack=pack, corpus=corpus, failures=failures, k=_BIG_K, und=und_of(), adj=adj_of())
         elif fn is ensemble:
             # Only force the (lazy) re-partition for the degraded path; with a real second_graph
             # ensemble takes the exo path and never consults new_comm, so leave it unforced (_UNSET).
             ens_repart = repart_of() if second_graph is None else _UNSET
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, second_graph=second_graph,
-                      und=und_of(), adj=adj_of(), new_comm=ens_repart)
+            produced = fn(G, pack=pack, corpus=corpus, failures=failures, k=_BIG_K, second_graph=second_graph,
+                          und=und_of(), adj=adj_of(), new_comm=ens_repart)
         elif fn is periphery:
-            out += fn(G, pack=pack, corpus=corpus, failures=failures, k=k, adj=adj_of())
+            produced = fn(G, pack=pack, corpus=corpus, failures=failures, k=_BIG_K, adj=adj_of())
+        else:  # unreachable — the ladder is exhaustive over _DISPATCH; defensive only
+            produced = []
+        full += produced
+        out += produced[: max(0, int(k))]  # the SURFACED slate: this mechanism's own top-k (unchanged)
     # Dedup EDGE candidates across mechanisms by (source, target, relation) — the triple the canonical
     # edge_id derives from (review-low): with `second_graph=None`, ensemble degrades to regroup and
     # re-emits the SAME edges under a second mechanism name; other mechanisms can also independently
@@ -660,17 +694,20 @@ def run_generators(G, mechanism="bridge", *, pack=None, corpus=None, failures=No
         return (c.source, c.target, c.relation)
 
     # convergence (§4 advisory): tally how many DISTINCT mechanisms independently proposed each edge key
-    # BEFORE the dedup discards the duplicates' signal. The degraded-ensemble path (second_graph=None)
-    # re-emits regroup's edges under a SECOND name — but that is the SAME construction, not a second
-    # independent one, so collapse `ensemble`→`regroup` for the tally; otherwise the degrade path would
-    # spuriously inflate convergence to 2 on every regroup edge (asserted in a test). This is computed
-    # purely from mechanism agreement on STRUCTURE — no text, no span, no verdict — and only ever rides
-    # the response / queue ordering, never `score` and never a canon edge (G3/G4).
+    # BEFORE the dedup discards the duplicates' signal. The tally runs over `full` — each mechanism's
+    # PRE-truncation candidate list — NOT the surfaced top-k slate: a pair proposed by two mechanisms but
+    # dropped from one mechanism's own top-k would otherwise be undercounted (review). The
+    # degraded-ensemble path (second_graph=None) re-emits regroup's edges under a SECOND name — but that
+    # is the SAME construction, not a second independent one, so collapse `ensemble`→`regroup` for the
+    # tally; otherwise the degrade path would spuriously inflate convergence to 2 on every regroup edge
+    # (asserted in a test). This is computed purely from mechanism agreement on STRUCTURE — no text, no
+    # span, no verdict — and only ever rides the response / queue ordering, never `score` and never a
+    # canon edge (G3/G4).
     degraded_ensemble = second_graph is None
     def _conv_mech(c):
         return "regroup" if (degraded_ensemble and c.mechanism == "ensemble") else c.mechanism
     mech_by_key: dict = defaultdict(set)
-    for c in out:
+    for c in full:
         if c.kind == "edge":
             mech_by_key[_edge_key(c)].add(_conv_mech(c))
 

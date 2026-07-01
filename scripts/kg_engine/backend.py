@@ -423,6 +423,25 @@ class BackendExtractor:
 # --------------------------------------------------------------------------- CLI
 
 
+def _exit_code(out: dict) -> int:
+    """Map a run summary to a process exit code so CI never goes green on a degenerate build.
+
+    Non-zero when: (a) any section failed; (b) the resulting graph is edgeless — a run where every edge
+    was REJECTED still lands nodes with NO rollback, so `failed_sections` alone would let CI pass on a
+    graph with no relations (`metrics.edges` is the honest post-run edge count); or (c) the run wrote
+    nothing (zero ACCEPTED/DEMOTED) while items were REJECTED/QUARANTINED."""
+    if out.get("failed_sections"):
+        return 1
+    if not (out.get("metrics") or {}).get("edges"):
+        return 1  # edgeless/degenerate graph: no relations landed
+    disp = out.get("dispositions") or {}
+    written = disp.get("ACCEPTED", 0) + disp.get("DEMOTED", 0)
+    blocked = disp.get("REJECTED", 0) + disp.get("QUARANTINED", 0)
+    if written == 0 and blocked > 0:
+        return 1  # nothing accepted while items were rejected/quarantined
+    return 0
+
+
 def _build_engine(args: argparse.Namespace) -> KGEngine:
     # CLI flags override env, but pack auto-discovery, sensitivity/metrics, and the flood rate limit
     # all resolve through the single shared builder so the headless path never diverges from the server.
@@ -452,9 +471,9 @@ def main(argv: list[str] | None = None) -> int:
     extractor = BackendExtractor(engine, model=args.model, max_tokens=args.max_tokens)
     out = extractor.run()
     print(json.dumps(out, indent=2))
-    # The derived layer is already projected (run() does it in a finally); a non-zero exit only
-    # signals that some sections failed so a CI run doesn't go green on a partial extraction.
-    return 1 if out.get("failed_sections") else 0
+    # The derived layer is already projected (run() does it in a finally); a non-zero exit signals a
+    # failed section OR a degenerate (edgeless / all-rejected) build so CI doesn't go green on it.
+    return _exit_code(out)
 
 
 if __name__ == "__main__":

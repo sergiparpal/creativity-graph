@@ -48,9 +48,11 @@ class Reconciler:
         self.canon = canon
         self.state_path = Path(state_path) if state_path else (canon.root / ".kg-reconcile-state.json")
         self.audit_path = canon.root / GROUND_AUDIT
-        # The audit log is the durable trust root; this seam appends/reads the §1.8 spend-ledger
-        # checkpoint that lets a sweep RECOVER `consumed`/`epistemic` after the disposable reconcile-state
-        # cache is lost (the incremental count fold below reads the bytes directly for its offset cache).
+        # The audit log is the durable trust root; this seam reads it for forge detection and owns the
+        # §1.8 spend-ledger checkpoint SIDECAR that lets a sweep RECOVER `consumed`/`epistemic` after the
+        # disposable reconcile-state cache is lost. The checkpoint is written to a separate, atomically
+        # OVERWRITTEN sidecar (not appended to the append-only log) so the log stays bounded by real
+        # verdict volume (the incremental count fold below reads the log bytes for its offset cache).
         self._ground_audit = GroundAuditLog(self.audit_path)
         # In-process incremental-fold cache for the append-only audit log (reconciler-18). The audit log
         # is read+parsed in full on every sweep and grows unbounded; folding only the NEW bytes since the
@@ -360,26 +362,31 @@ class Reconciler:
                 live_files.add(rel)
                 continue  # leave its file_state untouched so it's retried next scan
 
-            # A re-quarantine is a read->mutate->write; the reconciler holds no lease across it, so a
-            # concurrent kg_ground (separate process) could ground a SIBLING edge on this same node
-            # between our read and our write and our stale in-memory copy would clobber that verdict
-            # (lost update, reconciler-M2). Take the lease for the critical section and decide on a FRESH
-            # read under it — mirroring kg_ground's read-under-lease discipline — so we reset only what
-            # is STILL forged and never drop a concurrently-applied sibling verdict. If the lease can't
-            # be taken (another live writer), fall back to the snapshot read: correctness is unchanged
-            # (any clobbered verdict is re-applied by its own kg_ground; this note retries next sweep),
-            # and single-process callers (the lease is free) always take the fast lease path.
+            # A re-quarantine is a read->mutate->write; the reconciler holds no lease across the sweep, so
+            # a concurrent kg_ground (separate process) could ground a SIBLING edge on this same note
+            # between our read and our write, and a stale in-memory copy written back would silently
+            # clobber that verdict (lost update, reconciler-M3/M2). Take the lease for the critical
+            # section and decide on a FRESH read under it — mirroring kg_ground's read-under-lease
+            # discipline — so we reset only what is STILL forged and never drop a concurrently-applied
+            # sibling verdict. If the lease CANNOT be taken (another live writer), do NOT mutate+write the
+            # stale snapshot at all: skip this note (keep it live so the prune doesn't reap it, and carry
+            # its snapshot keys so the epistemic baseline survives) and retry under the lease on the next
+            # sweep. Only the lease-held FRESH read is ever mutated and written; single-process callers
+            # (the lease is free) always take the fast lease path.
             locked = self.canon.try_acquire_lock()
+            if not locked:
+                live_files.add(rel)
+                live_keys.update(self._node_keys(node))  # snapshot keys keep the baseline; retry next sweep
+                continue
             try:
-                if locked:
-                    try:
-                        node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
-                    except OSError:
-                        live_files.add(rel)  # vanished/unreadable under the lease; retry next sweep
-                        continue
-                    except Exception:  # noqa: BLE001 — became malformed; no parseable keys, retry next
-                        live_files.add(rel)
-                        continue
+                try:
+                    node = node_from_markdown(p.read_text(encoding="utf-8"), fallback_id=p.stem)
+                except OSError:
+                    live_files.add(rel)  # vanished/unreadable under the lease; retry next sweep
+                    continue
+                except Exception:  # noqa: BLE001 — became malformed; no parseable keys, retry next
+                    live_files.add(rel)
+                    continue
                 mutated = self._requarantine_forged(node, epistemic, consumed, audit, report)
 
                 if mutated:
@@ -399,8 +406,7 @@ class Reconciler:
                         live_files.add(rel)  # vanished right after our write; cache it next sweep
                         continue
             finally:
-                if locked:
-                    self.canon._release_lock()
+                self.canon._release_lock()
             keys = self._node_keys(node)
             files_state[rel] = self._file_record(st, digest, keys)
             live_files.add(rel)
@@ -436,15 +442,17 @@ class Reconciler:
 
         self._save_state({"files": files_state, "epistemic": epistemic, "consumed": consumed})
 
-        # Durably checkpoint the spend ledger into the append-only audit log (the trust root) so a later
-        # loss of the disposable reconcile-state cache can RECOVER it (above) instead of replaying every
-        # historical record (§1.8). A full sweep is a consistent snapshot of every live key, so checkpoint
-        # there; scan() runs full_sweep per session, keeping growth to ~one record per session. Gated on
-        # the lease (the audit log is lease-guarded like every writer) and best-effort: a busy lease or a
-        # failed append just defers to the next sweep, and a stale checkpoint is only ever safe-high.
+        # Durably checkpoint the spend ledger to the OVERWRITTEN sidecar (not the append-only log) so a
+        # later loss of the disposable reconcile-state cache can RECOVER it (above) instead of replaying
+        # every historical record (§1.8). Overwriting each sweep (rather than appending one whole-ledger
+        # snapshot per session to the log) keeps the checkpoint storage O(1) and the audit log bounded by
+        # real verdict volume. A full sweep is a consistent snapshot of every live key, so checkpoint
+        # there; scan() runs full_sweep per session. Gated on the lease (consistent with every writer) and
+        # best-effort: a busy lease or a failed write just defers to the next sweep, and a stale
+        # checkpoint is only ever safe-high.
         if full_sweep and self.canon.try_acquire_lock():
             try:
-                self._ground_audit.append_checkpoint(consumed, epistemic)
+                self._ground_audit.write_checkpoint(consumed, epistemic)
             except Exception:  # noqa: BLE001 — checkpointing must never break the sweep
                 pass
             finally:
