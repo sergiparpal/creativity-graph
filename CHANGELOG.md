@@ -12,7 +12,7 @@ NetworkX/SQLite **derived** layer. The deterministic Python engine (`scripts/kg_
 hard guarantees; the Claude Code session and its subagents do the language work and hand structured
 JSON back across the MCP boundary.
 
-## [0.6.0] — 2026-06-30
+## [0.6.0] — 2026-07-01
 
 Three additions, all **below the grounding boundary** — additive, backward-compatible, and respecting
 every anti-nonsense invariant (no forged verdicts, no span-less written edges, no composite scalar,
