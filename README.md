@@ -1,5 +1,7 @@
 # creativity-graph
 
+![rhizome-sprouts.jpg](rhizome-sprouts.jpg)
+
 A Claude Code plugin that turns a *non-self-grounding* conceptual document into a
 **grounded, queryable knowledge graph** — a human-editable canon with three-axis provenance,
 a span-present write boundary, a grounding loop with memory of failures, and a regenerable
