@@ -1,6 +1,6 @@
 # Sproutgraph
 
-![rhizome-sprouts.jpg](rhizome-sprouts.jpg)
+![rhizome-sprouts.jpg](images/rhizome-sprouts.jpg)
 
 A Claude Code plugin that turns a *non-self-grounding* conceptual document into a
 **grounded, queryable knowledge graph** — a human-editable canon with three-axis provenance,
