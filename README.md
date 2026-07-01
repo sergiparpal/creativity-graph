@@ -1,4 +1,4 @@
-# creativity-graph
+# Sproutgraph
 
 ![rhizome-sprouts.jpg](rhizome-sprouts.jpg)
 
