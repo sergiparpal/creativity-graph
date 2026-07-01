@@ -1,7 +1,7 @@
 ---
 description: Generate hypothesized idea candidates from the graph's structure (bridge|seed|compression|regroup|transplant|ensemble|periphery), phrase them via the language layer, and write them to the hypothesized lane — then hand off to /kg-ground as the filter.
 argument-hint: "[mechanism-set] [k]"
-allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_generate, mcp__plugin_creativity-graph_creativity-graph__kg_propose, mcp__plugin_creativity-graph_creativity-graph__kg_operate, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_absorption
+allowed-tools: Task, Bash, mcp__plugin_sproutgraph_sproutgraph__kg_generate, mcp__plugin_sproutgraph_sproutgraph__kg_propose, mcp__plugin_sproutgraph_sproutgraph__kg_operate, mcp__plugin_sproutgraph_sproutgraph__kg_context, mcp__plugin_sproutgraph_sproutgraph__kg_metrics, mcp__plugin_sproutgraph_sproutgraph__kg_absorption
 ---
 
 # /kg-generate — the generative layer (PLAN Stages 3–6)
@@ -22,7 +22,7 @@ grounder supplies a span or citation (which *upgrades* its provenance) — see `
 
 ## Step 0 — confirm a graph exists
 
-Call `mcp__plugin_creativity-graph_creativity-graph__kg_context(budget=2000)`. If `items[]` **and**
+Call `mcp__plugin_sproutgraph_sproutgraph__kg_context(budget=2000)`. If `items[]` **and**
 `advisory.bridge_metric.nodes[]` are both empty, there is no graph to generate from — tell the user to run
 `/kg-build` → `/kg-ground` first, and stop. Otherwise note `advisory.bridge_metric.gate_on` (whether
 specificity-weighted betweenness is the trusted bridge signal this projection) and carry it into the report.
@@ -43,7 +43,7 @@ This is a **non-blocking checkpoint**: invite a reply, but never make progress c
 
 ## Step 2 — generate the structural candidates (read-only)
 
-Call `mcp__plugin_creativity-graph_creativity-graph__kg_generate(mechanism=<chosen>, k=<k>)` (use
+Call `mcp__plugin_sproutgraph_sproutgraph__kg_generate(mechanism=<chosen>, k=<k>)` (use
 `mechanism="all"` for the full set; it runs the default set on `"default"`). It returns
 `{mechanism, k, gate_on, count, candidates[], note}`. Each candidate carries
 `{kind, mechanism, source, target, relation, label, node_type, score, specificity, rationale, section, convergence}`.
@@ -74,7 +74,7 @@ Task(subagent_type: "kg-generator", description: "Phrase + label candidates", pr
 
 The kg-generator owns `kg_propose`; it writes the hypothesized lane. (For purely structural ops —
 collapse/explode/regroup/open — you may instead call
-`mcp__plugin_creativity-graph_creativity-graph__kg_operate` directly; it also routes through the propose lane.)
+`mcp__plugin_sproutgraph_sproutgraph__kg_operate` directly; it also routes through the propose lane.)
 
 ## Step 4 — record the generation (for the absorption window, §14)
 
@@ -102,7 +102,7 @@ Present a ranked **idea slate** to the user, one row per accepted candidate:
 | 1 | seed      | §3| Betweenness and memory-of-failures may be abnormally connectable … | 1.83 | hypothesized |
 ```
 
-Then call `mcp__plugin_creativity-graph_creativity-graph__kg_metrics` and report the new
+Then call `mcp__plugin_sproutgraph_sproutgraph__kg_metrics` and report the new
 `edges_by_epistemic_state` — the hypothesized candidates show up under `unverified`. State `gate_on` from
 Step 0 (was the slate ranked by the confound-corrected `spec_betweenness` or the honest fallback?).
 

@@ -1,7 +1,7 @@
 ---
 name: kg-evaluator
 description: Run the blind four-condition ideation experiment (CONTROL vs GRAPH vs GRAPH+GENERATE vs RAG) over fixed prompts from the domain and emit the JSON that `python -m kg_engine.harness ideation` scores. Use when you need to know whether the graph — and the generative layer on top of it — actually helps ideation without smuggling in unsupported claims (§Stage 8/9).
-tools: Read, Grep, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph
+tools: Read, Grep, Bash, mcp__plugin_sproutgraph_sproutgraph__kg_context, mcp__plugin_sproutgraph_sproutgraph__query_graph
 ---
 
 You are **kg-evaluator**. You run a controlled, *blind* experiment that answers two questions:
@@ -23,8 +23,8 @@ GRAPH+GENERATE, then all RAG — never interleave, and never let a later conditi
 
 | condition | grounding source | rule |
 |-----------|------------------|------|
-| **control** | none | Answer from the prompt alone. No `mcp__plugin_creativity-graph_creativity-graph__kg_context`, no `examples/source.md`, no graph. Pure model prior. |
-| **graph** | `mcp__plugin_creativity-graph_creativity-graph__kg_context` `items[]` (+ the `advisory.signal:"structural-bridge"` hint) | Ground every idea in the returned **grounded** `items[]` edges and `advisory.nodes[]`. You MAY also call `query_graph` to expand. |
+| **control** | none | Answer from the prompt alone. No `mcp__plugin_sproutgraph_sproutgraph__kg_context`, no `examples/source.md`, no graph. Pure model prior. |
+| **graph** | `mcp__plugin_sproutgraph_sproutgraph__kg_context` `items[]` (+ the `advisory.signal:"structural-bridge"` hint) | Ground every idea in the returned **grounded** `items[]` edges and `advisory.nodes[]`. You MAY also call `query_graph` to expand. |
 | **graph+generate** | the same call's `items[]` **plus** its `hypotheses[]` (the unverified slate) | Ground each idea in the grounded `items[]` AND the hypothesized proposals — clearly treated as *unverified candidates*. Tests whether *generating* lifts ideation beyond grounded context alone (Stage 9). |
 | **rag** | flat retrieval over `examples/source.md` | Grep/read the raw source as undifferentiated text. NO graph structure: no epistemic_state, no bridges, no falsification counters, no degree. Just the prose. |
 | **lightrag** *(optional, off by default)* | a real LightRAG GraphRAG index over the **same** `examples/source.md` | Build/query a published GraphRAG baseline through its OWN retrieval. Same prose corpus as `rag`, structure-blind to OUR graph: it never reads our canon's epistemic_state, bridges, falsification counters, degree, or any `kg_*` output. Run **only** when available (see "The optional lightrag arm" below); otherwise OMIT the key entirely. |
@@ -53,7 +53,7 @@ PYTHONPATH="$SCRIPTS" "$PY" -m kg_engine.lightrag_arm check    # -> {"available"
   isolated helper build/load the index over `examples/source.md` **once** and answer every prompt:
   ```bash
   PYTHONPATH="$SCRIPTS" "$PY" -m kg_engine.lightrag_arm answer \
-      --source /home/sergi/creativity-graph/examples/source.md \
+      --source /home/sergi/Sproutgraph/examples/source.md \
       --prompts prompts.json --out lightrag_answers.json    # -> {"answers": ["...", ...]}
   ```
   Read `lightrag_answers.json` (`answers[k]` is the response to prompt `k`, same order as every other arm)
@@ -110,10 +110,10 @@ Confirm the graph is reachable before you start:
 
 ```bash
 # dev: repo venv; runtime: ${CLAUDE_PLUGIN_DATA}/.venv/bin/python with PYTHONPATH=${CLAUDE_PLUGIN_ROOT}/scripts
-/home/sergi/creativity-graph/.venv/bin/python -c "import json,sys" 2>/dev/null
+/home/sergi/Sproutgraph/.venv/bin/python -c "import json,sys" 2>/dev/null
 ```
 
-and probe the surface with `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=None, budget=2000)`. If `items`
+and probe the surface with `mcp__plugin_sproutgraph_sproutgraph__kg_context(query=None, budget=2000)`. If `items`
 is empty, the graph has not been built — report that and stop (CONTROL/RAG would still run, but the
 experiment is pointless with no graph).
 
@@ -159,7 +159,7 @@ GRAPH+GENERATE.
 
 ## Procedure
 
-1. **Read the source.** `Read /home/sergi/creativity-graph/examples/source.md` once. You need its
+1. **Read the source.** `Read /home/sergi/Sproutgraph/examples/source.md` once. You need its
    full text for the `source` field and to keep your GRAPH/RAG ideas anchored in real vocabulary
    (compression, generality confound, span-present, betweenness, specificity, bridges, falsification,
    canon, projection). This is also the RAG corpus.
@@ -170,7 +170,7 @@ GRAPH+GENERATE.
 3. **CONTROL pass.** For each prompt, answer 2-4 sentences from the model prior only. Do NOT open
    any tool or file. Collect into `outputs.control` in order.
 
-4. **GRAPH pass.** For each prompt: call `mcp__plugin_creativity-graph_creativity-graph__kg_context(query="<prompt keyword>")`
+4. **GRAPH pass.** For each prompt: call `mcp__plugin_sproutgraph_sproutgraph__kg_context(query="<prompt keyword>")`
    (optionally `query_graph(relation=..., epistemic_state="grounded")` to expand). Ground each idea
    in returned `items[]` edges / `advisory.nodes[]`. Obey the anti-smuggling invariant. Collect into
    `outputs.graph`.

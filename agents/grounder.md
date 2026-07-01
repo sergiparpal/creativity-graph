@@ -1,7 +1,7 @@
 ---
 name: kg-grounder
 description: Use to verify the queue of unverified edges against the real source — re-read each cited span, reject vague/unfalsifiable relations (the generality confound §1.6), and stamp grounded/rejected verdicts via kg_ground.
-tools: Read, Grep, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__get_node, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__kg_ground
+tools: Read, Grep, mcp__plugin_sproutgraph_sproutgraph__query_graph, mcp__plugin_sproutgraph_sproutgraph__get_node, mcp__plugin_sproutgraph_sproutgraph__kg_context, mcp__plugin_sproutgraph_sproutgraph__kg_ground
 model: opus
 ---
 
@@ -21,12 +21,12 @@ adversarial judgments (does this span *specifically* support the relation, or is
 
 ## The ONLY verdict path
 
-`mcp__plugin_creativity-graph_creativity-graph__kg_ground` is the **only** way to set an epistemic verdict (§1.4/§1.8). You may not
+`mcp__plugin_sproutgraph_sproutgraph__kg_ground` is the **only** way to set an epistemic verdict (§1.4/§1.8). You may not
 edit canon files, and an extractor may not pre-assert a verdict (the boundary strips forged verdicts → DEMOTED).
 Verdicts flow through this one tool and nowhere else.
 
 ```
-mcp__plugin_creativity-graph_creativity-graph__kg_ground(
+mcp__plugin_sproutgraph_sproutgraph__kg_ground(
   target_id = "<edge.id>",       # the deterministic edge id, see below
   verdict   = "grounded" | "rejected",   # (failed/obsolete exist but are the ADVERSARIAL grounder's job, not yours)
   kind      = "edge",
@@ -83,12 +83,12 @@ Never construct an id by hand and hope. **Read the `id` field off the edge dict*
 
 ## Inputs
 
-- The edge queue, from `mcp__plugin_creativity-graph_creativity-graph__query_graph(epistemic_state="unverified", limit=50)`
+- The edge queue, from `mcp__plugin_sproutgraph_sproutgraph__query_graph(epistemic_state="unverified", limit=50)`
   → `{nodes[], edges[]}`. **Note:** `query_graph` applies `epistemic_state` only to the returned `nodes[]`; the
   `edges[]` are filtered only by `relation`/`limit`, so select the edges whose `epistemic_state == "unverified"`
   yourself. Each edge carries: `id, source, target, relation, span, provenance, authored_by,
   epistemic_state, confidence, confidence_score`.
-- Triage signal, from `mcp__plugin_creativity-graph_creativity-graph__kg_context(budget=2000)` → `items[]`,
+- Triage signal, from `mcp__plugin_sproutgraph_sproutgraph__kg_context(budget=2000)` → `items[]`,
   `falsification_counters.failed_or_rejected_edges` (the running tally of negative information, §1.7),
   and `advisory` (if `signal == "structural-bridge"`, those `nodes[]` are likely generic hubs — scrutinize
   their incident edges hardest; a vague hub is the generality confound in action, §1.6).

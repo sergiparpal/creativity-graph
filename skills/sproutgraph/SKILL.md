@@ -1,5 +1,5 @@
 ---
-name: creativity-graph
+name: sproutgraph
 description: >-
   Turn a non-self-grounding conceptual document into a grounded, queryable knowledge graph.
   Use this when the user wants to build, ground, query, evaluate, or experiment over a
@@ -9,7 +9,7 @@ description: >-
   document, build the graph, ground the graph, query the graph, falsification, span-present.
 ---
 
-# creativity-graph — operating guide
+# Sproutgraph — operating guide
 
 A conceptual document does not verify itself the way code verifies against a parse tree
 (`examples/source.md` §intro). A naive extractor turns such prose into convincing nonsense.
@@ -80,7 +80,7 @@ afterward. The portico moved from the door of imagination to after generation.
 | `/kg-eval` | `kg-annotator` | `f4_probe.py`, `kg_engine.harness`, `query_graph` |
 | `/kg-experiment` | `kg-evaluator` | `kg_engine.harness ideation` |
 
-The MCP server is named `creativity-graph`; tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`.
+The MCP server is named `sproutgraph`; tools are namespaced `mcp__plugin_sproutgraph_sproutgraph__<tool>`.
 The sixteen read/write/ground tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_merge`,
 `kg_metrics`, `kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path` — the
 read-only grounded-only associative chain, `kg_context`, `kg_agenda` — the read-only structural agenda,
@@ -110,7 +110,7 @@ hypothesized write lane; `kg_generate` — the discovery mechanisms; `kg_operate
    pruned, surfaced in `kg_context.falsification_counters.failed_or_rejected_edges`. The
    adversarial grounder *creates* this signal via `attacked_by` edges plus
    `kg_ground(verdict="failed")`. A graph that forgets its mistakes drifts into nonsense.
-5. **egress scrub (§1.9).** `mcp__plugin_creativity-graph_creativity-graph__kg_scrub(text)` redacts secrets (always) plus
+5. **egress scrub (§1.9).** `mcp__plugin_sproutgraph_sproutgraph__kg_scrub(text)` redacts secrets (always) plus
    PII (per `sensitivity`) with CONSISTENT placeholders (`⟦SECRET:1⟧` etc.) *before* text is handed
    to a subagent; `kg_write` then RESTORES placeholder spans to the ORIGINAL text so the canon
    stores the restored original span. On the no-PII demo source it is a no-op (0 redactions).

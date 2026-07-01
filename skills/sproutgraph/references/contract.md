@@ -4,11 +4,11 @@ The precise specification the extractor and grounders bind to. This mirrors the 
 (`scripts/kg_engine/boundary.py`, `model.py`) and `ARCHITECTURE.md`. When the prose here and the engine
 ever disagree, the engine wins — grep `scripts/kg_engine/` rather than guessing.
 
-`mcp__plugin_creativity-graph_creativity-graph__kg_write(payload)` is the ONLY path from language into the canon. It writes nothing
+`mcp__plugin_sproutgraph_sproutgraph__kg_write(payload)` is the ONLY path from language into the canon. It writes nothing
 until `validate_payload` (§1.8) classifies every node and edge into a **disposition**. This file is the spec
 for that payload and that classification.
 
-Before extraction, the §1.9 **egress scrub** `mcp__plugin_creativity-graph_creativity-graph__kg_scrub(text=None) ->
+Before extraction, the §1.9 **egress scrub** `mcp__plugin_sproutgraph_sproutgraph__kg_scrub(text=None) ->
 {scrubbed, redactions, sensitivity, categories}` redacts secrets (always) + PII (per `sensitivity`) with
 **consistent** placeholders (`⟦SECRET:1⟧` etc.) so relational structure survives, then hands the scrubbed
 text to the subagent. `kg_write` **restores** the placeholder spans to the ORIGINAL text before writing, so
@@ -160,7 +160,7 @@ A `kg_write` payload may **not** assert `grounded`/`rejected`/`failed` (in `epis
 verdict is wasted, not honored.
 
 Verdicts come **only** from
-`mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind, note, support_span, support_note)`
+`mcp__plugin_sproutgraph_sproutgraph__kg_ground(target_id, verdict, kind, note, support_span, support_note)`
 with `verdict ∈ {grounded, rejected, failed, obsolete}`, which stamps `verdict_by`/`verdict_at` and appends an
 audit record. The reconciler re-quarantines any verdict that appears in canon without a matching audit
 record. **Extractors emit `unverified` only.** Promoting a **hypothesized** edge to `grounded` *requires*
@@ -232,7 +232,7 @@ still binds the lane:
   `collapses-into-known-failure`: a claim that collapses into a known failure is rejected on sight, never
   merged into trusted canon.
 
-`mcp__plugin_creativity-graph_creativity-graph__kg_propose(payload)` is a thin, explicit alias over `kg_write`
+`mcp__plugin_sproutgraph_sproutgraph__kg_propose(payload)` is a thin, explicit alias over `kg_write`
 that keeps the lanes legible at the call site: it forces every item to `provenance=hypothesized`, and any item
 that arrives **explicitly** claiming `span-present`/`inferred` is REFUSED with reason `propose-lane-text-claim`
 (text claims belong on `kg_write`). The accepted items then transit the SAME `validate_payload`, so the rules

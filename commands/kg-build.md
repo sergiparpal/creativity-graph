@@ -1,7 +1,7 @@
 ---
 description: Build the grounded knowledge graph from a source document — extract section-by-section into the canon (bounded parallel waves), then project.
 argument-hint: "[source_path] [wave_size]"
-allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_scrub, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_status, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph
+allowed-tools: Task, Bash, mcp__plugin_sproutgraph_sproutgraph__kg_scrub, mcp__plugin_sproutgraph_sproutgraph__kg_metrics, mcp__plugin_sproutgraph_sproutgraph__kg_status, mcp__plugin_sproutgraph_sproutgraph__kg_context, mcp__plugin_sproutgraph_sproutgraph__query_graph
 ---
 
 # /kg-build — orchestrate the BUILD
@@ -69,10 +69,10 @@ file**; pass the file's basename (e.g. `source.md`) as the extractor's `source_f
 ### 1. Egress scrub — the §1.9 egress point (now WIRED)
 
 You are reading a **source on disk** and handing *section text* to a subagent. The §1.9 egress scrub is the
-engine's `scrub.py`, now exposed as the MCP tool `mcp__plugin_creativity-graph_creativity-graph__kg_scrub`. It is real and wired into the
+engine's `scrub.py`, now exposed as the MCP tool `mcp__plugin_sproutgraph_sproutgraph__kg_scrub`. It is real and wired into the
 flow as **Step 0** of each section:
 
-1. **Step 0 — scrub before egress.** Call `mcp__plugin_creativity-graph_creativity-graph__kg_scrub(text=<section body>)` to get the
+1. **Step 0 — scrub before egress.** Call `mcp__plugin_sproutgraph_sproutgraph__kg_scrub(text=<section body>)` to get the
    `scrubbed` source. This redacts secrets (always) and PII (per sensitivity) into **consistent placeholders**
    (`⟦SECRET:1⟧`, `⟦EMAIL:1⟧`, …) before any text crosses the egress to a subagent. It returns
    `{scrubbed, redactions, sensitivity, categories}`. For the no-PII demo source (`examples/source.md`),
@@ -115,7 +115,7 @@ Task(
   subagent_type: "kg-extractor",
   description: "Extract §1 Compression",
   prompt: """
-You are extracting ONE section of the source document into the canon via mcp__plugin_creativity-graph_creativity-graph__kg_write.
+You are extracting ONE section of the source document into the canon via mcp__plugin_sproutgraph_sproutgraph__kg_write.
 
 source_file: source.md          # basename of $SOURCE — used as edge.source_file
 section: "## 1. Compression and the cost of generality"
@@ -150,7 +150,7 @@ the kg_write result (dispositions, details[], written_nodes[], rolled_back).
 > single-section extractors run at once; they never change *what one extractor sees*.
 
 **Resume / progress probe (projection-free).** Between waves — or to recover after a transport hiccup or a
-cancelled request — call `mcp__plugin_creativity-graph_creativity-graph__kg_status()`: it reads the **canon
+cancelled request — call `mcp__plugin_sproutgraph_sproutgraph__kg_status()`: it reads the **canon
 only** (it never projects) and returns the node/edge counts, the `unverified` queue size, and a `coverage` map
 of which `##` sections already carry an anchored span-present edge. Re-launch only the **uncovered** sections
 (covered re-writes are idempotent anyway), and call it once more at the end to confirm full coverage.
@@ -163,19 +163,19 @@ Collect each launch's returned `kg_write` result: the `dispositions` counts
 The canon is the single source of truth; the derived layer is regenerable and **projects** the canon (§5). The
 read tools project **lazily** — they only rebuild the derived layer when it is stale. Confirm the build landed:
 
-1. `mcp__plugin_creativity-graph_creativity-graph__kg_metrics()` — reads the **canon** directly and returns
+1. `mcp__plugin_sproutgraph_sproutgraph__kg_metrics()` — reads the **canon** directly and returns
    `{nodes, edges, edges_by_epistemic_state}`. This is your authoritative count of what the extractors wrote.
    Freshly written edges are `unverified` (no verdicts asserted at build time), so expect
    `edges_by_epistemic_state` to be dominated by `unverified`.
-2. `mcp__plugin_creativity-graph_creativity-graph__kg_context(budget=2000)` — this **lazily projects** (rebuilds the derived layer if
+2. `mcp__plugin_sproutgraph_sproutgraph__kg_context(budget=2000)` — this **lazily projects** (rebuilds the derived layer if
    stale) and returns `{items[], approx_tokens, budget, falsification_counters:{failed_or_rejected_edges},
    advisory:{signal:"structural-bridge", note, nodes[]}}`. Calling it both *forces* the projection and confirms
    the derived layer agrees with the canon. At build time `falsification_counters.failed_or_rejected_edges` will
    typically be 0 — failures are negative information created later by an adversarial grounder via `kg_ground`
    (§1.7).
 
-Optionally spot-check structure with `mcp__plugin_creativity-graph_creativity-graph__query_graph(node_type="compression")` or
-`mcp__plugin_creativity-graph_creativity-graph__query_graph(epistemic_state="unverified", limit=50)` to eyeball the written nodes/edges.
+Optionally spot-check structure with `mcp__plugin_sproutgraph_sproutgraph__query_graph(node_type="compression")` or
+`mcp__plugin_sproutgraph_sproutgraph__query_graph(epistemic_state="unverified", limit=50)` to eyeball the written nodes/edges.
 
 ### 4. Report
 

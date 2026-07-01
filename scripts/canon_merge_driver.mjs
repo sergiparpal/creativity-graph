@@ -23,7 +23,7 @@ const SCRIPTS = join(ROOT, "scripts");
 const py = enginePython(venvDir(ROOT), () => systemPython(["sys", "yaml"]));
 if (!py) {
   process.stderr.write(
-    "[creativity-graph] canon merge driver: no engine python and no Python >= 3.10 on PATH; " +
+    "[sproutgraph] canon merge driver: no engine python and no Python >= 3.10 on PATH; " +
       "leaving the merge to git's default driver.\n"
   );
   // Exit non-zero so git reports the canon file as conflicted rather than silently taking one side.
@@ -44,7 +44,7 @@ const r = spawnSync(py, ["-m", "kg_engine.canonmerge", ...process.argv.slice(2)]
 });
 if (r.error) {
   process.stderr.write(
-    "[creativity-graph] canon merge driver: failed to run the engine " +
+    "[sproutgraph] canon merge driver: failed to run the engine " +
       `(${r.error.code || r.error.message}); leaving the merge to git's default driver.\n`
   );
   process.exit(1);

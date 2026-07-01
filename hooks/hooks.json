@@ -8,7 +8,7 @@
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/provision.mjs\"",
             "async": true,
             "timeout": 600,
-            "statusMessage": "Provisioning the creativity-graph engine (one-time)…"
+            "statusMessage": "Provisioning the Sproutgraph engine (one-time)…"
           }
         ]
       }

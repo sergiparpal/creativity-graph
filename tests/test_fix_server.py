@@ -133,7 +133,7 @@ def test_real_fastmcp_registers_every_tool_with_schema(engine):
     pytest.importorskip("mcp.server.fastmcp")
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("creativity-graph-test")
+    mcp = FastMCP("sproutgraph-test")
     _register(mcp, engine)
     tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
     assert {"kg_ping", "kg_write", "kg_ground", "query_graph", "kg_context", "kg_export"} <= set(tools)

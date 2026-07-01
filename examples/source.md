@@ -1,6 +1,6 @@
 # A theory of grounded conceptual knowledge
 
-This is a self-contained demo source for the creativity-graph plugin: a dense, *non-self-grounding*
+This is a self-contained demo source for the Sproutgraph plugin: a dense, *non-self-grounding*
 conceptual document. Its claims do not verify themselves the way code verifies against a parse tree, so
 it is exactly the kind of text a naive extractor turns into convincing nonsense.
 

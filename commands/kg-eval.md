@@ -1,7 +1,7 @@
 ---
 description: Measure extractor precision (Stage 4) and grounding reliability (Stage 7); record the numbers in PROGRESS.md.
 argument-hint: "[graph.json] (default: ${KG_DATA:-${CLAUDE_PROJECT_DIR:-.}/.kg-data}/derived/graph.json)"
-allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__query_graph
+allowed-tools: Task, Bash, mcp__plugin_sproutgraph_sproutgraph__query_graph
 ---
 
 # /kg-eval — extraction & grounding measurement
@@ -28,9 +28,9 @@ and stop.
 Pick **one** `PY` and a working directory, then reuse it for every Bash step below.
 
 - **Dev (in this repo):**
-  `PY=/home/sergi/creativity-graph/.venv/bin/python` (or prefix commands with `uv run`), run from
-  `/home/sergi/creativity-graph`. `kg_engine` is importable as `scripts/kg_engine`, so run the harness with
-  `PYTHONPATH=/home/sergi/creativity-graph/scripts`.
+  `PY=/home/sergi/Sproutgraph/.venv/bin/python` (or prefix commands with `uv run`), run from
+  `/home/sergi/Sproutgraph`. `kg_engine` is importable as `scripts/kg_engine`, so run the harness with
+  `PYTHONPATH=/home/sergi/Sproutgraph/scripts`.
 - **Runtime (installed plugin):**
   `PY=${CLAUDE_PLUGIN_DATA}/.venv/bin/python` with `PYTHONPATH=${CLAUDE_PLUGIN_ROOT}/scripts`; the probe is
   `${CLAUDE_PLUGIN_ROOT}/scripts/f4_probe.py`. Keep all scratch files (`labels.csv`, `label_sets.json`)
@@ -45,9 +45,9 @@ The blocks below use the dev paths; swap in the runtime paths verbatim when inst
 ### 4.1 Inspect the graph (sanity, no labeling yet)
 
 ```bash
-PY=/home/sergi/creativity-graph/.venv/bin/python
+PY=/home/sergi/Sproutgraph/.venv/bin/python
 GRAPH="${1:-${KG_DATA:-${CLAUDE_PROJECT_DIR:-.}/.kg-data}/derived/graph.json}"
-"$PY" /home/sergi/creativity-graph/scripts/f4_probe.py summary "$GRAPH"
+"$PY" /home/sergi/Sproutgraph/scripts/f4_probe.py summary "$GRAPH"
 ```
 
 This prints node/edge counts, the nodes grouped by `file_type` (distinct from the `node_type` used in the
@@ -58,7 +58,7 @@ EXTRACTED tier is span-present by construction, so the sheet excludes it by defa
 ### 4.2 Emit the labeling sheet
 
 ```bash
-"$PY" /home/sergi/creativity-graph/scripts/f4_probe.py sheet "$GRAPH" --n 80 --out labels.csv
+"$PY" /home/sergi/Sproutgraph/scripts/f4_probe.py sheet "$GRAPH" --n 80 --out labels.csv
 ```
 
 `sheet` deterministically samples (seed 42) up to 80 non-EXTRACTED edges into `labels.csv` with columns
@@ -76,7 +76,7 @@ Task(
   description: "Label Stage-4 precision sheet",
   prompt: """
     Read the labeling sheet at ABS_PATH/labels.csv and the source document at
-    /home/sergi/creativity-graph/examples/source.md  (runtime: ${CLAUDE_PROJECT_DIR}/canon's source).
+    /home/sergi/Sproutgraph/examples/source.md  (runtime: ${CLAUDE_PROJECT_DIR}/canon's source).
 
     For EACH row, judge the (source_label, relation, target_label) claim STRICTLY against the source text
     and write two columns IN PLACE, leaving every other column untouched:
@@ -106,7 +106,7 @@ tools, so they cannot forge a verdict into the canon (verdicts reach the canon o
 ### 4.4 Score
 
 ```bash
-"$PY" /home/sergi/creativity-graph/scripts/f4_probe.py score labels.csv
+"$PY" /home/sergi/Sproutgraph/scripts/f4_probe.py score labels.csv
 ```
 
 Capture from stdout:
@@ -126,14 +126,14 @@ If **PRECISION < 0.70**, iterate; otherwise skip to recording. Each pass:
 1. Read the per-relation precision and verdict breakdown. The two failure shapes drive two fixes:
    - many `vague` → the **generality confound**: tighten `node_types` / sharpen the extractor prompt to
      reject unfalsifiable edges, and add `specificity_seeds` for the confused vague terms in
-     `/home/sergi/creativity-graph/pack/pack.yaml` so they are not mistaken for content.
+     `/home/sergi/Sproutgraph/pack/pack.yaml` so they are not mistaken for content.
    - many `wrong_type` / `fabricated` → tighten the relation definitions in `pack.yaml` and the
      extractor's worked example; the boundary already REJECTS span-not-in-source, so persistent
      `fabricated` here means the prompt is over-reaching.
 2. Validate the pack before re-extracting:
    ```bash
-   "$PY" -m kg_engine.pack validate /home/sergi/creativity-graph/pack/pack.yaml \
-       /home/sergi/creativity-graph/examples/source.md
+   "$PY" -m kg_engine.pack validate /home/sergi/Sproutgraph/pack/pack.yaml \
+       /home/sergi/Sproutgraph/examples/source.md
    ```
    (Runtime: `PYTHONPATH=${CLAUDE_PLUGIN_ROOT}/scripts "$PY" -m kg_engine.pack validate ...`.)
 3. Re-run `/kg-build` (re-extract → re-project → fresh `graph.json`), then redo 4.2–4.4.
@@ -151,8 +151,8 @@ Reliability needs **independent** coders: launch the annotator **twice** over th
 pass blind to the other (no shared notes, no second pass seeing the first's labels). Emit two CSVs:
 
 ```bash
-"$PY" /home/sergi/creativity-graph/scripts/f4_probe.py sheet "$GRAPH" --n 80 --out labels_a.csv
-"$PY" /home/sergi/creativity-graph/scripts/f4_probe.py sheet "$GRAPH" --n 80 --out labels_b.csv
+"$PY" /home/sergi/Sproutgraph/scripts/f4_probe.py sheet "$GRAPH" --n 80 --out labels_a.csv
+"$PY" /home/sergi/Sproutgraph/scripts/f4_probe.py sheet "$GRAPH" --n 80 --out labels_b.csv
 ```
 
 `sheet` is deterministic (seed 42), so `labels_a.csv` and `labels_b.csv` cover the *identical* edge sample —
@@ -179,7 +179,7 @@ def coder(p):
 json.dump([coder(p) for p in sys.argv[1:]], sys.stdout)
 EOF
 
-PYTHONPATH=/home/sergi/creativity-graph/scripts \
+PYTHONPATH=/home/sergi/Sproutgraph/scripts \
   "$PY" -m kg_engine.harness agreement label_sets.json
 ```
 
@@ -190,8 +190,8 @@ than 2 coders are ignored, so both passes must cover the same `edge_id`s — the
 ### 7.3 Specificity bridge-metric gate
 
 ```bash
-PYTHONPATH=/home/sergi/creativity-graph/scripts \
-  "$PY" -m kg_engine.harness specificity "$GRAPH" /home/sergi/creativity-graph/examples/source.md
+PYTHONPATH=/home/sergi/Sproutgraph/scripts \
+  "$PY" -m kg_engine.harness specificity "$GRAPH" /home/sergi/Sproutgraph/examples/source.md
 ```
 
 Emits JSON comparing specificity-weighted betweenness against raw degree and raw betweenness over the source
@@ -201,7 +201,7 @@ place — gate ON") means the specificity-weighted bridge metric separates real 
 high-traffic nodes beyond the churn band and may be promoted out of advisory; otherwise degree stays the
 honest MVP advisory and specificity-weighted betweenness remains GATED (§1.6).
 
-> Cross-check (optional): `mcp__plugin_creativity-graph_creativity-graph__query_graph(node_type="compression")` shows the live
+> Cross-check (optional): `mcp__plugin_sproutgraph_sproutgraph__query_graph(node_type="compression")` shows the live
 > compression nodes; the specificity leaders should be these, not vague terms like `idea`/`system`.
 
 Stage 7 does not gate either — log α and the gate verdict and proceed (§4).
@@ -214,7 +214,7 @@ Append (never overwrite) a dated block to `PROGRESS.md` at the project root. Fil
 stdout; under "iterations" note how many Stage-4 passes ran and that the **best** precision is recorded.
 
 ```bash
-cat >> "${CLAUDE_PROJECT_DIR:-/home/sergi/creativity-graph}/PROGRESS.md" <<EOF
+cat >> "${CLAUDE_PROJECT_DIR:-/home/sergi/Sproutgraph}/PROGRESS.md" <<EOF
 
 ## /kg-eval — $(date -u +%Y-%m-%dT%H:%M:%SZ)
 graph: $GRAPH   (labeled n=<N>)

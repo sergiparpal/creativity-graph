@@ -1,4 +1,4 @@
-# PROGRESS — creativity-graph build log
+# PROGRESS — Sproutgraph build log
 
 One line per stage with its exit-test result and any recorded metric.
 Auditable end-to-end without re-reading code. Metric stages log the outcome and proceed; no human gate.
@@ -44,7 +44,7 @@ test (§1.1) — measured, labelled, not shipped as a guarantee.
 ## Live validation (installed plugin, fresh vault)
 
 The plugin was installed locally (user scope, via a single-plugin `marketplace.json`) and the full
-workflow run end-to-end **through the installed plugin** — `/creativity-graph:kg-build` → `/kg-ground` →
+workflow run end-to-end **through the installed plugin** — `/sproutgraph:kg-build` → `/kg-ground` →
 `/kg-query` on a fresh vault (`/tmp/kg-vault`). Driving it for real surfaced and fixed four packaging/quality
 bugs static review could not (committed):
 

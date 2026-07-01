@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+([-+].+)?$")  # SemVer-ish (allows pre-release / build metadata)
-PLUGIN_NAME = "creativity-graph"
+PLUGIN_NAME = "sproutgraph"
 
 
 def _grep_version(rel: str, pattern: str, errors: list[str]) -> str | None:
@@ -58,7 +58,7 @@ REQUIRED_AGENTS = ["extractor", "grounder", "annotator", "adversarial-grounder",
                    "generator"]
 REQUIRED_COMMANDS = ["kg-build", "kg-ground", "kg-query", "kg-eval", "kg-experiment", "kg-generate",
                      "kg-perturb", "kg-view"]
-REQUIRED_FILES = ("skills/creativity-graph/SKILL.md",
+REQUIRED_FILES = ("skills/sproutgraph/SKILL.md",
                   "scripts/kg_engine/server.py", "pack/pack.yaml",
                   # cross-platform install system: SessionStart dispatcher + OS launchers,
                   # the self-provisioning bootstrap, the Node MCP launcher, and the
@@ -109,7 +109,7 @@ def _check_plugin(errors: list[str]) -> str | None:
 
 
 def _check_mcp(errors: list[str]) -> None:
-    """Validate that .mcp.json declares the creativity-graph server."""
+    """Validate that .mcp.json declares the sproutgraph server."""
     mcp = _load_json(".mcp.json", errors)
     if mcp is not None and PLUGIN_NAME not in (mcp.get("mcpServers") or {}):
         errors.append(f".mcp.json: no '{PLUGIN_NAME}' server declared")
@@ -132,7 +132,7 @@ def _check_hooks(errors: list[str]) -> None:
 
 
 def _check_marketplace(version: str | None, errors: list[str]) -> None:
-    """Validate that every marketplace.json creativity-graph entry agrees with the plugin version."""
+    """Validate that every marketplace.json sproutgraph entry agrees with the plugin version."""
     market = _load_json(".claude-plugin/marketplace.json", errors)
     if market is not None and version is not None:
         # a malformed shape must produce the validator's clean failure list, not an AttributeError —

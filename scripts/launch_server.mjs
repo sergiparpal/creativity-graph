@@ -222,7 +222,7 @@ function foregroundCatchUp(sys, force) {
   // server's early-failure self-heal is still the net.
   if (r.error || (typeof r.status === "number" && r.status !== 0)) {
     process.stderr.write(
-      "[creativity-graph] engine provisioning did not complete" +
+      "[sproutgraph] engine provisioning did not complete" +
         (r.error ? ` (${r.error.code || r.error.message})` : ` (bootstrap exit ${r.status})`) +
         "; the background worker may still be building — retry shortly if tools are missing.\n"
     );
@@ -299,7 +299,7 @@ export function createSupervisor({
       // A spawn-level error (ENOENT, EACCES) is not a server crash-loop — the binary can't run at all,
       // so relaunching would just thrash. Log it and give up cleanly.
       log(`spawn error: ${e.message}`);
-      process.stderr.write(`[creativity-graph] failed to start engine server: ${e.message}\n`);
+      process.stderr.write(`[sproutgraph] failed to start engine server: ${e.message}\n`);
       exit(1);
     });
     child.on("exit", (code, signal) => onChildExit(code, signal));
@@ -324,7 +324,7 @@ export function createSupervisor({
     if (decision.action === "exit") {
       if (decision.reason === "crash-loop-cap") {
         process.stderr.write(
-          `[creativity-graph] engine crash-looped during startup (${restartTimes.length} retries in ` +
+          `[sproutgraph] engine crash-looped during startup (${restartTimes.length} retries in ` +
             `${policy.RESTART_WINDOW_MS / 1000}s); giving up. See ${join(serverLogDir(), "server.log")}.\n`
         );
       }
@@ -382,7 +382,7 @@ function main() {
 
   if (!py) {
     process.stderr.write(
-      "[creativity-graph] engine venv is not provisioned and no Python >= 3.10 was found " +
+      "[sproutgraph] engine venv is not provisioned and no Python >= 3.10 was found " +
         "on PATH. Install Python 3.10+ and start a new session.\n"
     );
     process.exit(1);

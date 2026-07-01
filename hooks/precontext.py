@@ -95,7 +95,7 @@ def main() -> int:
         ctx = proj.kg_context(query, budget=800)
         if not ctx["items"] and not ctx["advisory"]["nodes"]:
             return 0
-        lines = ["creativity-graph (query the graph first; provenance + falsification attached):"]
+        lines = ["Sproutgraph (query the graph first; provenance + falsification attached):"]
         for it in ctx["items"][:6]:
             lines.append(f"- {it['source']} --{it['relation']}--> {it['target']} "
                          f"[{it['provenance']}/{it['epistemic_state']}]")

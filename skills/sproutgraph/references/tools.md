@@ -13,7 +13,7 @@ call never crashes the session; success returns and domain `{ok:false}` results 
 ## 1 · MCP tool surface
 
 A plugin-bundled MCP server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>` — here both the
-plugin and the server are named `creativity-graph`, so every tool is `mcp__plugin_creativity-graph_creativity-graph__<tool>`
+plugin and the server are named `sproutgraph`, so every tool is `mcp__plugin_sproutgraph_sproutgraph__<tool>`
 (use this exact form in agent `tools:` / command `allowed-tools:` grants). These **twenty** are the **only**
 graph tools — the verify/read tools (§1.1–§1.11, including `kg_merge` §1.5b and the read-only egress
 `kg_explain_path` §1.10b) plus the four generative-layer tools (§1.12–§1.15)
@@ -34,12 +34,12 @@ an empty-schema derived layer is materialised, and the tool serves canon-derived
 merged into its result (a list-returning read like `get_neighbors` can't carry the flag, so it returns `[]`).
 Writes never pass through this seam.
 
-### 1.1 `mcp__plugin_creativity-graph_creativity-graph__kg_ping()`
+### 1.1 `mcp__plugin_sproutgraph_sproutgraph__kg_ping()`
 
 Health check / config probe. No args.
 
 ```json
-{"name": "creativity-graph", "version": "<__version__>", "metrics_mode": "structure_only",
+{"name": "sproutgraph", "version": "<__version__>", "metrics_mode": "structure_only",
  "sensitivity": "medium", "pack_loaded": true}
 ```
 
@@ -47,7 +47,7 @@ Health check / config probe. No args.
 is `structure_only` by default (centrality stays advisory; the specificity-weighted bridge metric is gated,
 §1.4/§1.6).
 
-### 1.2 `mcp__plugin_creativity-graph_creativity-graph__kg_scrub(text=None)`
+### 1.2 `mcp__plugin_sproutgraph_sproutgraph__kg_scrub(text=None)`
 
 The §1.9 **egress scrub**. Redacts **secrets (always)** + **PII (per `sensitivity`)** with **CONSISTENT
 placeholders** (`⟦SECRET:1⟧`, `⟦EMAIL:1⟧`, …) before any text is handed to a subagent for semantic work.
@@ -69,7 +69,7 @@ local canon.
 For the no-PII demo source (`examples/source.md`), `kg_scrub` is a **no-op**: `redactions: 0`,
 `categories: []`, and `scrubbed` equals the source verbatim.
 
-### 1.3 `mcp__plugin_creativity-graph_creativity-graph__kg_write(payload: dict, idempotency_key: str | None = None)`
+### 1.3 `mcp__plugin_sproutgraph_sproutgraph__kg_write(payload: dict, idempotency_key: str | None = None)`
 
 The boundary (§1.5). Validates an extraction payload, writes ACCEPTED/DEMOTED nodes & edges to the canon,
 quarantines or rejects the rest. `payload` is the write contract (see `references/contract.md` / the shared
@@ -116,7 +116,7 @@ A write may never set a non-`unverified` state or claim parser/human authorship:
 `agent` (`human-claim-stripped`); `deterministic` → `agent` (`deterministic-claim-stripped`, so an
 extractor can't dodge span-present by self-declaring parser authorship). None are accepted as-is.
 
-### 1.4 `mcp__plugin_creativity-graph_creativity-graph__kg_ground(target_id, verdict, kind="edge", note="", support_span="", support_note="")`
+### 1.4 `mcp__plugin_sproutgraph_sproutgraph__kg_ground(target_id, verdict, kind="edge", note="", support_span="", support_note="")`
 
 **The ONLY path that may set a verdict** (§1.4/§1.8). Stamps the epistemic_state and appends a `ground.audit`
 record so the reconciler treats the transition as legitimate.
@@ -148,7 +148,7 @@ for an edge it is the edge id.
 > `kg_ground(target_id=<edge>, verdict="failed")`. Failed/rejected edges are NEGATIVE INFORMATION — never
 > pruned, surfaced by `kg_context.falsification_counters`.
 
-### 1.5 `mcp__plugin_creativity-graph_creativity-graph__kg_rename(old_id, new_id)`
+### 1.5 `mcp__plugin_sproutgraph_sproutgraph__kg_rename(old_id, new_id)`
 
 Renames a node and rewrites every edge endpoint (`source`/`target`) referencing it, preserving the
 single-canonical-edge rule. Both ids are slugged.
@@ -163,7 +163,7 @@ Failure: `{"ok": false, "error": "node not found"}` or `"target id exists"`. `ok
 `kg_rename` stays **strict** — `"target id exists"` is a refusal, never a silent merge. To collapse two
 nodes that genuinely name the same concept, use `kg_merge` (below).
 
-### 1.5b `mcp__plugin_creativity-graph_creativity-graph__kg_merge(from_id, into_id)`
+### 1.5b `mcp__plugin_sproutgraph_sproutgraph__kg_merge(from_id, into_id)`
 
 The **deliberate node-merge** `kg_rename` refuses. Folds `from_id` into the existing `into_id` (both must
 exist), rewrites every edge endpoint `from_id`→`into_id`, then RETIRES `from_id`. Where the rewrite makes
@@ -192,7 +192,7 @@ reconciler's §1.8 forgery sweep.
 
 Failure: `{"ok": false, "error": "source node not found" | "target node not found" | "cannot merge a node into itself" | "node_type conflict — refusing to merge"}`; `ok` is `false` (`error: "merge rolled back: …"`) if the multi-file write rolled back — the graph is left untouched.
 
-### 1.6 `mcp__plugin_creativity-graph_creativity-graph__kg_metrics()`
+### 1.6 `mcp__plugin_sproutgraph_sproutgraph__kg_metrics()`
 
 Cheap summary counts straight off the canon (no projection). No args.
 
@@ -203,7 +203,7 @@ Cheap summary counts straight off the canon (no projection). No args.
 `edges_by_epistemic_state` keys are whatever `EpistemicState` values are present
 (`unverified|grounded|rejected|failed|obsolete`).
 
-### 1.7 `mcp__plugin_creativity-graph_creativity-graph__query_graph(node_type=None, relation=None, epistemic_state=None, limit=50)`
+### 1.7 `mcp__plugin_sproutgraph_sproutgraph__query_graph(node_type=None, relation=None, epistemic_state=None, limit=50)`
 
 Filtered read of the derived index. Nodes filtered by `node_type` and/or `epistemic_state`, **ordered by
 precomputed `degree` DESC** (the honest MVP advisory, §1.6), capped at `limit`. Edges filtered by `relation` and **ordered by `id` ASC** (a deterministic, byte-stable top-N),
@@ -235,7 +235,7 @@ Valid `node_type` filters are the pack's declared types
 (`compression|primitive|claim|metric|operation|failure`); `relation` filters the declared edge types
 (`grounds|attacked_by|reconciles_with|bridges|collapses_into|confounded_by|approximates|defends_against|projects|survives`).
 
-### 1.8 `mcp__plugin_creativity-graph_creativity-graph__get_node(node_id)`
+### 1.8 `mcp__plugin_sproutgraph_sproutgraph__get_node(node_id)`
 
 One node row + its incident edges (both `source=` and `target=` matches).
 
@@ -255,12 +255,12 @@ One node row + its incident edges (both `source=` and `target=` matches).
 
 Returns `{"error": "not found"}` when the id is unknown.
 
-### 1.9 `mcp__plugin_creativity-graph_creativity-graph__get_neighbors(node_id, relation=None)`
+### 1.9 `mcp__plugin_sproutgraph_sproutgraph__get_neighbors(node_id, relation=None)`
 
 A **list** (not a dict) of edge dicts incident to `node_id` (as `source` OR `target`), optionally filtered by
 `relation`. Each element has the same shape as an edge row above. Empty list if the node has no incident edges.
 
-### 1.10 `mcp__plugin_creativity-graph_creativity-graph__shortest_path(source, target)`
+### 1.10 `mcp__plugin_sproutgraph_sproutgraph__shortest_path(source, target)`
 
 BFS over the derived edge list, treated as **undirected** (no centrality is computed).
 
@@ -270,7 +270,7 @@ BFS over the derived edge list, treated as **undirected** (no centrality is comp
 
 `{"path": ["x"]}` when `source == target`; `{"path": null}` when no path exists.
 
-### 1.10b `mcp__plugin_creativity-graph_creativity-graph__kg_explain_path(nodes)`
+### 1.10b `mcp__plugin_sproutgraph_sproutgraph__kg_explain_path(nodes)`
 
 **READ-ONLY egress** (§2). Traces the associative chain connecting `nodes` over **`grounded` edges only** —
 `unverified`/`hypothesized`/`failed`/`rejected` edges are excluded entirely, so a returned chain is one that
@@ -290,7 +290,7 @@ When no fully-grounded path exists: `{"path": [], "edges": [], "leap": null, "gr
 "reason": "no fully-grounded path between <a> and <b>"}` — an honest absence (the concepts are joined only
 through unverified/hypothesized/refuted links, or not at all), never an exception.
 
-### 1.11 `mcp__plugin_creativity-graph_creativity-graph__kg_context(query=None, budget=2000)`
+### 1.11 `mcp__plugin_sproutgraph_sproutgraph__kg_context(query=None, budget=2000)`
 
 The **grounding-aware, provenance-carrying, token-budgeted** context tool — the one to call before reasoning
 over the graph. Reads precomputed ranks **O(1)**; it **NEVER computes centrality in-request** (centrality is
@@ -364,7 +364,7 @@ The four tools below are the *offensive* half (the inversion: **generate offensi
 **hypothesized** lane only — they can never set a verdict or forge a text anchor. A candidate becomes grounded
 knowledge solely when `kg_ground` (§1.4) promotes it with support.
 
-### 1.12 `mcp__plugin_creativity-graph_creativity-graph__kg_propose(payload)`
+### 1.12 `mcp__plugin_sproutgraph_sproutgraph__kg_propose(payload)`
 
 The **hypothesized write lane** (PLAN Stage 1). A thin, explicit alias over `kg_write` that forces every item
 to `provenance=hypothesized` and **REFUSES** any item arriving with a text-claim provenance
@@ -384,7 +384,7 @@ Returns the `kg_write` shape plus two fields:
 `refused_text_claims` counts the call-site `propose-lane-text-claim` refusals (folded into `details[]` and the
 `REJECTED` count).
 
-### 1.13 `mcp__plugin_creativity-graph_creativity-graph__kg_generate(mechanism="bridge", k=10, second_graph=None)`
+### 1.13 `mcp__plugin_sproutgraph_sproutgraph__kg_generate(mechanism="bridge", k=10, second_graph=None)`
 
 The **discovery engine** (PLAN Stage 3). **READ-ONLY** — projects if stale, reads precomputed ranks O(1),
 dispatches to the chosen mechanism, and returns ranked candidates. It never writes; `/kg-generate` routes the
@@ -413,7 +413,7 @@ propose lane forces it). `convergence` is **advisory** — the number of *distin
 independently proposed the same edge (≥1); a grounding-queue ranking prior, never folded into `score` and
 never written to the canon, harness-gated (`harness.convergence`) before it may reorder grounding.
 
-### 1.14 `mcp__plugin_creativity-graph_creativity-graph__kg_operate(op, target=None, label="", body="", members=None, k=None)`
+### 1.14 `mcp__plugin_sproutgraph_sproutgraph__kg_operate(op, target=None, label="", body="", members=None, k=None)`
 
 The **four §8 endo operations** (PLAN Stage 4), each persisting its result **through the propose lane**
 (`kg_propose`), so everything lands `hypothesized`/`unverified` with no span.
@@ -427,7 +427,7 @@ Returns the `kg_propose` shape with `{ok: true, op, info}` merged in. On a bad o
 `{"ok": false, "op": "collapse", "error": "no structure to operate on", "info": …}` or
 `{"ok": false, "error": "unknown op 'foo'; expected collapse|explode|regroup|open"}`.
 
-### 1.15 `mcp__plugin_creativity-graph_creativity-graph__kg_absorption()`
+### 1.15 `mcp__plugin_sproutgraph_sproutgraph__kg_absorption()`
 
 The **§14 absorption window** (PLAN Stage 5). For each node grounded *from* a hypothesis, scores how long it
 stayed perturbing before the graph renormalised, so the slate can prefer the fertile middle. Reads the derived
@@ -442,7 +442,7 @@ graph plus the `derived/generations.json` ledger that `/kg-generate` appends to.
 `status ∈ fertile | absorbed | isolated`. With no ledger yet, `tracked` is `0` and `note` explains that
 `/kg-generate` has not started tracking the window (never an error).
 
-### 1.16 `mcp__plugin_creativity-graph_creativity-graph__kg_agenda(limit=5)`
+### 1.16 `mcp__plugin_sproutgraph_sproutgraph__kg_agenda(limit=5)`
 
 **Read-only structural "suggested questions"** (R6). Reads ONLY precomputed derived columns (node ranks +
 edge provenance/state) and returns ~`limit` structural gaps, split into two lanes that mirror `kg_context`'s
@@ -468,7 +468,7 @@ edge provenance/state) and returns ~`limit` structural gaps, split into two lane
   text is session-time only and never written to the canon. It is a **heuristic, not a guarantee** — it
   suggests where to look or what to ground next; it never answers or acts. `limit` is clamped to `[1, 50]`.
 
-### 1.17 `mcp__plugin_creativity-graph_creativity-graph__kg_export(kind="all")`
+### 1.17 `mcp__plugin_sproutgraph_sproutgraph__kg_export(kind="all")`
 
 **Read-only human-facing render** (R1). Projects-if-stale, then consumes ONLY the derived layer (through the
 shared `_agenda_reader()` seam) plus `kg_metrics`, and writes two **disposable** artifacts under the derived
@@ -493,7 +493,7 @@ dir. `kind ∈ {html, report, all}` (default `all`).
   (`projector.py` stays their sole writer). Cannot forge a verdict or bypass span-present. Also: CLI
   `python -m kg_engine.export html|report|all` and the `/kg-view` command.
 
-### 1.18 `mcp__plugin_creativity-graph_creativity-graph__kg_status()`
+### 1.18 `mcp__plugin_sproutgraph_sproutgraph__kg_status()`
 
 A cheap, **projection-FREE** status + coverage probe. Reads ONLY the canon (and the source text for coverage);
 it **never** triggers or refreshes the derived layer (unlike `kg_metrics`, which serves off the index when
@@ -534,7 +534,7 @@ Unlike `kg_metrics` (§1.6) this NEVER opens the derived db. Granted to `/kg-bui
 
 ## 2 · Deterministic CLI surface
 
-Run via Bash. **Dev**: repo venv `/home/sergi/creativity-graph/.venv/bin/python` (or `uv run`). **Runtime**:
+Run via Bash. **Dev**: repo venv `/home/sergi/Sproutgraph/.venv/bin/python` (or `uv run`). **Runtime**:
 `${CLAUDE_PLUGIN_DATA}/.venv/bin/python` with `PYTHONPATH=${CLAUDE_PLUGIN_ROOT}/scripts`. The `kg_engine.*`
 module CLIs require that `PYTHONPATH`; `f4_probe.py` is a standalone script. None of these gate the pipeline —
 each prints a number + verdict; the orchestration logs it and proceeds (§4).

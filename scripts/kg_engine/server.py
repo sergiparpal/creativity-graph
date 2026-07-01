@@ -506,7 +506,7 @@ class KGEngine:
 
     # ---- tools -----------------------------------------------------------
     def kg_ping(self) -> dict:
-        return {"name": "creativity-graph", "version": __version__,
+        return {"name": "sproutgraph", "version": __version__,
                 "metrics_mode": self.metrics_mode, "sensitivity": self.sensitivity,
                 "pack_loaded": self.pack is not None}
 
@@ -1968,7 +1968,7 @@ def main() -> None:
         from mcp.server.fastmcp import FastMCP
         # The lifespan writes <KG_DATA>/.engine-ready as the serve loop comes up so the Node supervisor can
         # tell a post-init crash (exit clean -> client reconnects) from a startup crash (relaunch in place).
-        mcp = FastMCP("creativity-graph", lifespan=readiness_lifespan)
+        mcp = FastMCP("sproutgraph", lifespan=readiness_lifespan)
         engine = build_engine_from_env()
         _register(mcp, engine)
         # mcp.run() returns NORMALLY on a clean client disconnect (stdin EOF closes the stdio transport

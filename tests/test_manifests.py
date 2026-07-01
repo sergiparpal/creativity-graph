@@ -153,7 +153,7 @@ def test_pyproject_version_check_matches_real_repo():
 
 # ---- generative-layer manifests: the new command/agent are discovered and declare only real tools ----
 
-_NS = "mcp__plugin_creativity-graph_creativity-graph__"
+_NS = "mcp__plugin_sproutgraph_sproutgraph__"
 
 
 def _registered_mcp_tools() -> set:

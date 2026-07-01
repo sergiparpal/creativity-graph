@@ -1,7 +1,7 @@
 ---
 description: Render the human-facing knowledge-graph artifacts — a self-contained offline graph.html + GRAPH_REPORT.md.
 argument-hint: "[html|report|all]"
-allowed-tools: mcp__plugin_creativity-graph_creativity-graph__kg_export
+allowed-tools: mcp__plugin_sproutgraph_sproutgraph__kg_export
 ---
 
 # /kg-view — render the human-facing artifacts (R1)
@@ -16,7 +16,7 @@ view, not a source of truth (the canon is the source of truth).
 
 ## Procedure
 
-1. Call `mcp__plugin_creativity-graph_creativity-graph__kg_export(kind="$1")` — `$1 ∈ {html, report, all}`,
+1. Call `mcp__plugin_sproutgraph_sproutgraph__kg_export(kind="$1")` — `$1 ∈ {html, report, all}`,
    default **`all`**. It returns `{ok, kind, html_path, report_path}`.
 2. Report the two artifact paths to the user:
    - **`graph.html`** — a self-contained, fully-offline force-directed viz (open it in any browser; no network,

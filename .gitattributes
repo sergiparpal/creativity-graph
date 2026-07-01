@@ -1,7 +1,7 @@
 # Route per-node canon notes through the semantic merge driver (R5, §1.2/§1.4).
 # Activate it once per clone (the driver itself is not auto-installed — pure git plumbing,
 # no per-session git-config writes); see README "Multi-machine / multi-branch canon merges":
-#   git config merge.kgcanon.name   "creativity-graph canon merge"
+#   git config merge.kgcanon.name   "Sproutgraph canon merge"
 #   git config merge.kgcanon.driver "node ${CLAUDE_PLUGIN_ROOT}/scripts/canon_merge_driver.mjs %O %A %B"
 # Without that config git falls back to its default text merge, so this line is inert (never harmful)
 # on a clone that has not opted in.

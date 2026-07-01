@@ -183,7 +183,7 @@ python -m kg_engine.pack validate pack/pack.yaml
 
 # validate + coverage (pass a source path)
 python -m kg_engine.pack validate pack/pack.yaml examples/source.md
-# (dev: /home/sergi/creativity-graph/.venv/bin/python -m kg_engine.pack ...  or  uv run)
+# (dev: /home/sergi/Sproutgraph/.venv/bin/python -m kg_engine.pack ...  or  uv run)
 ```
 
 Real output for the demo pack + source (a fully grounded pack — both ratios at 1.0):

@@ -62,7 +62,7 @@ _FALLBACK_EDGE_TYPES = [
 ]
 
 SYSTEM_PROMPT = """\
-You are kg-extractor, the headless extraction backend of the creativity-graph plugin. You turn a
+You are kg-extractor, the headless extraction backend of the Sproutgraph plugin. You turn a
 non-self-grounding conceptual document into structured JSON: typed nodes, typed edges, and — for
 every edge — a VERBATIM span from the source that proves the relation came from the text, not from
 your own invention. You do the LANGUAGE work only; a deterministic engine validates and persists.

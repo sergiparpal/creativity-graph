@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform, self-provisioning bootstrap for the creativity-graph engine venv.
+"""Cross-platform, self-provisioning bootstrap for the Sproutgraph engine venv.
 
 This is the single source of truth for building the engine's virtualenv. It is
 invoked three ways, all idempotent and safe to re-run:
@@ -704,7 +704,7 @@ def maybe_reconcile(venv_dir: Path) -> None:
         "from kg_engine.reconciler import Reconciler\n"
         "rep = Reconciler(Canon(os.environ['CLAUDE_PROJECT_DIR'])).scan(full_sweep=True)\n"
         "if rep.requarantined:\n"
-        "    print(f\"[creativity-graph] reconcile re-quarantined {len(rep.requarantined)} \"\n"
+        "    print(f\"[sproutgraph] reconcile re-quarantined {len(rep.requarantined)} \"\n"
         "          f\"forged verdict(s)\")\n"
     )
     try:
@@ -845,7 +845,7 @@ def spawn_background(venv_dir: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Provision the creativity-graph engine venv.")
+    parser = argparse.ArgumentParser(description="Provision the Sproutgraph engine venv.")
     parser.add_argument("--venv", default=None, help="explicit venv directory")
     parser.add_argument(
         "--background",

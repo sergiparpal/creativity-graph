@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "creativity-graph": {
+    "sproutgraph": {
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch_server.mjs"],
       "env": {

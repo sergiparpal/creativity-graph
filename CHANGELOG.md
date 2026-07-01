@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the **creativity-graph** Claude Code plugin are recorded here.
+All notable changes to the **Sproutgraph** Claude Code plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); the current release is the topmost
 version section below.
@@ -462,7 +462,7 @@ idempotent, resumable, and projection-decoupled so a lost response or a dead tra
   DLL is blocked from **loading** (reputation-based — igraph's DLL loads, leidenalg's does not) with
   `ImportError: DLL load failed while importing _c_leiden: "An Application Control policy has blocked this
   file"`. Because `verify_imports` treated leidenalg as a **mandatory** import, that aborted `do_install`,
-  which then `rmtree`'d the half-built venv — so provisioning never completed and the `creativity-graph`
+  which then `rmtree`'d the half-built venv — so provisioning never completed and the `sproutgraph`
   MCP server never came up ("1 error during load", no `kg_*` tools). This contradicted the **runtime**,
   where leidenalg has long been **optional**: `projector._leiden` wraps the import in `try/except` and
   degrades to label-propagation community detection when it can't load. The bootstrap now matches that
@@ -481,7 +481,7 @@ idempotent, resumable, and projection-decoupled so a lost response or a dead tra
 
 ### Documentation
 
-- **Troubleshooting note for `Plugin "creativity-graph" not found in marketplace "sergiparpal"` after a
+- **Troubleshooting note for `Plugin "sproutgraph" not found in marketplace "sergiparpal"` after a
   successful `marketplace add`.** Documented in the README *Install & enable* section that this is a
   stale marketplace cache (`marketplace add` reports success even when it reuses a cached clone that
   predates the plugin entry), with the ordered fix — `marketplace update` → remove + re-add → delete
@@ -896,7 +896,7 @@ surface), and `kg_write` now demotes a forged `authored_by=deterministic` claim 
 
 The initial end-to-end build. Engine: **79 tests green**.
 Components: **5 agents, 5 commands**, 1 skill (+3 on-demand references), the `SessionStart`/`PreToolUse`
-hooks, and the `creativity-graph` MCP server. Each stage advanced on its own automated exit test.
+hooks, and the `sproutgraph` MCP server. Each stage advanced on its own automated exit test.
 The plugin was then **installed locally and the full workflow run end-to-end** (see *Packaging hardening
 + live validation* below).
 
@@ -949,14 +949,14 @@ regression tests were added (`tests/test_review_fixes.py`).
 - Added the plugin manifest `.claude-plugin/plugin.json` with the `userConfig` enable-time prompts:
   `domain` (default "conceptual theory"), `source_path`, `sensitivity` (`low|medium|high`, default
   `medium`), `metrics_mode` (`structure_only|with_embeddings`, default `structure_only`).
-- Added `.mcp.json` registering one server `creativity-graph`, launched with `uv run` against the
+- Added `.mcp.json` registering one server `sproutgraph`, launched with `uv run` against the
   persistent data dir, exporting `KG_PROJECT_DIR=${CLAUDE_PROJECT_DIR}` and `KG_DATA=${CLAUDE_PLUGIN_DATA}`.
 - Added `pyproject.toml` (uv-managed engine deps) and the `SessionStart` bootstrap
   (`hooks/bootstrap.sh`): diff the bundled `pyproject.toml` against the copy in `${CLAUDE_PLUGIN_DATA}`
   and run `uv sync` only on difference, so the venv installs once and re-syncs only on dependency changes.
-- Stubbed `scripts/kg_engine/server.py` exposing `mcp__creativity-graph__kg_ping` →
+- Stubbed `scripts/kg_engine/server.py` exposing `mcp__sproutgraph__kg_ping` →
   `{name, version, metrics_mode, sensitivity, pack_loaded}`.
-- **Exit test:** `claude plugin validate ./creativity-graph --strict` passes; the plugin loads and
+- **Exit test:** `claude plugin validate ./Sproutgraph --strict` passes; the plugin loads and
   `kg_ping` returns the version.
 
 ### Stage 1 — Canon + transactional writes + lease lock + reconciler
@@ -995,7 +995,7 @@ regression tests were added (`tests/test_review_fixes.py`).
   `sensitivity`) using consistent placeholders that preserve relational structure
   (`⟦PERSON:1⟧ attacked_by ⟦PERSON:2⟧`); the mapping stays local and `restore` rebuilds the original
   for span verification (§1.9). The scrub protects egress, not the local canon.
-- The egress scrub is now wired into the live path: a new `mcp__creativity-graph__kg_scrub` tool runs
+- The egress scrub is now wired into the live path: a new `mcp__sproutgraph__kg_scrub` tool runs
   the §1.9 egress redaction with consistent placeholders (`⟦SECRET:1⟧` etc.) before text reaches a
   subagent, and `kg_write` restores placeholder spans to the original for the canon (the boundary
   stores the restored original span). The MCP tool surface is now **eleven** tools.
@@ -1008,7 +1008,7 @@ regression tests were added (`tests/test_review_fixes.py`).
   is **demoted** to `unverified`/`agent`, never forged (§1.4/§1.8).
 - `agents/extractor.md` (subagent `kg-extractor`): reads the scrubbed source section by section and
   emits the contract JSON — nodes, pack-typed edges, and a verbatim supporting span per edge — to
-  `mcp__creativity-graph__kg_write`.
+  `mcp__sproutgraph__kg_write`.
 - **Exit test:** `pytest tests/test_invariants.py` — fabricated/undeclared/span-less edges are
   rejected or demoted; truncated JSON is rejected; a seeded secret never leaves the scrubber.
 
@@ -1048,7 +1048,7 @@ regression tests were added (`tests/test_review_fixes.py`).
 
 ### Stage 6 — Grounding loop + adversarial grounder + memory of failures
 
-- `mcp__creativity-graph__kg_ground(target_id, verdict, by, kind, note)` — the **only** way to set a
+- `mcp__sproutgraph__kg_ground(target_id, verdict, by, kind, note)` — the **only** way to set a
   verdict (`grounded | rejected | failed | obsolete`), stamping `verdict_by`/`verdict_at` and an audit
   record; verdicts survive reprojection via the reconciler (§1.8).
 - `agents/grounder.md` (subagent `kg-grounder`): walks the `unverified` edge queue, re-verifies each
@@ -1098,24 +1098,24 @@ regression tests were added (`tests/test_review_fixes.py`).
     `evaluator.md` (`kg-evaluator`).
   - **Commands:** `/kg-build`, `/kg-ground`, `/kg-query`, `/kg-eval`, `/kg-experiment` — orchestrate the
     agents via the `Task` tool and the MCP tools.
-  - **Skill:** `skills/creativity-graph/SKILL.md` (the build → ground → query operating guide) with
+  - **Skill:** `skills/sproutgraph/SKILL.md` (the build → ground → query operating guide) with
     on-demand `references/` (`contract.md`, `pack-schema.md`, `tools.md`).
   - **Hooks:** `hooks/hooks.json` wiring `SessionStart` (`bootstrap.sh`) and `PreToolUse`
     (`precontext.py`).
-- **Exit test:** `pytest tests/` fully green and `claude plugin validate ./creativity-graph --strict`
+- **Exit test:** `pytest tests/` fully green and `claude plugin validate ./Sproutgraph --strict`
   passes; a clean install lists every component (skills, agents, hooks, MCP server).
 
 ### Packaging hardening + live validation (v0.1.0)
 
 After `claude plugin validate --strict` passed, the plugin was installed locally — user scope, via a
 single-plugin `marketplace.json` — and the full workflow run end-to-end **through the installed plugin**
-on a fresh vault: `/creativity-graph:kg-build` → `/kg-ground` → `/kg-query`. (Plugin commands are
-namespaced `/creativity-graph:<command>`.) Running it for real surfaced four packaging/quality bugs that
+on a fresh vault: `/sproutgraph:kg-build` → `/kg-ground` → `/kg-query`. (Plugin commands are
+namespaced `/sproutgraph:<command>`.) Running it for real surfaced four packaging/quality bugs that
 static review could not — each fixed and re-verified:
 
 - **MCP tool namespace.** A plugin-bundled server's tools are namespaced
-  `mcp__plugin_<plugin>_<server>__<tool>` (here `mcp__plugin_creativity-graph_creativity-graph__kg_write`),
-  **not** `mcp__creativity-graph__kg_write`. Every agent `tools:` / command `allowed-tools:` grant (and
+  `mcp__plugin_<plugin>_<server>__<tool>` (here `mcp__plugin_sproutgraph_sproutgraph__kg_write`),
+  **not** `mcp__sproutgraph__kg_write`. Every agent `tools:` / command `allowed-tools:` grant (and
   doc reference) used the short form, so the `kg-extractor` subagent received no graph tools. Swept all
   references to the correct prefix.
 - **userConfig → server environment.** `${CLAUDE_PLUGIN_OPTION_*}` does **not** expand inside `.mcp.json`
@@ -1185,14 +1185,14 @@ Stage 9 task list — implemented, then hardened against a 6-dimension adversari
 Streamlined the prose docs to `README` + `ARCHITECTURE` + `PROGRESS` + `CHANGELOG` + a new `CLAUDE.md`;
 the full `.md` set was then audited and verified free of dangling links.
 
-- **Removed `IMPLEMENTATION-PLAN-creativity-graph-claude-code.md`** — the pre-build design doc,
+- **Removed `IMPLEMENTATION-PLAN-sproutgraph-claude-code.md`** — the pre-build design doc,
   superseded by the shipped engine, `ARCHITECTURE.md`, and this changelog; no code, CI, or manifest
   referenced it. The stale prose pointers to it in `ARCHITECTURE`/`PROGRESS`/`CHANGELOG` were scrubbed.
 - **Removed `RELEASE.md`**, folding the maintainer release checklist (pre-flight validation,
   dual-manifest version bump, optional headless rebuild, manual publish/tag) into the new **`CLAUDE.md`**;
   the publish-step mentions in `PROGRESS`/`CHANGELOG` now point there.
-- **Fixed** a dangling reference in `skills/creativity-graph/references/tools.md`: the write-contract
+- **Fixed** a dangling reference in `skills/sproutgraph/references/tools.md`: the write-contract
   pointer now targets the existing `references/contract.md` (it previously named a sibling reference
   file that did not exist).
 
-[Unreleased]: https://github.com/sergiparpal/creativity-graph/commits/main
+[Unreleased]: https://github.com/sergiparpal/Sproutgraph/commits/main

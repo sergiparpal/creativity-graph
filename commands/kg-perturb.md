@@ -1,7 +1,7 @@
 ---
 description: Grounding's second function — import EXTERNAL structure the graph's own dynamics would resist, build it as a second construction, and cross-generate (ensemble §9) to surface bridges that exist across constructions. The only mechanism that attacks coverage.
 argument-hint: "[second_source_or_graph_json]"
-allowed-tools: Task, Bash, mcp__plugin_creativity-graph_creativity-graph__kg_generate, mcp__plugin_creativity-graph_creativity-graph__kg_propose, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__kg_metrics
+allowed-tools: Task, Bash, mcp__plugin_sproutgraph_sproutgraph__kg_generate, mcp__plugin_sproutgraph_sproutgraph__kg_propose, mcp__plugin_sproutgraph_sproutgraph__kg_context, mcp__plugin_sproutgraph_sproutgraph__kg_metrics
 ---
 
 # /kg-perturb — perturbation & exo cross-generation (PLAN Stage 7; §9 / §15)
@@ -24,7 +24,7 @@ in place (a re-partition), which degrades to `regroup`.
 
 ## Step 0 — confirm a primary graph exists
 
-Call `mcp__plugin_creativity-graph_creativity-graph__kg_context(budget=2000)`. If empty, tell the user to run
+Call `mcp__plugin_sproutgraph_sproutgraph__kg_context(budget=2000)`. If empty, tell the user to run
 `/kg-build` → `/kg-ground` (and optionally `/kg-generate`) first, and stop.
 
 ## Step 1 — obtain the SECOND construction (a second graph.json)
@@ -32,8 +32,8 @@ Call `mcp__plugin_creativity-graph_creativity-graph__kg_context(budget=2000)`. I
 Resolve the runner once (dev vs runtime, per the contract), then produce a second `graph.json`:
 
 ```bash
-PY=/home/sergi/creativity-graph/.venv/bin/python          # or "${CLAUDE_PLUGIN_DATA}/.venv/bin/python"
-SCRIPTS=/home/sergi/creativity-graph/scripts               # or "${CLAUDE_PLUGIN_ROOT}/scripts"
+PY=/home/sergi/Sproutgraph/.venv/bin/python          # or "${CLAUDE_PLUGIN_DATA}/.venv/bin/python"
+SCRIPTS=/home/sergi/Sproutgraph/scripts               # or "${CLAUDE_PLUGIN_ROOT}/scripts"
 SECOND="$1"
 ```
 
@@ -53,7 +53,7 @@ If a second graph was built, sanity-check it loaded (non-empty nodes/edges) befo
 
 ## Step 2 — cross-generate (ensemble §9)
 
-Call `mcp__plugin_creativity-graph_creativity-graph__kg_generate(mechanism="ensemble", second_graph="$SECOND_GRAPH", k=10)`.
+Call `mcp__plugin_sproutgraph_sproutgraph__kg_generate(mechanism="ensemble", second_graph="$SECOND_GRAPH", k=10)`.
 It returns hypothesized candidate bridges that are adjacent in the second construction but absent in ours
 (each rationale carries `perturbation=external`). With no second graph, the same call returns the `regroup`
 degrade (its `note` says so) — still useful, but internal, not coverage-attacking.
@@ -62,7 +62,7 @@ degrade (its `note` says so) — still useful, but internal, not coverage-attack
 
 Launch **kg-generator** with the candidates. Instruct it to mark each proposal as **imported structure**:
 carry `perturbation=external` into the `notes`, so the slate is legible as cross-construction structure
-rather than internal elaboration. It writes through `mcp__plugin_creativity-graph_creativity-graph__kg_propose`
+rather than internal elaboration. It writes through `mcp__plugin_sproutgraph_sproutgraph__kg_propose`
 (hypothesized/unverified, no span — never a verdict).
 
 ```
@@ -77,7 +77,7 @@ Task(subagent_type: "kg-generator", description: "Phrase exo bridges", prompt: "
 ## Step 4 — report the perturbation slate
 
 Present the ranked slate (mechanism `ensemble`, § = §9, one-sentence idea, specificity), flagged as
-**imported external structure**, then `mcp__plugin_creativity-graph_creativity-graph__kg_metrics` (the new
+**imported external structure**, then `mcp__plugin_sproutgraph_sproutgraph__kg_metrics` (the new
 hypothesized candidates land under `unverified`). State the caveat explicitly: *perturbation relocates the
 blind spot; it does not eliminate it.* Then point at `/kg-ground` as the filter — a cross-construction bridge
 earns `grounded` only by a span/citation, else it joins failure memory and binds the next generation.

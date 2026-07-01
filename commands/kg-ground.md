@@ -1,7 +1,7 @@
 ---
 description: Drain the grounding queue — verdict unverified edges, attack hub candidates, then report verdict counts and falsification memory.
 argument-hint: "[query-or-node-filter]"
-allowed-tools: Task, mcp__plugin_creativity-graph_creativity-graph__kg_metrics, mcp__plugin_creativity-graph_creativity-graph__kg_context, mcp__plugin_creativity-graph_creativity-graph__query_graph, mcp__plugin_creativity-graph_creativity-graph__kg_agenda, mcp__plugin_creativity-graph_creativity-graph__kg_merge
+allowed-tools: Task, mcp__plugin_sproutgraph_sproutgraph__kg_metrics, mcp__plugin_sproutgraph_sproutgraph__kg_context, mcp__plugin_sproutgraph_sproutgraph__query_graph, mcp__plugin_sproutgraph_sproutgraph__kg_agenda, mcp__plugin_sproutgraph_sproutgraph__kg_merge
 ---
 
 # /kg-ground — grounding loop + adversarial grounder + memory of failures (§1.6/§1.7/§1.8, plan Stage 6)
@@ -17,12 +17,12 @@ Optional `$ARGUMENTS`: a focus query / node filter (e.g. `betweenness`, `compres
 
 Find what is actually pending before spending any subagent budget.
 
-1. `mcp__plugin_creativity-graph_creativity-graph__kg_metrics()` → record the baseline `edges_by_epistemic_state` map (keys are the
+1. `mcp__plugin_sproutgraph_sproutgraph__kg_metrics()` → record the baseline `edges_by_epistemic_state` map (keys are the
    `epistemic_state` values: `unverified | grounded | rejected | failed | obsolete`). The count under
    `unverified` is the grounding queue depth.
-2. `mcp__plugin_creativity-graph_creativity-graph__query_graph(epistemic_state="unverified", limit=50)` → the concrete edge backlog
+2. `mcp__plugin_sproutgraph_sproutgraph__query_graph(epistemic_state="unverified", limit=50)` → the concrete edge backlog
    the first grounder must verdict. If `$ARGUMENTS` is non-empty, also call
-   `mcp__plugin_creativity-graph_creativity-graph__kg_context(query="$ARGUMENTS")` and read its `advisory` block —
+   `mcp__plugin_sproutgraph_sproutgraph__kg_context(query="$ARGUMENTS")` and read its `advisory` block —
    `advisory.signal == "structural-bridge"`, `advisory.note`, `advisory.nodes[]` — to learn which nodes the
    structural-bridge heuristic flags as bridges (the honest advisory is degree; specificity-weighted
    betweenness stays GATED until validated, §1.6). Those `advisory.nodes[]` plus any high-degree nodes are
@@ -31,7 +31,7 @@ Find what is actually pending before spending any subagent budget.
 If the `unverified` count is 0 and there are no hub candidates, stop and report "queue empty — nothing to
 ground". Otherwise proceed.
 
-> **Alternative prioritization (optional).** `mcp__plugin_creativity-graph_creativity-graph__kg_agenda()`'s
+> **Alternative prioritization (optional).** `mcp__plugin_sproutgraph_sproutgraph__kg_agenda()`'s
 > `blocked_on_grounding[]` lane is a read-only structural shortlist of what grounding would unblock —
 > under-grounded hubs and hypothesized-only neighbourhoods, ranked by the honest gate-aware signal. Use it to
 > pick which hubs/edges to drain first; it suggests, never grounds (verdicts still flow only through `kg_ground`).
@@ -50,7 +50,7 @@ A grounded/`failed` **span-present** edge's stored `span` is a snapshot taken wh
 source was later edited so that span no longer appears, the verdict is now resting on text that is gone. The
 projector recomputes this off the hot path and surfaces it (read-only — it **never** mutates the verdict):
 
-1. `mcp__plugin_creativity-graph_creativity-graph__kg_context(query="$ARGUMENTS")` → read
+1. `mcp__plugin_sproutgraph_sproutgraph__kg_context(query="$ARGUMENTS")` → read
    `advisory.stale_verdicts[]`. Each entry is `{edge_id, reason: "span-no-longer-in-source"}`: a grounded or
    `failed` edge whose stored span no longer verifies against its source file. (Empty when nothing diverged —
    the common case; if so, skip to Stage 1.)
@@ -127,9 +127,9 @@ as much as confirmation (source §4).
 
 Both subagents have applied verdicts. Re-read the engine and present the delta — do NOT re-verdict anything.
 
-1. `mcp__plugin_creativity-graph_creativity-graph__kg_metrics()` → show the new `edges_by_epistemic_state`. Print a before/after diff
+1. `mcp__plugin_sproutgraph_sproutgraph__kg_metrics()` → show the new `edges_by_epistemic_state`. Print a before/after diff
    against the Stage 0 baseline for `unverified` (should drop), `grounded`, `rejected`, and `failed`.
-2. `mcp__plugin_creativity-graph_creativity-graph__kg_context(query="$ARGUMENTS")` → read `falsification_counters` and report
+2. `mcp__plugin_sproutgraph_sproutgraph__kg_context(query="$ARGUMENTS")` → read `falsification_counters` and report
    `falsification_counters.failed_or_rejected_edges` as the size of the negative-information memory. Also note
    `approx_tokens` vs `budget` if context was requested for downstream use.
 

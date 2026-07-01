@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`creativity-graph` is a **Claude Code plugin** that turns a non-self-grounding conceptual document
+`Sproutgraph` is a **Claude Code plugin** that turns a non-self-grounding conceptual document
 into a grounded, queryable knowledge graph. It is built in two halves that meet at an MCP boundary:
 
 - A **deterministic Python engine** (`scripts/kg_engine/`) owns everything that must be exact —
@@ -119,7 +119,7 @@ churn exceeds the threshold). Grounders reject edges that are "true" only becaus
 
 ## In-session pipeline
 
-Slash command → subagent(s) → MCP tools. The `creativity-graph` skill (`skills/creativity-graph/`)
+Slash command → subagent(s) → MCP tools. The `sproutgraph` skill (`skills/sproutgraph/`)
 bundles these; its `references/{contract,tools,pack-schema}.md` are loaded on demand.
 
 | Command | Subagent(s) | What happens |
@@ -142,7 +142,7 @@ best and proceed — no human gate blocks the flow. Results are appended to `PRO
 
 ## MCP tool surface (20 tools)
 
-Namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`:
+Namespaced `mcp__plugin_sproutgraph_sproutgraph__<tool>`:
 - **Mutations (write canon):** `kg_write` (the boundary; carries a deterministic `receipt` and accepts an `idempotency_key` so a retry of a write whose transport response was lost replays the same receipt — never a duplicate), `kg_propose` (the *hypothesized* write lane — forces hypothesized provenance, refuses text claims), `kg_ground` (the *sole* verdict gateway — stamps `verdict_by`/`verdict_at` + audit record; `support_span`/`support_note` promote a hypothesis and upgrade its provenance), `kg_rename` (a STRICT pure-rename — re-keys a node's edges, refuses a target-id collision), `kg_merge` (the deliberate node-**merge** rename refuses: folds `from_id` into an existing `into_id`, rewriting + deduping colliding edges with negative-info-sticky precedence — `failed`/`rejected` survive, else `grounded`>`unverified`, span/note kept, never a forged verdict — dropping only the positive/unverified self-loops it creates (a `failed`/`rejected` self-loop the merge collapses survives as never-pruned negative information, §1.7) and re-keying surviving verdicts via the same id-migrating audit record as `kg_rename`). None of these touch the projection seam, so a projection failure can never block a write.
 - **Generative (read derived → propose; §2–§14):** `kg_generate` (seven discovery mechanisms — the six core plus `periphery` (§5, low-degree sources); read-only. Each candidate carries an advisory `convergence` = # of distinct mechanisms that independently proposed it — a ranking prior for the grounding queue, never a score and never written to the canon; harness-gated (`harness.convergence`) before it may reorder grounding), `kg_operate` (the four §8 endo operations, write via the propose lane), `kg_absorption` (the §14 absorption window).
 - **Reads (lazily project, then serve derived):** `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path` (read-only egress — R2/§2; traces the associative chain connecting nodes over **grounded edges only** and reports the path length as an advisory `leap` "creative-leap" signal — never a verdict, never written, never a score; empty with a `reason` when no fully-grounded path exists), `kg_context` (grounded `items[]` + a separate `hypotheses[]` + `advisory.bridge_metric`), `kg_agenda` (read-only structural "suggested questions" — R6; `answerable_now[]` vs `blocked_on_grounding[]`), `kg_export` (read-only human-facing render — R1; a self-contained `graph.html` + `GRAPH_REPORT.md`). Both read through the shared read-only `_agenda_reader()` seam; neither writes the derived layer. A reprojection that raises degrades the read (a `projection_degraded` flag over canon-derived/empty data) rather than crashing the tool.
@@ -260,7 +260,7 @@ only the full `pytest` suite catches a stale literal there — so after a bump a
 not just the validator:
 
 - `.claude-plugin/plugin.json` → `version`
-- `.claude-plugin/marketplace.json` → the `creativity-graph` entry's `version`
+- `.claude-plugin/marketplace.json` → the `sproutgraph` entry's `version`
 - `pyproject.toml` → `[project]` `version`
 - `scripts/kg_engine/__init__.py` → `__version__`
 - `tests/test_e2e_generative.py` → the `test_end_to_end_generative_loop` version stamp
@@ -284,17 +284,17 @@ python -m kg_engine.backend extract            # extract → boundary → canon 
 ### 4. Publish + tag (manual, outward-facing — run by a human)
 
 The bundled `.claude-plugin/marketplace.json` **is** the public single-plugin marketplace
-(`name: sergiparpal`, `source: "."`): pushing this repo to `github.com/sergiparpal/creativity-graph`
-makes it installable via `/plugin marketplace add sergiparpal/creativity-graph` +
-`/plugin install creativity-graph@sergiparpal`. These steps are **not** automated:
+(`name: sergiparpal`, `source: "."`): pushing this repo to `github.com/sergiparpal/Sproutgraph`
+makes it installable via `/plugin marketplace add sergiparpal/Sproutgraph` +
+`/plugin install sproutgraph@sergiparpal`. These steps are **not** automated:
 
 1. Commit the version bump and changelog on `main`.
 2. Push `main` to the public repo so the updated `marketplace.json` (with the bumped version) is live.
 3. Tag the release: `claude plugin tag . --push`. The CLI takes the plugin **path** (not a name), reads
    the version from `plugin.json`, validates that the enclosing `marketplace.json` entry agrees, and
-   creates **and** pushes the `creativity-graph--v<version>` tag — the repo's convention (cf. the
-   existing `creativity-graph--v0.3.0`). Drop `--push` to create it locally first, then
-   `git push origin refs/tags/creativity-graph--v<version>`. (There is no separate plain `vX.Y.Z` tag;
+   creates **and** pushes the `sproutgraph--v<version>` tag — the repo's convention (the tag's
+   plugin-name prefix is read from `plugin.json`). Drop `--push` to create it locally first, then
+   `git push origin refs/tags/sproutgraph--v<version>`. (There is no separate plain `vX.Y.Z` tag;
    `--dry-run` prints exactly what would be tagged.)
 
 Publishing is hard to reverse and makes the release publicly installable — do it only when steps 1–3

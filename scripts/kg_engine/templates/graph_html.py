@@ -20,7 +20,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>creativity-graph — knowledge graph</title>
+<title>Sproutgraph — knowledge graph</title>
 <style>
   :root { color-scheme: light dark; }
   html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, sans-serif; background: #fbfbfa; color: #222; }
@@ -44,7 +44,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <canvas id="c"></canvas>
 <div id="tip"></div>
 <div id="legend">
-  <h1>creativity-graph</h1>
+  <h1>Sproutgraph</h1>
   <p class="muted" id="counts"></p>
   <p class="muted">Three orthogonal axes, never one "quality" colour. Disposable render of the canon.</p>
   <div class="ax">epistemic_state — edge line</div>

@@ -1,4 +1,4 @@
-"""kg_engine — the deterministic graph engine for the creativity-graph Claude Code plugin.
+"""kg_engine — the deterministic graph engine for the Sproutgraph Claude Code plugin.
 
 Submodules:
   model       three axes, Node/Edge, span verification, frontmatter I/O

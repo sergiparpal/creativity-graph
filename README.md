@@ -113,24 +113,24 @@ This is a Claude Code plugin. From inside Claude Code (works in both the **CLI**
 **Desktop** app), run these two commands:
 
 ```
-/plugin marketplace add sergiparpal/creativity-graph
-/plugin install creativity-graph@sergiparpal
+/plugin marketplace add sergiparpal/Sproutgraph
+/plugin install sproutgraph@sergiparpal
 ```
 
 The first command registers this repo as a plugin marketplace (Claude Code reads
-`.claude-plugin/marketplace.json` from `github.com/sergiparpal/creativity-graph`); the second
-installs the `creativity-graph` plugin from it. Restart the session if prompted so the plugin's
+`.claude-plugin/marketplace.json` from `github.com/sergiparpal/Sproutgraph`); the second
+installs the `sproutgraph` plugin from it. Restart the session if prompted so the plugin's
 hooks and MCP server load.
 
 > For **local development** instead of installing from GitHub, point Claude Code at this checkout:
-> `claude --plugin-dir /path/to/creativity-graph`.
+> `claude --plugin-dir /path/to/Sproutgraph`.
 
 **Updating to the latest version.** If you don't have the latest version installed, update it from
 inside Claude Code:
 
 ```
 /plugin marketplace update sergiparpal
-/plugin install creativity-graph@sergiparpal
+/plugin install sproutgraph@sergiparpal
 ```
 
 On `SessionStart` a cross-platform hook (`hooks/provision.mjs` → an OS launcher →
@@ -147,7 +147,7 @@ into a clean automatic reconnect — no manual `/mcp reconnect`. See
 
 ### Troubleshooting install
 
-**`/plugin install` says `Plugin "creativity-graph" not found in marketplace "sergiparpal"` — even
+**`/plugin install` says `Plugin "sproutgraph" not found in marketplace "sergiparpal"` — even
 though `/plugin marketplace add` reported success.** This is a **stale marketplace cache**, not a
 problem with the published manifest. `marketplace add` reports "Successfully added" even when it reuses
 an existing cached clone of the marketplace (under `~/.claude/plugins/marketplaces/<name>/`), so an old
@@ -156,12 +156,12 @@ clone that predates the plugin entry hides it from the install lookup. Fix it in
 ```
 # 1. Refresh the cached manifest, then retry the install:
 /plugin marketplace update sergiparpal
-/plugin install creativity-graph@sergiparpal
+/plugin install sproutgraph@sergiparpal
 
 # 2. Still "not found"? Remove and re-add the marketplace fresh:
 /plugin marketplace remove sergiparpal
-/plugin marketplace add sergiparpal/creativity-graph
-/plugin install creativity-graph@sergiparpal
+/plugin marketplace add sergiparpal/Sproutgraph
+/plugin install sproutgraph@sergiparpal
 ```
 
 If it *still* fails after that, delete the cached clone (`rm -rf
@@ -172,7 +172,7 @@ is a network/access problem on that machine, not the repo:
 
 ```sh
 curl -sS -o /dev/null -w "%{http_code}\n" \
-  https://raw.githubusercontent.com/sergiparpal/creativity-graph/main/.claude-plugin/marketplace.json
+  https://raw.githubusercontent.com/sergiparpal/Sproutgraph/main/.claude-plugin/marketplace.json
 ```
 
 ### Multi-machine / multi-branch canon merges (optional)
@@ -190,7 +190,7 @@ already ships one) and register the driver:
 
 ```sh
 echo 'canon/*.md merge=kgcanon' >> .gitattributes
-git config merge.kgcanon.name   "creativity-graph canon merge"
+git config merge.kgcanon.name   "Sproutgraph canon merge"
 git config merge.kgcanon.driver "node ${CLAUDE_PLUGIN_ROOT}/scripts/canon_merge_driver.mjs %O %A %B"
 # (substitute the absolute path to the plugin checkout if ${CLAUDE_PLUGIN_ROOT} isn't exported in your shell)
 ```
@@ -201,9 +201,9 @@ a conflict, so it cannot forge a verdict; a verdict that survives a clean merge 
 record is re-quarantined by the per-session reconciler anyway. (Sharing verdicts *across* machines — a
 syncable audit log — is a deliberately deferred follow-up; see `CHANGELOG.md`.)
 
-### The install config screen ("Configure creativity-graph")
+### The install config screen ("Configure sproutgraph")
 
-`/plugin install creativity-graph@sergiparpal` opens a **Configure creativity-graph** screen
+`/plugin install sproutgraph@sergiparpal` opens a **Configure sproutgraph** screen
 listing the four options below and a final **Save configuration** row:
 
 ```
@@ -245,7 +245,7 @@ The **userConfig** table just below is the per-option reference; in short:
   run can override it inline (`/kg-build <source> <wave_size>`) without touching config.
 
 **Changing it after install.** The values are stored in `settings.json` under
-`pluginConfigs["creativity-graph@sergiparpal"].options`. To change them, edit that block (user
+`pluginConfigs["sproutgraph@sergiparpal"].options`. To change them, edit that block (user
 scope `~/.claude/settings.json`, or project scope `.claude/settings.json`) and run
 `/reload-plugins`, or re-open the configure screen from the `/plugin` menu. Confirm the server
 picked up the change with `kg_ping()`, which echoes `{metrics_mode, sensitivity, …}`.
@@ -267,13 +267,13 @@ picked up the change with `kg_ping()`, which echoes `{metrics_mode, sensitivity,
 Confirm the server sees your config:
 
 ```
-mcp__plugin_creativity-graph_creativity-graph__kg_ping()
+mcp__plugin_sproutgraph_sproutgraph__kg_ping()
 → {name, version, metrics_mode, sensitivity, pack_loaded}
 ```
 
 ---
 
-## Tutorial — using creativity-graph (no jargon)
+## Tutorial — using Sproutgraph (no jargon)
 
 A plain-English walkthrough for using the plugin **after it's installed and configured** (the two sections
 above). No coding — you'll type a few short commands and ask questions in normal words.
@@ -299,7 +299,7 @@ to the exact sentence that supports it.
 1. **Commands you type yourself.** These start with a slash (`/`), like `/kg-build`. You type them straight
    into Claude Code — these are the main buttons you press.
 2. **Helpers Claude runs for you.** These have names like `kg_ping` (no slash). You *don't* type these — you
-   just ask Claude in plain English ("check that the creativity-graph server is running") and it runs the
+   just ask Claude in plain English ("check that the Sproutgraph server is running") and it runs the
    right helper behind the scenes. The slash commands use these helpers automatically.
 
 **Rule of thumb: anything with a `/`, you type. Anything without a `/`, you just ask for in normal words.**
@@ -317,10 +317,10 @@ Just trying it out? The repo ships a demo document at `examples/source.md`.
 **Step 2 — Check it's awake.** Before building, make sure the plugin is connected and running. There's no
 command to type — just ask Claude something like:
 
-> "Check that the creativity-graph server is running and show me its settings."
+> "Check that the Sproutgraph server is running and show me its settings."
 
 Claude runs the health check (`kg_ping`) and reports back the version and your settings. (You can also type
-`/mcp` to see every connected server and confirm `creativity-graph` is in the list.)
+`/mcp` to see every connected server and confirm `sproutgraph` is in the list.)
 
 **Step 3 — Build the map.**
 
@@ -437,9 +437,9 @@ Claude for them in plain words.
 ## Component layout
 
 ```
-creativity-graph/
+Sproutgraph/
 ├── .claude-plugin/plugin.json     # manifest + userConfig
-├── .mcp.json                      # MCP server "creativity-graph" (node → launch_server.mjs)
+├── .mcp.json                      # MCP server "sproutgraph" (node → launch_server.mjs)
 ├── commands/                      # slash commands (the orchestration layer)
 │   ├── kg-build.md                # /kg-build   — extract → canon → project
 │   ├── kg-ground.md               # /kg-ground  — grounding loop + adversarial red-team
@@ -456,7 +456,7 @@ creativity-graph/
 │   ├── generator.md               # kg-generator          → phrase/name candidates → kg_propose
 │   ├── annotator.md               # kg-annotator          → f4_probe labels / α label passes
 │   └── evaluator.md               # kg-evaluator          → blind ideation experiment (control|graph|graph+generate|rag · +optional lightrag)
-├── skills/creativity-graph/       # SKILL.md operating guide + references/
+├── skills/sproutgraph/       # SKILL.md operating guide + references/
 ├── pack/{pack.yaml,glossary.md}   # the declared vocabulary
 ├── hooks/                         # SessionStart provisioning + PreToolUse context (cross-platform)
 │   ├── hooks.json
@@ -483,7 +483,7 @@ creativity-graph/
 
 ## The MCP tool surface
 
-Server name `creativity-graph` ⇒ tools are namespaced `mcp__plugin_creativity-graph_creativity-graph__<tool>`. The
+Server name `sproutgraph` ⇒ tools are namespaced `mcp__plugin_sproutgraph_sproutgraph__<tool>`. The
 **sixteen** verify/read tools (`kg_ping`, `kg_scrub`, `kg_write`, `kg_ground`, `kg_rename`, `kg_merge`, `kg_metrics`,
 `kg_status`, `query_graph`, `get_node`, `get_neighbors`, `shortest_path`, `kg_explain_path`, `kg_context`, `kg_agenda`,
 `kg_export`) plus the **four** generative-layer tools (`kg_propose` — the hypothesized write lane; `kg_generate` — the
@@ -565,7 +565,7 @@ python -m kg_engine.pack validate pack/pack.yaml examples/source.md   # PackCont
 
 ## Development
 
-Run from the repo with the engine venv (`/home/sergi/creativity-graph/.venv/bin/python`) or
+Run from the repo with the engine venv (`/home/sergi/Sproutgraph/.venv/bin/python`) or
 `uv run`:
 
 ```bash
