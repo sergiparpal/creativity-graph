@@ -296,6 +296,20 @@ makes it installable via `/plugin marketplace add sergiparpal/Sproutgraph` +
    plugin-name prefix is read from `plugin.json`). Drop `--push` to create it locally first, then
    `git push origin refs/tags/sproutgraph--v<version>`. (There is no separate plain `vX.Y.Z` tag;
    `--dry-run` prints exactly what would be tagged.)
+4. **Publish the GitHub Release** — the object shown in the repo's main-page **Releases** panel, and a
+   *distinct* thing from the git tag: `claude plugin tag` (step 3) pushes **only** the tag, so without
+   this step the new version never appears on the main page. Every version in this repo has a matching
+   Release; create one from the just-pushed tag with the house `v<version> — <summary>` title and that
+   version's `CHANGELOG.md` section as the body:
+   ```sh
+   gh release create sproutgraph--v<version> \
+     --title "v<version> — <one-line summary>" \
+     --notes-file <(awk '/^## \[<version>\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md) \
+     --latest --verify-tag
+   ```
+   `--latest` marks it the release surfaced on the main page; `--verify-tag` refuses to publish unless
+   the step-3 tag was actually pushed. (The `awk` extracts the matching `## [<version>]` section from
+   `CHANGELOG.md`.)
 
 Publishing is hard to reverse and makes the release publicly installable — do it only when steps 1–3
 are green and the version is final.
