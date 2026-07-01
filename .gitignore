@@ -3,8 +3,11 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-.kg-session-lock
+# Per-vault engine runtime artifacts — locks (incl. the `.stale` reclaim rename), reconcile state, the
+# §1.8 grounding-audit log + its checkpoint sidecar, and the derived store. All disposable, never canon.
+.kg-session-lock*
 .kg-reconcile-state.json
+.kg-ground-audit.jsonl*
 .kg-data/
 .tmp-*
 *.Zone.Identifier
