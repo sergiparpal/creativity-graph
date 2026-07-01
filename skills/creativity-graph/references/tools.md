@@ -102,7 +102,9 @@ REJECTED as `truncated-payload`.
 - `written_nodes[]` — node ids actually committed (includes boundary-auto-created placeholder source nodes).
 - `rolled_back` / `error` — `rolled_back` is `true` (and `error` carries the failure message) when the multi-file canon write could not commit and was rolled back.
 - `receipt` — a deterministic token: a short hash over the SORTED set of the payload's target ids (node ids +
-  derived edge ids). Same payload → same `receipt`, across restarts.
+  derived edge ids) **and each item's content-bearing fields** (a node's `label`/`body`/`node_type`/three axes/
+  `confidence`; an edge's `span`/`note`/`confidence`/axes/`source_file`), so a same-ids payload whose TEXT
+  changed (e.g. a corrected span) yields a DIFFERENT `receipt`. Same payload → same `receipt`, across restarts.
 - `idempotency_key` (optional arg) — re-sending an identical write (same payload ⇒ same `receipt`) with the
   same key after a lost transport response is a TRUE no-op: the cached response is replayed VERBATIM with
   `idempotent_replay: true` (no re-validation, no second write). A reused key with a DIFFERENT payload is NOT
@@ -171,7 +173,10 @@ two edges share one canonical id they are **deduped** (never duplicated, never a
   that state — it is never pruned. Otherwise the stronger of `grounded` > `unverified` wins.
 - The **verbatim span** and the stored **verdict note** are kept; provenance prefers `span-present`. No
   verdict or span is ever forged, upgraded, or invented — the merged state is always one a real edge held.
-- **Self-loops** the rewrite creates (`source == target`) are dropped and reported.
+- **Self-loops** the rewrite creates (`source == target`) are dropped and reported — **except** a
+  `failed`/`rejected` self-loop, which is PRESERVED (negative information is never pruned, §1.7): a refuted
+  edge lying directly between the two merged concepts survives as a degenerate self-loop so its verdict +
+  span stay in `falsification_counters`.
 
 Keeps `into_id`'s `node_type`/`label`, and **refuses** (`"node_type conflict — refusing to merge"`) a merge
 across two *different declared* node types so a wrong merge can't corrupt typing. A surviving verdict whose
@@ -201,7 +206,7 @@ Cheap summary counts straight off the canon (no projection). No args.
 ### 1.7 `mcp__plugin_creativity-graph_creativity-graph__query_graph(node_type=None, relation=None, epistemic_state=None, limit=50)`
 
 Filtered read of the derived index. Nodes filtered by `node_type` and/or `epistemic_state`, **ordered by
-precomputed `degree` DESC** (the honest MVP advisory, §1.6), capped at `limit`. Edges filtered by `relation`,
+precomputed `degree` DESC** (the honest MVP advisory, §1.6), capped at `limit`. Edges filtered by `relation` and **ordered by `id` ASC** (a deterministic, byte-stable top-N),
 capped at `limit`. All filters optional.
 
 ```json

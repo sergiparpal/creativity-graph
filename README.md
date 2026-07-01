@@ -25,7 +25,7 @@ A prose theory does not verify itself the way code verifies against a parse tree
 everything, edges no one ever checked, confident verdicts no one ever earned. This plugin
 exists to make that failure mode *structurally impossible*.
 
-A deterministic Python engine (`scripts/kg_engine`, 496 tests green) does the work that must be
+A deterministic Python engine (`scripts/kg_engine`, 733 tests green) does the work that must be
 exact — schema validation, span verification, verdict stamping, projection, scrubbing. The
 Claude Code session and its subagents do the **language** work — reading prose, proposing typed
 edges, copying spans, arguing the adversarial case — and hand structured JSON back across an
@@ -496,7 +496,7 @@ commands).
 | `kg_write(payload, idempotency_key=None)` | the span-present write boundary → `{dispositions, details[], written_nodes[], rolled_back, error, receipt}`; egress scrubbing is wired in here too — placeholder spans are restored to the original source text for the canon. Every response carries a deterministic `receipt` (a hash of the payload's target ids); an optional `idempotency_key` makes a retry of a write whose transport response was lost a true no-op that replays the same receipt (`idempotent_replay: true`) — never a duplicate. |
 | `kg_ground(target_id, verdict, kind, note)` | **the only way to set a verdict** (always attributed to the agent — `by` is not a parameter); `verdict ∈ {grounded, rejected, failed, obsolete}`, `kind ∈ {edge, node}`. |
 | `kg_rename(old_id, new_id)` | rename a node and re-key its edges (STRICT: refuses if `new_id` already exists). |
-| `kg_merge(from_id, into_id)` | deliberately **merge** `from_id` into an existing `into_id`, then retire `from_id`. Rewrites every endpoint and **dedups** colliding edges — `failed`/`rejected` negative info is sticky (never pruned), else `grounded`>`unverified`, the verbatim span + verdict note are kept, and no verdict/span is ever forged; drops the self-loops the rewrite makes; refuses a merge across two different declared `node_type`s. → `{ok, from, into, touched[], edges_rewritten, edges_deduped[], self_loops_dropped[], nodes, edges}`. |
+| `kg_merge(from_id, into_id)` | deliberately **merge** `from_id` into an existing `into_id`, then retire `from_id`. Rewrites every endpoint and **dedups** colliding edges — `failed`/`rejected` negative info is sticky (never pruned), else `grounded`>`unverified`, the verbatim span + verdict note are kept, and no verdict/span is ever forged; drops only the positive/unverified self-loops the rewrite makes (a `failed`/`rejected` self-loop between the two merged nodes is negative information and survives, §1.7); refuses a merge across two different declared `node_type`s. → `{ok, from, into, touched[], edges_rewritten, edges_deduped[], self_loops_dropped[], nodes, edges}`. |
 | `kg_metrics()` | `{nodes, edges, edges_by_epistemic_state}`. |
 | `kg_status()` | cheap, **projection-FREE** status + coverage probe (reads only the canon, never opens the derived db) → `{ok, version, nodes, edges, edges_by_epistemic_state, nodes_by_epistemic_state, unverified_edges, coverage:{files[],sections[]}, derived_present, projection_degraded}`; reports the `unverified` grounding-queue size and which source files/`##` sections already have an anchored edge — for confirming progress and **resuming a partial build** after a transport hiccup. |
 | `query_graph(node_type, relation, epistemic_state, limit)` | filtered `{nodes[], edges[]}`. |

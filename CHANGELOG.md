@@ -51,6 +51,46 @@ generation never gated on a metric, fully deterministic).
   The degraded-ensemble path (no second construction) is folded back into `regroup` so it can never
   inflate the count. CLI: `python -m kg_engine.harness convergence`.
 
+### Fixed — adversarial review of the 0.6.0 additions
+
+Two adversarially-verified reviews of the 0.6.0 additions — a full-codebase pass and a focused review of the
+new egress — each fix carrying a regression test (`tests/test_rfix_*.py`, `tests/test_explainpath.py`).
+**No core invariant changed:** span-present, verdict-only-via-`kg_ground`, never-prune-negative-info, and
+deterministic edge identity are all preserved.
+
+- **`kg_explain_path`'s >2-node visiting order (and `query_graph`'s top-N) are now byte-stable across
+  processes.** The previous NetworkX `greedy_tsp` walk tie-broke on hash-randomized set iteration, so a server
+  restart (routine under the supervisor relaunch + handler watchdog) could change `path`/`edges`/`leap` —
+  contradicting the egress's explicit byte-stability guarantee. It is now a self-contained deterministic
+  nearest-neighbour walk over the grounded metric closure (start at the smallest id; closest-unvisited with a
+  `(distance, id)` total-order tie-break); the NetworkX TSP import is dropped, and `query_graph`'s node/edge
+  queries pin an `id` tiebreak.
+- **Read tools re-scrub their egress free-text (§1.9).** A secret scrubbed before extraction and restored into
+  a canon span could round-trip back to the model on a read; `query_graph`/`get_node`/`get_neighbors`/
+  `shortest_path`/`kg_context`/`kg_explain_path` now re-scrub grounded spans on the read path, and the tool
+  error envelope scrubs at the **configured** sensitivity rather than a hardcoded tier.
+- **`kg_context.items[]` (the answer lane) excludes refuted edges.** `failed`/`rejected` edges are negative
+  information: they are no longer surfaced as answers, only in `falsification_counters` (memory of failures,
+  §1.7), which still counts them.
+- **The reconciler's no-lease sweep never clobbers a concurrent verdict (§1.8).** When it cannot take the canon
+  lease for a re-quarantine, it now **skips + retries** on the next sweep instead of writing a stale snapshot
+  over a `kg_ground` verdict applied mid-sweep; the spend-ledger checkpoint moved to a sidecar file.
+- **`kg_merge` preserves `failed`/`rejected` self-loops (§1.7).** A refuted edge collapsed into a self-loop by
+  a merge is kept so its verdict + span stay in `falsification_counters`; only a positive/`unverified`
+  self-loop is dropped.
+- **`kg_scrub` redacts more secrets.** Card-number runs up to 19 digits (covering 19-digit PANs, not just the
+  16-digit majors) and RFC 5952 `::`-compressed IPv6 addresses are now redacted with consistent placeholders.
+- **The generators build topology over the failure-excluded live subgraph (§1.7).** A `failed`/`rejected` edge
+  no longer contributes structure to discovery, matching the node ranks; `convergence` is now tallied
+  pre-truncation.
+- **The best-effort canon git commit is scoped to the batch's touched notes.** A bare `git commit` would have
+  recorded the whole staged index (including a file another process staged concurrently) into the vault
+  history; the commit is now restricted to exactly the paths this write touched, mirroring the scoped `add`.
+- **`launch_server.mjs` distinguishes a startup crash from a graceful exit.** A hard-fault crash signal
+  (SIGSEGV/SIGABRT/…) during startup now falls through to the self-heal + in-place relaunch path, while a
+  graceful SIGTERM/SIGINT stays a clean exit; the readiness marker (`servedInit`) is the primary
+  startup-vs-post-init signal and the wall-clock window is a widened fallback.
+
 ### Deferred
 
 - **Persisted convergence history → automatic projector-level gate.** This release keeps the convergence
