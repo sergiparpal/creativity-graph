@@ -570,7 +570,7 @@ Run from the repo with the engine venv (`/home/sergi/Sproutgraph/.venv/bin/pytho
 
 ```bash
 uv sync                                  # provision the engine venv (dev; the plugin runtime uses scripts/bootstrap.py)
-uv run pytest tests/ -q                  # → 496 passed
+uv run pytest tests/ -q                  # → 733 passed
 claude plugin validate --strict          # validate the plugin manifest + components
 ```
 
